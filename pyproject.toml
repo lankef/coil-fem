@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coil-fem"
+version = "0.1.0"
+description = "Coil body forces, gradients, and optional JAX-FEM structural analysis for stellarator coils"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.6.2",
+    "lineax",
+    "interpax",
+    "jax-fem",
+    "meshio",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "jupyter",
+    "matplotlib",
+]
+docs = [
+    "sphinx>=7",
+]
+# GPU sparse direct solver (spineax + NVIDIA cuDSS).
+# Requires a real `nvcc` (e.g. `conda install -c conda-forge cuda-nvcc=12.9.86`)
+# and `--no-build-isolation`, because spineax compiles CUDA against the
+# installed jaxlib/XLA headers. cuDSS is capped below 0.8 (the 0.8 API break
+# replaced `cudaDataType_t` with `cudssDataType_t`, which spineax does not yet
+# support). Install with:
+#   pip install --no-build-isolation -e ".[cudss]"
+cudss = [
+    "spineax @ git+https://github.com/johnviljoen/spineax.git",
+    "nvidia-cudss-cu12>=0.7,<0.8",
+    "jax[cuda12]>=0.6.2",
+]
+
+# Allow the `spineax @ git+https://…` direct reference in the `cudss` extra.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coil_fem"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

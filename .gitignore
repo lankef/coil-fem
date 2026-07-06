@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+docs/_build/
+docs/api/generated/
+docs/tutorial/tutorial_out/
+
+# Virtual envs / conda
+.env
+.venv
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data and outputs
+data/
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.vtk
+*.vtu
+*.png
+*.xdmf
+*.vtu
+*.msh
+
+# Depreciated files
+depreciated/*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+depreciated/studies/structural_out/structural/von_mises_stress.xdmf
