@@ -1,42 +1,46 @@
 # coil-fem
 
-Coil body forces, gradients, and optional JAX-FEM structural analysis for
-stellarator coils.
+A differentiable FEA toolkit for stellarator coils.
 
 ## Installation
 
 ```bash
-pip install -e ".[dev]"      # editable install with test/notebook extras
-pip install -e ".[docs]"     # Sphinx documentation extras
+pip install -e ".[dev]"       # editable install with test/notebook extras
+pip install -e ".[docs]"      # Sphinx documentation extras
+pip install -e ".[cudss]"     # cuDSS solver extras, see below.
 ```
 
-`simsopt` is installed from a local editable checkout at `../simsopt` and is not
-declared in `pyproject.toml`. See [AGENTS.md](AGENTS.md) for full environment
-setup.
+`coil-fem` depends on `simsopt` and `jax`. For its install instructions, 
+please see:
+- The [simsopt documentation](https://simsopt.readthedocs.io/latest/installation.html).
+- The [JAX documentation](https://docs.jax.dev/en/latest/installation.html).
+
 
 ## Supported solvers
 
-The linear/Newton solver used by the FEM structural analysis is selected via
+JAX-FEM supports multiple sparse solver that can be selected via
 `problem_options`, e.g. `problem_options={'solver': 'umfpack'}` (and
-`'adjoint_solver'` for the gradient pass). Recognised values:
+`'adjoint_solver'` for the gradient pass). Currently supported solvers
+are:
 
-| Solver     | Type                         | Availability        |
-|------------|------------------------------|---------------------|
-| `umfpack`  | CPU sparse direct (default)  | JAX-FEM built-in    |
-| `petsc`    | PETSc (CPU/GPU)              | JAX-FEM built-in    |
-| `jax`      | Pure-JAX iterative           | JAX-FEM built-in    |
-| `amgx`     | NVIDIA AmgX (GPU)            | JAX-FEM built-in    |
-| `cudss`    | GPU sparse direct (cuDSS)    | coil-fem extra      |
+| Solver     | Type                                     | Availability         |
+|------------|------------------------------------------|--------------------- |
+| `umfpack`  | CPU sparse direct (default)              | Shipped with JAX-FEM |
+| `petsc`    | PETSc (CPU/GPU)                          | Shipped with JAX-FEM |
+| `jax`      | Pure-JAX iterative                       | Shipped with JAX-FEM |
+| `amgx`     | NVIDIA AmgX (GPU)                        | Shipped with JAX-FEM |
+| `cudss`    | cuDSS direct sparse solver (recommended) | Installable extra    |
 
-- **`umfpack`, `petsc`, `jax`, `amgx` (JAX-FEM built-in)** — these ship with
-  JAX-FEM; no extra installation is required from coil-fem. Refer to the
-  [JAX-FEM documentation](https://github.com/deepmodeling/jax-fem) for setup and
-  any per-solver dependencies (e.g. PETSc, AmgX). MUMPS is available through the
-  `petsc` option as PETSc's LU factor package — it is not a separate solver
-  name.
-- **`cudss` (coil-fem extra)** — a GPU sparse direct solver via
-  [spineax](https://github.com/johnviljoen/spineax) + NVIDIA cuDSS, providing a
-  zero-copy on-device Newton/adjoint path. It is an optional dependency:
+- **`umfpack`, `petsc`, `jax`, `amgx` (JAX-FEM built-in)** — `coil-fem` supports a
+  number of sparse linear solvers through JAX-FEM. For their setup instructions,
+  please see the [JAX-FEM documentation](https://github.com/deepmodeling/jax-fem).
+  Note that *these solvers does not work with JAX JIT compilation*. As a result,
+  their performance can be heavily limited by CPU bottlenecks and/or array copying.
+  
+- **`cudss` (recommended, extra setup needed)** — a GPU sparse direct solver via
+  [spineax](https://github.com/johnviljoen/spineax) + NVIDIA cuDSS. This is a
+  zero-copy solver that directly works with JIT-compiled JAX program on GPU.
+  To install, follow the steps below:
 
   ```bash
   # A real nvcc matching the CUDA 12.9 runtime (the pip nvcc wheel ships only ptxas):
