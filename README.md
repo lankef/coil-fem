@@ -10,7 +10,7 @@ pip install -e ".[docs]"      # Sphinx documentation extras
 pip install -e ".[cudss]"     # cuDSS solver extras, see below.
 ```
 
-`coil-fem` depends on `simsopt` and `jax`. For its install instructions, 
+`coil-fem` depends on `simsopt` and `jax`. For the install instructions, 
 please see:
 - The [simsopt documentation](https://simsopt.readthedocs.io/latest/installation.html).
 - The [JAX documentation](https://docs.jax.dev/en/latest/installation.html).
