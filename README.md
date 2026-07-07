@@ -18,7 +18,7 @@ please see:
 
 ## Supported solvers
 
-JAX-FEM supports multiple sparse solver that can be selected via
+`coil-fem` supports multiple sparse solver that can be selected via
 `problem_options`, e.g. `problem_options={'solver': 'umfpack'}` (and
 `'adjoint_solver'` for the gradient pass). Currently supported solvers
 are:
@@ -32,7 +32,7 @@ are:
 | `cudss`    | cuDSS direct sparse solver (recommended) | Installable extra    |
 
 - **`umfpack`, `petsc`, `jax`, `amgx` (JAX-FEM built-in)** — `coil-fem` supports a
-  number of sparse linear solvers through JAX-FEM. For their setup instructions,
+  number of sparse linear solvers shipped with JAX-FEM. For their setup instructions,
   please see the [JAX-FEM documentation](https://github.com/deepmodeling/jax-fem).
   Note that *these solvers does not work with JAX JIT compilation*. As a result,
   their performance can be heavily limited by CPU bottlenecks and/or array copying.
