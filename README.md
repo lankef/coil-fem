@@ -43,8 +43,8 @@ are:
   To install, follow the steps below:
 
   ```bash
-  # A real nvcc matching the CUDA 12.9 runtime (the pip nvcc wheel ships only ptxas):
-  conda install -c conda-forge cuda-nvcc=12.9.86
+  # Conda nvcc matching the CUDA 12 runtime (the pip nvcc wheel is incomplete):
+  conda install -c conda-forge cuda-nvcc=<version>
 
   # Build spineax against the installed jaxlib/XLA headers and install the extra:
   pip install --no-build-isolation -e ".[cudss]"
@@ -53,4 +53,4 @@ are:
   Notes: `--no-build-isolation` is required (spineax compiles CUDA against the
   installed `jaxlib`/XLA headers), and `nvidia-cudss-cu12` is pinned `<0.8`
   because cuDSS 0.8 introduced a breaking API change that spineax does not yet
-  support. See [AGENTS.md](AGENTS.md) for details.
+  support. 
