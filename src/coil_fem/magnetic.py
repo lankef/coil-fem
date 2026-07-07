@@ -13,6 +13,11 @@ B_self_quadrature(framed_curve, current, cross_section, phi_quad, uv_quad)
     Antonsen (2025) formula for a rectangular cross-section.  Disk cross-
     sections raise ``NotImplementedError``.
 
+lorentz_body_force(J, B)
+    Lorentz body-force density ``f = J x B``.  The caller builds the current
+    density ``J`` (e.g. ``(I / A) t_hat``), keeping this agnostic to the current
+    model (uniform, cable, skin-effect, ...).
+
 Cross-section coordinate convention (LHA 2025)
 ----------------------------------------------
 Points inside the cross-section are parametrised as
@@ -75,18 +80,6 @@ def _rect_k(a, b):
         * jnp.log(a / b + b / a)
     )
 
-
-def _rect_delta(a, b):
-    r"""Regularization parameter delta for a rectangular cross-section (Eq. 12).
-
-    .. math::
-
-        \delta = \exp\!\left(-\tfrac{25}{6} + k(a, b)\right)
-
-    The product ``delta * a * b`` equals ``regularization_rect(a, b)`` from
-    simsopt.
-    """
-    return jnp.exp(-25.0 / 6.0 + _rect_k(a, b))
 
 
 def _G_rect(x, y):
@@ -284,9 +277,11 @@ def B_self_quadrature(
 
     # ------------------------------------------------------------------
     # delta and regularization  (Eqs. 12-13)
-    # delta * a * b == simsopt's regularization_rect(a, b)
+    # \delta = \exp\!\left(-\tfrac{25}{6} + k(a, b)\right)
+    # The product ``delta * a * b`` equals ``regularization_rect(a, b)`` from
+    # simsopt.
     # ------------------------------------------------------------------
-    delta = _rect_delta(a, b)
+    delta = jnp.exp(-25.0 / 6.0 + _rect_k(a, b))  
     reg   = delta * a * b
 
     # ------------------------------------------------------------------
@@ -367,3 +362,30 @@ def B_self_quadrature(
     # ------------------------------------------------------------------
     B_total = B_reg_q + B_0_q + B_kappa_q + B_b_q
     return B_total.reshape(n_cells, n_quads_per_cell, 3)
+
+
+# ============================================================================
+# Lorentz body force
+# ============================================================================
+
+def lorentz_body_force(J: jax.Array, B: jax.Array) -> jax.Array:
+    """Lorentz body force density **f = J × B**.
+
+    The exact law is ``f = J × B``.  For a coil with uniform current ``I``
+    distributed over cross-section area ``A`` with tangent ``t_hat``,
+    ``J = (I / A) t_hat`` — but the caller is responsible for building ``J``,
+    so this stays agnostic to the current model (uniform, cable, skin-effect,
+    ...).
+
+    Parameters
+    ----------
+    J : jax.Array, shape ``(..., 3)``
+        Current density [A/m²].
+    B : jax.Array, shape ``(..., 3)``
+        Magnetic field [T].
+
+    Returns
+    -------
+    jax.Array, shape ``(..., 3)`` [N/m³]
+    """
+    return jnp.cross(J, B)

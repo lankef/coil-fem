@@ -1,14 +1,14 @@
 coil-fem
 ========
 
-Coil body forces, gradients, and optional JAX-FEM structural analysis for stellarator coils.
+A differentiable structural mechanics toolkit for stellarator coils.
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
 
-   tutorial/index
    theory/index
+   tutorial/index
    api/index
 
 Indices and tables

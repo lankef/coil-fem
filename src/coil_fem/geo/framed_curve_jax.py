@@ -287,6 +287,32 @@ class FramedCurveJAX:
             alpha = jnp.zeros(n)
         self.alpha = jnp.asarray(alpha, dtype=float)
 
+    def with_dofs(self, dofs):
+        """Return a new framed curve of the same type built from new curve DOFs.
+
+        Rebuilds the underlying :class:`CurveXYZFourierJAX` from *dofs* (reusing
+        the current ``quadpoints`` and ``order``) and wraps it in the same frame
+        subclass, preserving ``alpha``.  This is the differentiable entry point
+        used to regenerate mesh geometry from traced DOFs: ``dofs`` is the only
+        traced input; ``quadpoints``/``order``/``alpha`` are treated as
+        constants.  The stored ``self.curve.dofs`` is intentionally ignored.
+
+        Parameters
+        ----------
+        dofs : jax.Array
+            Curve Fourier DOFs, same layout as ``self.curve.dofs``.
+
+        Returns
+        -------
+        FramedCurveJAX
+            A new instance of ``type(self)``.
+        """
+        from .curve_jax import CurveXYZFourierJAX
+        new_curve = CurveXYZFourierJAX(
+            self.curve.quadpoints, dofs, self.curve.order
+        )
+        return type(self)(new_curve, self.alpha)
+
     def alphadash(self):
         """d(alpha)/d(phi) via spectral (FFT) differentiation.
 
@@ -694,3 +720,29 @@ def make_rmf_frame(curve, alpha=None):
     FramedCurveRMFJAX
     """
     return FramedCurveRMFJAX(_to_jax_curve(curve), alpha)
+
+
+def make_framed_curve(curve, frame_type, alpha=None):
+    """Dispatch a frame-type string to the matching framed-curve class.
+
+    Parameters
+    ----------
+    curve : CurveXYZFourierJAX or simsopt CurveXYZFourier
+    frame_type : {'rmf', 'centroid'}
+        ``'rmf'`` for a rotation-minimising frame, ``'centroid'`` for the
+        centroid frame.
+    alpha : array-like, optional
+        Rotation angles at quadrature points (default: zeros).
+
+    Returns
+    -------
+    FramedCurveRMFJAX or FramedCurveCentroidJAX
+    """
+    if frame_type == 'rmf':
+        return make_rmf_frame(curve, alpha)
+    elif frame_type == 'centroid':
+        return make_centroid_frame(curve, alpha)
+    else:
+        raise ValueError(
+            f"frame_type must be 'rmf' or 'centroid', got {frame_type!r}."
+        )

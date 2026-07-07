@@ -1,17 +1,27 @@
-# Issue: Newton Double Assembly in Linear Elasticity Solve
+# Plans for the project
+
+## Todo
+1. Make meshio an optional req
+2. Add field-on-coil to objective and investigate the best mechanism to calculate deformed dof and its jacobian wrt the initial dof.
+3. Implement B_self without the uniform current assumption
+4. Add the instrumentation to switch Lorentz off.
+
+## Long term plans
+1. Add parameterized conductors and heat source/sinks for cross sections
+2. Add beam-network model for cage-type support
+3. Add volumetric grid for the topological optimization of shell/cage-type support. 
+4. Add thermo-elastic model.
+
+## Issues 
+
+### Issue: Newton Double Assembly in Linear Elasticity Solve
 
 Status: **Deferred** (do not implement yet). Revisit only after the cuDSS
 solver is confirmed to work robustly, to avoid introducing more moving parts
 on top of an unverified solver.
 
 Scope when implemented: **cuDSS path only**. The CPU jax_fem `solver()` double
-assembly is library code and is intentionally left untouched.
-
----
-
-## What "Newton double assembly" means
-
-### The generic Newton loop
+assembly is library code and is intentionally.
 
 Both the CPU path and the GPU (cuDSS) path solve the elasticity system with a
 *general nonlinear* Newton loop, even though linear elasticity is linear.
@@ -60,7 +70,7 @@ Coilforce's cuDSS path mirrors the same structure in
 where `_get_res_and_update` -> `problem.newton_update(sol_list)` re-assembles
 the Jacobian (`V_jax`) on every call.
 
-### Why this assembles twice for a linear problem
+#### Why this assembles twice for a linear problem
 
 Trace the loop for linear elasticity, where the stiffness `K` does not depend
 on the displacement `u`:
@@ -81,7 +91,7 @@ roughly doubles the assembly cost of every forward solve.
 Note: the adjoint/backward pass already does only one assembly
 (`adjoint_solve` / `implicit_vjp`), so this waste is forward-pass-only.
 
-## What is `K`?
+#### What is `K`?
 
 `K` is the **global stiffness matrix** of the FEM system - the tangent
 (Jacobian) of the residual with respect to the displacement DOFs. Linear
@@ -121,13 +131,13 @@ loop.
 
 ## Planned fix (cuDSS only; deferred)
 
-### Will this break nonlinear support?
+#### Will this break nonlinear support?
 
 Only if the loop is literally deleted. The plan keeps nonlinear capability:
 add a single-assembly linear path and make it the default, while retaining
 `newton_loop` for nonlinear use behind a flag.
 
-### Change 1: Add `linear_solve` to `CuDSSNewtonSolver`
+#### Change 1: Add `linear_solve` to `CuDSSNewtonSolver`
 
 In `src/coil-fem/cudss_solver.py`, add a method beside `newton_loop`:
 
@@ -143,7 +153,7 @@ In `src/coil-fem/cudss_solver.py`, add a method beside `newton_loop`:
 Dirichlet elimination, and calls cuDSS, so no other change is needed. This
 performs exactly one Jacobian assembly.
 
-### Change 2: Route the wrapper through `linear_solve` (default), keep Newton
+#### Change 2: Route the wrapper through `linear_solve` (default), keep Newton
 
 In `cudss_ad_wrapper`:
 
@@ -153,12 +163,12 @@ In `cudss_ad_wrapper`:
 - Leave `newton_loop` and `adjoint_solve` unchanged, so nonlinear use remains
   available via `linear=False`.
 
-### Change 3: Docstrings
+#### Change 3: Docstrings
 
 - Update the module docstring (item 5) and `cudss_ad_wrapper`'s docstring to
   note the default single-assembly linear forward solve and the `linear` flag.
 
-### No changes needed in coil_fem
+#### No changes needed in coil_fem
 
 `src/coil-fem/coil_fem.py` calls `cudss_ad_wrapper(...)` without `linear`, so
 it defaults to the new single-assembly path automatically.
@@ -172,9 +182,11 @@ it defaults to the new single-assembly path automatically.
 
 ---
 
-## Why deferred
+#### Why deferred
 
 The cuDSS solver must be shown to work robustly first. Removing the double
 assembly adds more moving parts to the forward path; doing it before the
 baseline solver is trusted would make debugging harder. Implement only after
 cuDSS is verified end-to-end.
+
+

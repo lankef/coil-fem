@@ -114,7 +114,7 @@ analytically in COMSOL without importing a field:
 
 1. Add a **Current** physics (or simply compute it by hand):
    - Current `I` [A] = `float(fem.base_currents[0])`
-   - Cross-section area `A` [m²] = `fem._grid_meta[0]['cross_section_area']`
+   - Cross-section area `A` [m²] = `fem.meshes[0].cross_section_area`
 2. For a first-principles COMSOL study with the **AC/DC Module**:
    - Add **Magnetic Fields (mf)** physics.
    - Define a **Single-Turn Coil Domain** with the imported mesh as the

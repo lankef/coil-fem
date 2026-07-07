@@ -37,7 +37,7 @@ Run the forward solve and write all VTU files plus the parameter record you will
 need to re-enter in ANSYS.
 
 ```python
-from coil_fem.container import CoilFEM
+from coil_fem import CoilFEM
 
 fem = CoilFEM(
     base_curves      = base_curves,
@@ -95,7 +95,7 @@ print(f"gravity      = {fem.gravity_options}")   # None = off
 
 print("\n=== Coil currents (base coils) ===")
 for i, I in enumerate(fem.base_currents):
-    A = fem._grid_meta[i]['cross_section_area']
+    A = fem.meshes[i].cross_section_area
     print(f"  coil {i:02d}: I = {float(I):.4e} A,  A = {A:.6e} m2,"
           f"  J = {float(I)/A:.4e} A/m2")
 
@@ -106,11 +106,11 @@ print(f"n_base       = {len(fem.base_curves)}")
 print(f"n_total      = {fem.n_total}   (= n_base * nfp * (1 + int(stellsym)))")
 
 print("\n=== Mesh shapes ===")
-for i, m in enumerate(fem._grid_meta):
-    if m['shape'] == 'rect':
-        print(f"  coil {i:02d}: rect  w1={m['w1']:.4e} m  w2={m['w2']:.4e} m")
+for i, m in enumerate(fem.meshes):
+    if m.shape == 'rect':
+        print(f"  coil {i:02d}: rect  w1={m.w1:.4e} m  w2={m.w2:.4e} m")
     else:
-        print(f"  coil {i:02d}: disk  radius={m['radius']:.4e} m")
+        print(f"  coil {i:02d}: disk  radius={m.radius:.4e} m")
 ```
 
 Also export the **centerline quadrature points** for every base coil and every
@@ -754,7 +754,7 @@ Work through this list before trusting the comparison.
 - [ ] Element order in Mechanical is **Linear** (TET4, no mid-side nodes).
 - [ ] Node count and element count printed by Mechanical match those in
   the VTU (check `n_nodes = mesh.points.shape[0]`, `n_cells` from
-  `fem._grid_meta[i]['n_cells']`).
+  `fem.meshes[i].n_cells`).
 
 ### Material
 

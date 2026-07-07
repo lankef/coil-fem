@@ -51,14 +51,14 @@ pytest is configured via `[tool.pytest.ini_options]` in `pyproject.toml` with `t
 ```
 src/coil_fem/                  # main package (Hatchling src-layout)
   __init__.py                  # re-exports CoilFEM, biot_savart, B_self_quadrature, lorentz_body_force
-  container.py                 # CoilFEM — differentiable FEM pipeline container
-  magnetic.py                  # B-field helpers (biot_savart, B_self_quadrature)
-  forces.py                    # Lorentz body-force density
-  elasticity.py                # LinearElasticity3D — JAX-FEM Problem subclass
-  thermal.py                   # Thermal eigenstrain hooks (itc_strain, cauchy_stress_with_thermal_strain)
+  coil_fem.py                  # CoilFEM — differentiable FEM pipeline container
+  magnetic.py                  # B-field helpers (biot_savart, B_self_quadrature) + lorentz_body_force
   metrics.py                   # Von Mises / strain metrics on FEM solutions
   meshing.py                   # Fixed-topology hex/tet meshing (rectangle/disk sweep, curved-sided TET10)
-  problem.py                   # DeviceProblem — JAX device-assembly Problem subclass
+  problem/                     # FEM Problem subpackage
+    __init__.py                # re-exports LinearElasticity3D, DeviceProblem (+ elasticity helpers)
+    linear_elasticity.py       # LinearElasticity3D — JAX-FEM Problem subclass; itc_strain thermal eigenstrain
+    device_problem.py          # DeviceProblem — JAX device-assembly Problem subclass
   geo/                         # Curve geometry and symmetry subpackage
     __init__.py                # re-exports CurveXYZFourierJAX, framed curves, symmetry helpers
     curve_jax.py               # CurveXYZFourierJAX — JAX pytree, simsopt interop
@@ -68,7 +68,7 @@ src/coil_fem/                  # main package (Hatchling src-layout)
     __init__.py                # re-exports CoilFEMObjective, CoilSupport family
     objective.py               # CoilFEMObjective — simsopt Optimizable wrapper
     support.py                 # CoilSupport, CoilSupportDiscrete, CoilSupportTopBottom
-  backend/                     # Optional GPU backend subpackage
+  solver/                      # Optional GPU solver subpackage
     __init__.py
     cudss.py                   # GPU sparse direct solver (spineax + NVIDIA cuDSS)
 pyproject.toml                 # Hatchling build, deps, pytest config

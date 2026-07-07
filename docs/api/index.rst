@@ -9,14 +9,11 @@ Generated from module docstrings. Optional dependencies (``jax-fem``, ``simsopt`
    :toctree: generated
    :recursive:
 
-   container
+   coil_fem
    magnetic
-   forces
-   elasticity
-   thermal
    metrics
    meshing
    geo
    simsopt
-   backend
+   solver
    problem

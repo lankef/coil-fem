@@ -7,6 +7,7 @@ from .framed_curve_jax import (
     FramedCurveRMFJAX,
     make_centroid_frame,
     make_rmf_frame,
+    make_framed_curve,
 )
 from .symmetries import (
     apply_symmetries_to_gammas,

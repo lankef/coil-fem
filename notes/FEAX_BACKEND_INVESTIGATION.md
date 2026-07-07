@@ -19,9 +19,11 @@ The constitutive law (`get_tensor_map`) and surface maps
 
 ### 1.1 Mesh Adapter
 
-`CoilMesh` currently inherits from `jax_fem.generate_mesh.Mesh` (or a minimal
-fallback).  FEAX's `feax.mesh.Mesh` is a plain container with the same three
-fields (`points`, `cells`, `ele_type`).
+`CoilMesh` is now an abstract base (`abc.ABC`) that inherits from
+`jax_fem.generate_mesh.Mesh`, with two concrete subclasses `CoilMeshRectangle`
+and `CoilMeshDisk` that own their cross-section metadata and implement
+`mesh_points_from_dofs`.  FEAX's `feax.mesh.Mesh` is a plain container with the
+same three base fields (`points`, `cells`, `ele_type`).
 
 **Work:**
 
@@ -66,8 +68,9 @@ Both libraries use the same subclass pattern:
 
 - Factor the stress law (Hooke's law with optional thermal eigenstrain) into a
   standalone function that both Problem subclasses call.  This already half-exists
-  in `fem_objectives.py::cauchy_stress_small_strain` and
-  `thermal.py::cauchy_stress_with_thermal_strain`.
+  in `metrics.py::cauchy_stress_small_strain` and
+  `problem/linear_elasticity.py::LinearElasticity3D.get_tensor_map`
+  (with the thermal eigenstrain from `problem/linear_elasticity.py::itc_strain`).
 - Write `LinearElasticity3D_FEAX(feax.problem.Problem)` mirroring the existing
   `LinearElasticity3D(jax_fem.problem.Problem)`.
 - The FEAX subclass will be simpler: no `set_params` override is needed because

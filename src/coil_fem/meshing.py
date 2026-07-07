@@ -1,3 +1,5 @@
+import abc
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -493,99 +495,21 @@ def disk_sweep(
     aspect_ratio=1.0,
     mesh_type: str = "TET4",
 ):
-    """
-    Circular cross-section via a 5-block structured O-grid in the (p, q) plane,
-    swept periodically along the curve.
+    """Backward-compatible wrapper that builds a :class:`CoilMeshDisk`.
 
-    Uses framed_curve.gamma() for centerline positions and framed_curve.rotated_frame()
-    for the frame vectors (p, q) at quadrature points.
-
-    .. note::
-        ``CoilFEM``'s volumetric Lorentz-force pipeline assumes cells whose
-        cross-sections are **perpendicular to the coil centerline** (this
-        matches the LHA 2025 formula, which evaluates B at points
-        ``r_c + (u a/2) p + (v b/2) q`` with ``(p, q)`` the cross-section
-        frame).  If a non-aligned sweep is ever introduced, ``uv_quad`` must
-        be computed from the actual ``(p, q)``-plane intersection of each
-        cell, and the ``(phi, u, v)`` → quad-point lift in
-        ``CoilFEM.__init__`` must change accordingly.
-
-    Parameters
-    ----------
-    framed_curve
-        Framed curve object. Can be:
-        - simsopt FramedCurve (FramedCurveRMF, FramedCurveCentroid)
-        - Pure JAX wrapper (FramedCurveRMFJAX, FramedCurveCentroidJAX)
-        Typically use RMF frame to minimize twist for circular cross-sections.
-    radius
-        Disk radius.
-    n_center
-        O-grid center block resolution. If None, computed from aspect_ratio.
-    n_radial
-        O-grid radial resolution. If None, computed from aspect_ratio.
-    aspect_ratio
-        Target aspect ratio for mesh elements (default 1.0 for cubic elements).
-        Used to compute n_center and n_radial if not provided.
-    spline
-        Frame interpolation method: "auto", "linear", or "cubic".
-    mesh_type
-        "TET4" only (currently).
+    The mesh-generation logic now lives in :class:`CoilMeshDisk.__init__`; this
+    function is a thin shim so existing callers keep working.  See
+    :class:`CoilMeshDisk` for the full parameter documentation.
 
     Returns
     -------
-    CoilMesh
-        Mesh with points and cells.
+    CoilMeshDisk
     """
-    if mesh_type != "TET4":
-        raise NotImplementedError("disk_sweep currently supports TET4 only")
-    
-    # Compute default grid sizes based on aspect ratio
-    if n_center is None or n_radial is None:
-        # Get characteristic length scale along the curve
-        ds = framed_curve.curve.incremental_arclength()
-        length_per_quadpoint = jnp.mean(ds)/ds.shape[0]
-        
-        # Target element size in cross-section based on aspect ratio
-        target_size = length_per_quadpoint * aspect_ratio
-        
-        if n_center is None:
-            # Center block spans roughly 2*radius/sqrt(2) in each direction
-            center_span = 2.0 * radius / jnp.sqrt(2.0)
-            n_center = int(jnp.ceil(center_span / target_size))
-            n_center = max(2, n_center)  # Minimum of 2
-        
-        if n_radial is None:
-            # Radial direction spans from edge of center to outer radius
-            radial_span = radius * (1.0 - 1.0 / jnp.sqrt(2.0))
-            n_radial = int(jnp.ceil(radial_span / target_size))
-            n_radial = max(2, n_radial)  # Minimum of 2
-    
-    quads_np, oxy_np, _ = _build_disk_o_grid_topology_np(
-        n_center + 1, n_radial + 1
+    return CoilMeshDisk(
+        framed_curve, radius,
+        n_center=n_center, n_radial=n_radial,
+        aspect_ratio=aspect_ratio, mesh_type=mesh_type,
     )
-    quads = jnp.asarray(quads_np, dtype=jnp.int32)
-    oxy = jnp.asarray(oxy_np, dtype=float)
-    
-    # Get centerline positions and frame at quadrature points
-    r0 = framed_curve.gamma()  # shape (n_phi, 3)
-    _, p, q = framed_curve.rotated_frame()  # shapes (n_phi, 3) each
-    
-    n_phi = r0.shape[0]
-    rad = jnp.asarray(radius, dtype=float)
-    
-    # Broadcast to (n_phi, n2d, 3) for each cross-section point
-    r0_expanded = r0[:, None, :]  # (n_phi, 1, 3)
-    p_expanded = p[:, None, :]    # (n_phi, 1, 3)
-    q_expanded = q[:, None, :]    # (n_phi, 1, 3)
-    
-    # Compute offsets: oxy has shape (n2d, 2) with normalized (p, q) coordinates
-    off = rad * (
-        oxy[None, :, 0:1] * p_expanded + oxy[None, :, 1:2] * q_expanded
-    )  # (n_phi, n2d, 3)
-    
-    gamma = r0_expanded + off  # (n_phi, n2d, 3)
-    pts, cells = quad_sweep_points_to_mesh(gamma, quads, mesh_type=mesh_type)
-    return CoilMesh(pts, cells, ele_type=mesh_type)
 
 def rectangle_sweep(
     framed_curve,
@@ -596,96 +520,76 @@ def rectangle_sweep(
     aspect_ratio=1.0,
     mesh_type="TET4",
 ):
-    """Tensor-product rectangle sweep → :class:`CoilMesh`.
+    """Backward-compatible wrapper that builds a :class:`CoilMeshRectangle`.
 
-    Sweeps a structured ``(n_grid_1 + 1) x (n_grid_2 + 1)`` cross-section
-    grid along the framed curve's centerline. For ``'TET10'`` the
-    midside nodes are placed at the **curved midpoint** of each edge
-    (i.e. the image under the framed-curve map of the parametric
-    midpoint), producing a true curve-sided isoparametric mesh.
-
-    The same pure-JAX helper :func:`_rect_sweep_points` is used both
-    here and inside ``coil_fem.CoilFEM._mesh_points_from_dofs``
-    for the differentiable forward pass, so init-time and forward-pass
-    meshes are bit-identical.
-
-    .. note::
-        ``CoilFEM``'s volumetric Lorentz-force pipeline assumes cells whose
-        cross-sections are **perpendicular to the coil centerline** (this
-        matches the LHA 2025 formula, which evaluates B at points
-        ``r_c + (u a/2) p + (v b/2) q`` with ``(p, q)`` the cross-section
-        frame).  If a non-aligned sweep is ever introduced, ``uv_quad`` must
-        be computed from the actual ``(p, q)``-plane intersection of each
-        cell, and the ``(phi, u, v)`` → quad-point lift in
-        ``CoilFEM.__init__`` must change accordingly.
-
-    Parameters
-    ----------
-    framed_curve : FramedCurveJAX
-        Pure-JAX framed curve. Pass an RMF frame for circular-like
-        cross-sections, a centroid frame otherwise.
-    w1, w2 : float
-        Full widths of rectangular cross-section.
-    n_grid_1, n_grid_2 : int, optional
-        Number of *cells* per cross-section direction.  The grid has
-        ``n_grid_1 + 1`` and ``n_grid_2 + 1`` points respectively.
-        If ``None``, the value is chosen from ``aspect_ratio`` and the
-        mean phi-spacing.
-    aspect_ratio : float
-        Target cross-section element size relative to the average
-        arclength per quadpoint (default 1.0 for roughly cubic elements).
-    mesh_type : str
-        ``'TET4'`` (straight) or ``'TET10'`` (curved isoparametric).
+    The mesh-generation logic now lives in :class:`CoilMeshRectangle.__init__`;
+    this function is a thin shim so existing callers keep working.  See
+    :class:`CoilMeshRectangle` for the full parameter documentation.
 
     Returns
     -------
-    CoilMesh
+    CoilMeshRectangle
     """
-    if n_grid_1 is None or n_grid_2 is None:
-        ds = framed_curve.curve.incremental_arclength()
-        length_per_quadpoint = jnp.mean(ds) / ds.shape[0]
-        target_size = length_per_quadpoint * aspect_ratio
-        if n_grid_1 is None:
-            n_grid_1 = max(2, int(jnp.ceil(w1 / target_size)))
-        if n_grid_2 is None:
-            n_grid_2 = max(2, int(jnp.ceil(w2 / target_size)))
-
-    M = int(framed_curve.curve.quadpoints.shape[0])
-    N = n_grid_1 + 1
-    O = n_grid_2 + 1
-
-    pts = _rect_sweep_points(framed_curve, w1, w2, N, O, mesh_type=mesh_type)
-    _, _, _, cells = _rect_sweep_topology(M, N, O, mesh_type)
-    return CoilMesh(pts, cells, ele_type=mesh_type)
+    return CoilMeshRectangle(
+        framed_curve, w1, w2,
+        n_grid_1=n_grid_1, n_grid_2=n_grid_2,
+        aspect_ratio=aspect_ratio, mesh_type=mesh_type,
+    )
 
 
-class CoilMesh(JAXFEMMesh):
-    """
-    Tetrahedral mesh with quality metrics, inherits from JAX-FEM Mesh.
-    
-    This class extends ``jax_fem.generate_mesh.Mesh`` with coil-specific
-    mesh generation methods (rectangle_sweep, disk_sweep) and quality metrics.
+class CoilMesh(JAXFEMMesh, abc.ABC):
+    """Abstract base for coil volume meshes with quality metrics.
+
+    Concrete subclasses (:class:`CoilMeshRectangle`, :class:`CoilMeshDisk`) own
+    their cross-section metadata and implement :meth:`mesh_points_from_dofs`, the
+    differentiable regeneration of mesh node positions from curve DOFs.  Build
+    one via :meth:`from_options` (dispatch on ``mesh_options['shape']``) or the
+    subclass constructors directly.
 
     Attributes
     ----------
     points : ndarray, (N, 3)
-        Node coordinates.
+        Node coordinates (initial geometry; the differentiable positions are
+        produced separately by :meth:`mesh_points_from_dofs`).
     cells : ndarray, (n_tet, 4 or 10)
         Element connectivity (TET4 or TET10).
     ele_type : str
         Element type: ``'TET4'`` or ``'TET10'``.
-    
+    shape : str
+        Cross-section family: ``'rect'`` or ``'disk'`` (class attribute).
+    framed_curve : FramedCurveJAX
+        Framed centerline used to generate the mesh; :meth:`mesh_points_from_dofs`
+        rebuilds it from new DOFs via :meth:`FramedCurveJAX.with_dofs`.
+    n_cross, n_phi, n_cells, cross_section_area, phi_cell_idx
+        Static topology/geometry metadata.
+    n_quads, phi_quad, uv_quad
+        Reference-coordinate arrays populated by :meth:`attach_ref_coords` once
+        the FEM problem (quadrature rule) is known.
+
     Notes
     -----
-    Inherits from ``jax_fem.generate_mesh.Mesh``, which is already a registered
-    JAX pytree. This means CoilMesh instances can be used with all JAX
-    transformations (jit, grad, vmap, etc.) and directly with JAX-FEM solvers.
+    ``CoilMesh`` is intentionally **not** a registered JAX pytree.  It is a
+    mutable Python container (:meth:`attach_ref_coords` fills reference-coordinate
+    fields in place after construction) that mixes static metadata with constant
+    arrays and holds a ``framed_curve`` carrying the initial DOFs.  It is only
+    ever accessed through the owning :class:`~coil_fem.CoilFEM` via closure and is
+    never passed as an argument to a JAX transformation, so it behaves as an
+    opaque constant during tracing.  Registering it as a pytree would surface the
+    stale initial DOFs as leaves and conflict with the in-place mutation.  Only
+    the traced ``dofs`` flowing through :meth:`mesh_points_from_dofs` participate
+    in autodiff.
     """
 
+    # Cross-section family; overridden by concrete subclasses.
+    shape: str | None = None
+
+    # VTK / JAX-FEM TET10 midside edge order (columns 4-9 of each cell), used to
+    # place midpoint reference coordinates in :meth:`attach_ref_coords`.
+    _TET10_MID_EDGES = _TET10_VTK_EDGES
+
     def __init__(self, points, cells, ele_type: str = "TET4"):
-        """
-        Initialize mesh.
-        
+        """Low-level initializer shared by subclasses.
+
         Parameters
         ----------
         points : array_like, (N, 3)
@@ -705,7 +609,147 @@ class CoilMesh(JAXFEMMesh):
         # Cache JAX arrays for our quality metrics
         self._points_jax = jnp.asarray(self.points)
         self._cells_jax = jnp.asarray(self.cells)
-    
+
+    # ------------------------------------------------------------------
+    # Shared metadata / construction helpers
+    # ------------------------------------------------------------------
+
+    def _set_metadata(self, framed_curve, cross_section_area, n_cross, phi_cell_idx):
+        """Store the metadata common to every cross-section shape.
+
+        Called by subclass constructors after ``super().__init__`` so that
+        ``self.cells`` is already populated.  Phase-2 reference-coordinate
+        fields (``n_quads``/``phi_quad``/``uv_quad``) are initialised to ``None``
+        and filled later by :meth:`attach_ref_coords`.
+        """
+        self.framed_curve = framed_curve
+        self.n_phi = int(framed_curve.curve.quadpoints.shape[0])
+        self.n_cells = int(self.cells.shape[0])
+        self.cross_section_area = float(cross_section_area)
+        self.n_cross = int(n_cross)
+        self.phi_cell_idx = np.asarray(phi_cell_idx, dtype=np.int32)
+        # Phase-2 (set by attach_ref_coords once the FEM problem exists).
+        self.n_quads = None
+        self.phi_quad = None
+        self.uv_quad = None
+
+    @classmethod
+    def from_options(cls, framed_curve, opt, mesh_type):
+        """Dispatch ``mesh_options`` to the matching concrete subclass.
+
+        Parameters
+        ----------
+        framed_curve : FramedCurveJAX
+        opt : dict
+            A single normalised ``mesh_options`` entry (must contain ``'shape'``).
+        mesh_type : str
+            ``'TET4'`` or ``'TET10'``.
+
+        Returns
+        -------
+        CoilMeshRectangle or CoilMeshDisk
+        """
+        shape = opt['shape']
+        if shape == 'rect':
+            return CoilMeshRectangle(
+                framed_curve, opt['w1'], opt['w2'],
+                n_grid_1=opt.get('n_grid_1'),
+                n_grid_2=opt.get('n_grid_2'),
+                aspect_ratio=opt.get('aspect_ratio', 1.0),
+                mesh_type=mesh_type,
+            )
+        elif shape == 'disk':
+            return CoilMeshDisk(
+                framed_curve, opt['radius'],
+                n_center=opt.get('n_center'),
+                n_radial=opt.get('n_radial'),
+                aspect_ratio=opt.get('aspect_ratio', 1.0),
+                mesh_type=mesh_type,
+            )
+        else:
+            raise ValueError(
+                f"mesh_options['shape'] must be 'rect' or 'disk', got {shape!r}."
+            )
+
+    @abc.abstractmethod
+    def mesh_points_from_dofs(self, dofs_i):
+        """Return ``(n_nodes, 3)`` mesh points as a differentiable JAX array.
+
+        ``dofs_i`` is the only traced input; the frame is rebuilt from it via
+        ``self.framed_curve.with_dofs(dofs_i)`` and swept using the stored static
+        cross-section metadata, so init-time and forward-pass meshes are
+        bit-identical.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Reference-coordinate pre-computation (phase 2; needs the FEM problem)
+    # ------------------------------------------------------------------
+
+    def attach_ref_coords(self, prob) -> None:
+        """Populate ``n_quads``/``phi_quad``/``uv_quad`` from a built problem.
+
+        ``phi_quad[c, q]`` is the curve parameter phi at FEM quadrature point
+        ``q`` of cell ``c`` (values exceed 1.0 for seam cells; ``interpax``
+        handles this via ``period=1.0``).  ``uv_quad`` holds the cross-section
+        ``(u, v)`` coordinates and is shape-specific (``None`` unless the
+        subclass overrides :meth:`_compute_uv_quad`).
+
+        Supports TET4 (4-node) and TET10 (10-node) elements; for TET10 the 6
+        midpoint reference coordinates are averages of the corner pairs given by
+        :data:`_TET10_MID_EDGES`.
+        """
+        fe = prob.fes[0]
+        cells_np = np.asarray(fe.cells, dtype=np.int64)   # (n_cells, n_nodes)
+        sv_np = np.asarray(fe.shape_vals)                  # (n_quads, n_nodes)
+        n_cell_nodes = cells_np.shape[1]
+        if n_cell_nodes not in (4, 10):
+            raise ValueError(
+                f"attach_ref_coords: only TET4 and TET10 meshes are supported; "
+                f"found {n_cell_nodes} nodes per element."
+            )
+
+        self.n_quads = len(fe.quad_weights)
+        is_tet10 = (n_cell_nodes == 10)
+        corners_np = cells_np[:, :4]  # (n_cells, 4)
+
+        phi_cell_idx_np = np.asarray(self.phi_cell_idx, dtype=np.int64)  # (n_cells,)
+        n_cross = self.n_cross
+        n_phi = self.n_phi
+
+        # Per-corner-node phi integer from global node index; a node is "front"
+        # (phi+1 side) if its phi-slice differs from the cell's phi-slice.
+        phi_int = corners_np // n_cross          # (n_cells, 4)
+        i_slice = phi_cell_idx_np[:, np.newaxis]  # (n_cells, 1)
+        is_front = (phi_int != i_slice)          # (n_cells, 4)
+
+        phi_corners = np.where(
+            is_front,
+            (i_slice + 1.0) / n_phi,
+            i_slice / n_phi,
+        ).astype(np.float64)   # (n_cells, 4)
+
+        if is_tet10:
+            e = self._TET10_MID_EDGES
+            phi_mids = 0.5 * (phi_corners[:, e[:, 0]] +
+                              phi_corners[:, e[:, 1]])   # (n_cells, 6)
+            phi_ref_local = np.concatenate([phi_corners, phi_mids], axis=1)
+        else:
+            phi_ref_local = phi_corners
+
+        phi_quad_np = np.einsum('qn, cn -> cq', sv_np, phi_ref_local)
+        self.phi_quad = jnp.asarray(phi_quad_np)   # (n_cells, n_quads)
+
+        self.uv_quad = self._compute_uv_quad(corners_np, sv_np, is_tet10)
+
+    def _compute_uv_quad(self, corners_np, sv_np, is_tet10):
+        """Cross-section ``(u, v)`` at quadrature points; ``None`` by default.
+
+        Overridden by shapes (e.g. :class:`CoilMeshRectangle`) that carry a
+        rectangular ``(u, v)`` parametrisation.
+        """
+        return None
+
     @property
     def mesh_type(self):
         """Alias for ele_type for backward compatibility."""
@@ -828,3 +872,202 @@ class CoilMesh(JAXFEMMesh):
         vol = jnp.abs(jnp.einsum('ij,ij->i', a, jnp.cross(b, c))) / 6.0  # (N_tets,)
 
         return jnp.max(prod3 / vol)
+
+
+# ---------------------------------------------------------------------------
+# Concrete cross-section meshes
+# ---------------------------------------------------------------------------
+
+class CoilMeshRectangle(CoilMesh):
+    """Rectangular cross-section swept along a framed curve.
+
+    Sweeps a structured ``(n_grid_1 + 1) x (n_grid_2 + 1)`` cross-section grid
+    along the framed curve's centerline.  For ``'TET10'`` the midside nodes are
+    placed at the **curved midpoint** of each edge (the image under the
+    framed-curve map of the parametric midpoint), producing a true curve-sided
+    isoparametric mesh.  The same pure-JAX helper :func:`_rect_sweep_points` is
+    used both here and in :meth:`mesh_points_from_dofs`, so init-time and
+    forward-pass meshes are bit-identical.
+
+    .. note::
+        ``CoilFEM``'s volumetric Lorentz-force pipeline assumes cells whose
+        cross-sections are **perpendicular to the coil centerline** (this matches
+        the LHA 2025 formula, which evaluates B at points
+        ``r_c + (u a/2) p + (v b/2) q`` with ``(p, q)`` the cross-section frame).
+
+    Parameters
+    ----------
+    framed_curve : FramedCurveJAX
+        Pure-JAX framed curve. Pass an RMF frame for circular-like cross-sections,
+        a centroid frame otherwise.
+    w1, w2 : float
+        Full widths of the rectangular cross-section.
+    n_grid_1, n_grid_2 : int, optional
+        Number of *cells* per cross-section direction.  The node grid has
+        ``n_grid_1 + 1`` and ``n_grid_2 + 1`` points respectively.  If ``None``
+        the value is chosen from ``aspect_ratio`` and the mean phi-spacing.
+    aspect_ratio : float
+        Target cross-section element size relative to the average arclength per
+        quadpoint (default 1.0 for roughly cubic elements).
+    mesh_type : str
+        ``'TET4'`` (straight) or ``'TET10'`` (curved isoparametric).
+    """
+
+    shape = 'rect'
+
+    def __init__(
+        self, framed_curve, w1, w2, *,
+        n_grid_1=None, n_grid_2=None, aspect_ratio=1.0, mesh_type="TET4",
+    ):
+        if n_grid_1 is None or n_grid_2 is None:
+            ds = framed_curve.curve.incremental_arclength()
+            length_per_quadpoint = jnp.mean(ds) / ds.shape[0]
+            target_size = length_per_quadpoint * aspect_ratio
+            if n_grid_1 is None:
+                n_grid_1 = max(2, int(jnp.ceil(w1 / target_size)))
+            if n_grid_2 is None:
+                n_grid_2 = max(2, int(jnp.ceil(w2 / target_size)))
+
+        M = int(framed_curve.curve.quadpoints.shape[0])
+        N = n_grid_1 + 1   # node counts per cross-section direction
+        O = n_grid_2 + 1
+
+        pts = _rect_sweep_points(framed_curve, w1, w2, N, O, mesh_type=mesh_type)
+        _, _, _, cells = _rect_sweep_topology(M, N, O, mesh_type)
+        super().__init__(pts, cells, ele_type=mesh_type)
+
+        # Rectangle-specific metadata. n_grid_1/n_grid_2 store NODE counts (N, O).
+        self.w1 = float(w1)
+        self.w2 = float(w2)
+        self.n_grid_1 = int(N)
+        self.n_grid_2 = int(O)
+
+        n_per_phi = (N - 1) * (O - 1) * 6   # KUHN-6 tets per phi-slice
+        phi_cell_idx = np.repeat(np.arange(M, dtype=np.int32), n_per_phi)
+        self._set_metadata(
+            framed_curve,
+            cross_section_area=w1 * w2,
+            n_cross=N * O,
+            phi_cell_idx=phi_cell_idx,
+        )
+
+    def mesh_points_from_dofs(self, dofs_i):
+        fc = self.framed_curve.with_dofs(dofs_i)
+        return _rect_sweep_points(
+            fc, self.w1, self.w2, self.n_grid_1, self.n_grid_2,
+            mesh_type=self.ele_type,
+        )
+
+    def _compute_uv_quad(self, corners_np, sv_np, is_tet10):
+        n_cross = self.n_cross
+        n_g1 = self.n_grid_1
+        n_g2 = self.n_grid_2
+
+        # Cross-section node (j, k) index from global node index.
+        node_j = (corners_np % n_cross) // n_g2   # (n_cells, 4)
+        node_k = corners_np % n_g2
+
+        u_corners = (2.0 * node_j / (n_g1 - 1) - 1.0).astype(np.float64)
+        v_corners = (2.0 * node_k / (n_g2 - 1) - 1.0).astype(np.float64)
+
+        if is_tet10:
+            e = self._TET10_MID_EDGES
+            u_mids = 0.5 * (u_corners[:, e[:, 0]] + u_corners[:, e[:, 1]])
+            v_mids = 0.5 * (v_corners[:, e[:, 0]] + v_corners[:, e[:, 1]])
+            u_ref = np.concatenate([u_corners, u_mids], axis=1)
+            v_ref = np.concatenate([v_corners, v_mids], axis=1)
+        else:
+            u_ref = u_corners
+            v_ref = v_corners
+
+        uv_ref_local = np.stack([u_ref, v_ref], axis=-1)   # (n_cells, n_nodes, 2)
+        uv_quad_np = np.einsum('qn, cnd -> cqd', sv_np, uv_ref_local)
+        return jnp.asarray(uv_quad_np)   # (n_cells, n_quads, 2)
+
+
+class CoilMeshDisk(CoilMesh):
+    """Circular cross-section via a 5-block structured O-grid, swept along a curve.
+
+    Uses ``framed_curve.gamma()`` for centerline positions and
+    ``framed_curve.rotated_frame()`` for the cross-section frame ``(p, q)`` at
+    quadrature points.  Currently ``'TET4'`` only.
+
+    .. note::
+        As with :class:`CoilMeshRectangle`, the Lorentz-force pipeline assumes
+        cross-sections perpendicular to the centerline.
+
+    Parameters
+    ----------
+    framed_curve : FramedCurveJAX
+        Framed curve; typically an RMF frame to minimise twist.
+    radius : float
+        Disk radius.
+    n_center : int, optional
+        O-grid center-block resolution. If ``None``, from ``aspect_ratio``.
+    n_radial : int, optional
+        O-grid radial resolution. If ``None``, from ``aspect_ratio``.
+    aspect_ratio : float
+        Target element aspect ratio (default 1.0).
+    mesh_type : str
+        ``'TET4'`` only (currently).
+    """
+
+    shape = 'disk'
+
+    def __init__(
+        self, framed_curve, radius, *,
+        n_center=None, n_radial=None, aspect_ratio=1.0, mesh_type="TET4",
+    ):
+        if mesh_type != "TET4":
+            raise NotImplementedError("CoilMeshDisk currently supports TET4 only")
+
+        if n_center is None or n_radial is None:
+            ds = framed_curve.curve.incremental_arclength()
+            length_per_quadpoint = jnp.mean(ds) / ds.shape[0]
+            target_size = length_per_quadpoint * aspect_ratio
+            if n_center is None:
+                center_span = 2.0 * radius / jnp.sqrt(2.0)
+                n_center = max(2, int(jnp.ceil(center_span / target_size)))
+            if n_radial is None:
+                radial_span = radius * (1.0 - 1.0 / jnp.sqrt(2.0))
+                n_radial = max(2, int(jnp.ceil(radial_span / target_size)))
+
+        quads_np, oxy_np, _ = _build_disk_o_grid_topology_np(
+            n_center + 1, n_radial + 1
+        )
+        quads = jnp.asarray(quads_np, dtype=jnp.int32)
+        self.oxy = jnp.asarray(oxy_np, dtype=float)   # (n2d, 2) normalized (p, q)
+        self.radius = float(radius)
+
+        M = int(framed_curve.curve.quadpoints.shape[0])
+        n2d = int(oxy_np.shape[0])
+        n_quads_2d = int(quads_np.shape[0])
+
+        pts = self._points_from_framed_curve(framed_curve)          # (M*n2d, 3)
+        gamma_3d = pts.reshape(M, n2d, 3)
+        _, cells = quad_sweep_points_to_mesh(gamma_3d, quads, mesh_type=mesh_type)
+        super().__init__(pts, cells, ele_type=mesh_type)
+
+        self.n2d = n2d
+        phi_cell_idx = np.repeat(np.arange(M, dtype=np.int32), n_quads_2d * 6)
+        self._set_metadata(
+            framed_curve,
+            cross_section_area=np.pi * radius ** 2,
+            n_cross=n2d,
+            phi_cell_idx=phi_cell_idx,
+        )
+
+    def _points_from_framed_curve(self, fc):
+        """Sweep the O-grid cross-section along *fc*; returns ``(n_phi*n2d, 3)``."""
+        r0 = fc.gamma()                  # (n_phi, 3)
+        _, p, q = fc.rotated_frame()     # (n_phi, 3) each
+        off = self.radius * (
+            self.oxy[None, :, 0:1] * p[:, None, :]
+            + self.oxy[None, :, 1:2] * q[:, None, :]
+        )                                # (n_phi, n2d, 3)
+        gamma = r0[:, None, :] + off     # (n_phi, n2d, 3)
+        return gamma.reshape(-1, 3)
+
+    def mesh_points_from_dofs(self, dofs_i):
+        fc = self.framed_curve.with_dofs(dofs_i)
+        return self._points_from_framed_curve(fc)

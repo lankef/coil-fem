@@ -47,15 +47,6 @@ def cauchy_stress_small_strain(
     return lam * tr[..., None, None] * eye + 2.0 * mu * eps_m
 
 
-def von_mises_stress(sigma: jnp.ndarray) -> jnp.ndarray:
-    """Scalar Von Mises stress from Cauchy tensor, shape (..., 3, 3) -> (...)."""
-    tr = jnp.trace(sigma, axis1=-2, axis2=-1) / 3.0
-    dev = sigma - tr[..., None, None] * jnp.eye(3, dtype=sigma.dtype)
-    j2 = 0.5 * jnp.sum(dev * dev, axis=(-2, -1))
-    vm_sq = 3.0 * j2
-    return jnp.sqrt(vm_sq + 1e-30)
-
-
 def _resolve_shape_grads(problem, shape_grads):
     """Return shape_grads (num_cells, num_quads, num_nodes, dim)."""
     if shape_grads is not None:
@@ -115,8 +106,13 @@ def von_mises_on_quadrature(
     sol = jnp.asarray(sol_list[0])
     u_grad = displacement_gradient_at_quads(sol, problem, shape_grads=shape_grads)
     eps_th = _resolve_epsilon_th(problem, epsilon_th)
-    sig = cauchy_stress_small_strain(u_grad, lam, mu, epsilon_th=eps_th)
-    return von_mises_stress(sig)
+    sigma = cauchy_stress_small_strain(u_grad, lam, mu, epsilon_th=eps_th)
+    # Scalar Von Mises stress from Cauchy tensor, shape (..., 3, 3) -> (...).
+    tr = jnp.trace(sigma, axis1=-2, axis2=-1) / 3.0
+    dev = sigma - tr[..., None, None] * jnp.eye(3, dtype=sigma.dtype)
+    j2 = 0.5 * jnp.sum(dev * dev, axis=(-2, -1))
+    vm_sq = 3.0 * j2
+    return jnp.sqrt(vm_sq + 1e-30)
 
 
 def mean_von_mises_volume_weighted(
@@ -178,27 +174,17 @@ def l2_von_mises(
     return jnp.sum(vm**2 * jxw)
 
 
-def strain_energy_density(
-    u_grad: jnp.ndarray, lam: float, mu: float, *, epsilon_th=None
-) -> jnp.ndarray:
-    """0.5 σ : ε_m — elastic (mechanical) strain energy density per quadrature point.
-
-    Uses mechanical strain ``ε_m = ε − ε_th`` when ``epsilon_th`` is provided,
-    so thermal pre-strain does not spuriously contribute to the elastic energy.
-    """
-    eps = 0.5 * (u_grad + jnp.swapaxes(u_grad, -1, -2))
-    eps_m = eps - epsilon_th if epsilon_th is not None else eps
-    sig = cauchy_stress_small_strain(u_grad, lam, mu, epsilon_th=epsilon_th)
-    return 0.5 * jnp.sum(sig * eps_m, axis=(-2, -1))
-
-
 def total_strain_energy(
     problem, sol_list, lam: float, mu: float,
     *, shape_grads=None, JxW=None, epsilon_th=None,
 ) -> jnp.ndarray:
+    # Lazy import to avoid a module-load cycle: coil_fem imports metrics at the
+    # top level, while the strain-energy-density kernel lives on CoilFEM.
+    from .coil_fem import CoilFEM
+
     sol = jnp.asarray(sol_list[0])
     u_grad = displacement_gradient_at_quads(sol, problem, shape_grads=shape_grads)
     eps_th = _resolve_epsilon_th(problem, epsilon_th)
-    psi = strain_energy_density(u_grad, lam, mu, epsilon_th=eps_th)
+    psi = CoilFEM.strain_energy_density(u_grad, lam, mu, epsilon_th=eps_th)
     jxw = _resolve_JxW(problem, JxW)
     return jnp.sum(psi * jxw)

@@ -7,4 +7,4 @@ structural analysis pipeline.
 .. toctree::
    :maxdepth: 2
 
-   thermoelasticity
+   linearelasticity

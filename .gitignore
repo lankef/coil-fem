@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.so
 *.egg-info/
+.pytest_cache/
 dist/
 build/
 .eggs/
@@ -38,6 +39,8 @@ depreciated/*
 # IDE
 .vscode/
 .idea/
+.claude/
+.cursor/
 
 # OS
 .DS_Store

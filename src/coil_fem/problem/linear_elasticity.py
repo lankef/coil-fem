@@ -6,8 +6,15 @@ Main API
 * :class:`LinearElasticity3D` - JAX-FEM ``Problem`` subclass; supports
   ``ad_wrapper`` with geometry differentiation (Path C) and differentiable
   Winkler spring-foundation BCs via ``params['support_weights']``.
-* :func:`solve_linear_elasticity` - Forward-only convenience solver.
 * :func:`dirichlet_bc` - Build Dirichlet BC info from a selection-rule callable.
+
+Solving
+-------
+Solve via ``jax_fem.solver.ad_wrapper(problem)`` (CPU, differentiable) or
+:func:`coil_fem.solver.cudss.cudss_ad_wrapper` (GPU zero-copy path); both return
+JAX-FEM's ``sol_list`` whose first entry ``sol_list[0]`` is the displacement
+field of shape ``(num_nodes, 3)``.  :class:`~coil_fem.CoilFEM` drives this
+internally.
 
 Path C: JAX-native FE geometry
 -------------------------------
@@ -40,13 +47,9 @@ For a differentiable inverse problem (e.g. optimise coil geometry + currents)::
 
 Post-processing
 ---------------
-* :func:`von_mises_stress` - Per-quadrature-point von Mises stress.
-
-Visualization utilities (kept)
--------------------------------
-* :func:`dirichlet_bc_dof_mask`
-* :func:`save_dirichlet_bc_vtu`
-* :func:`save_fixture_centers_vtu`
+* :meth:`LinearElasticity3D.von_mises_stress` - Per-quadrature-point von Mises
+  stress.
+* :meth:`LinearElasticity3D.strain_tensors` - Total and thermal strain tensors.
 """
 
 from __future__ import annotations
@@ -56,11 +59,7 @@ from typing import Callable
 import numpy as onp
 import jax
 import jax.numpy as jnp
-from .problem import DeviceProblem
-from .thermal import (
-    itc_strain,
-    cauchy_stress_with_thermal_strain,
-)
+from .device_problem import DeviceProblem
 
 
 # ============================================================================
@@ -72,6 +71,38 @@ def lame_parameters(E: float, nu: float) -> tuple[float, float]:
     lam = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
     mu = E / (2.0 * (1.0 + nu))
     return lam, mu
+
+
+# ============================================================================
+# Thermal eigenstrain
+# ============================================================================
+
+def itc_strain(itc: jnp.ndarray) -> jnp.ndarray:
+    r"""Isotropic thermal eigenstrain from a single integral thermal contraction.
+
+    Small-strain additive decomposition ``ε = ε_mech + ε_th`` with an isotropic
+    thermal eigenstrain ``ε_th = −itc · I`` shifts the stress without changing
+    the linear Hooke tangent::
+
+        σ = λ tr(ε − ε_th) I + 2μ (ε − ε_th).
+
+    ``itc`` (integral thermal contraction) is the (positive) dimensionless linear
+    thermal contraction ``ΔL/L`` accumulated on cooldown to the service
+    temperature.  Parametrising directly by the measured integral contraction
+    avoids assuming a constant coefficient of thermal expansion — it is
+    equivalent to ``α ΔT = −itc``.
+
+    Parameters
+    ----------
+    itc : float
+        Integral thermal contraction ``ΔL/L`` (e.g. ``0.0029`` for 0.29 %).
+
+    Returns
+    -------
+    jnp.ndarray, shape (3, 3)
+    """
+    s = jnp.asarray(itc, dtype=float).reshape(())
+    return -s * jnp.eye(3, dtype=jnp.float64)
 
 
 # ============================================================================
@@ -237,13 +268,15 @@ class LinearElasticity3D(DeviceProblem):
     gravity).  :meth:`get_mass_map` internally negates it to match JAX-FEM's
     residual convention ``R = laplace_val + mass_val``::
 
+        from jax_fem.solver import solver
+
         rule = lambda pts: pts[:, 2] < pts[:, 2].min() + 1e-5
         problem = LinearElasticity3D(
             mesh, vec=3, dim=3, ele_type=mesh.ele_type,
             dirichlet_bc_info=dirichlet_bc(mesh, rule),
             additional_info=(200e9, 0.3, (0, 0, -7800 * 9.81)),
         )
-        sol = solve_linear_elasticity(problem)
+        sol = solver(problem, solver_options={"umfpack_solver": {}})
 
     Example — differentiable path with Winkler BC
     -----------------------------------------------
@@ -560,9 +593,12 @@ class LinearElasticity3D(DeviceProblem):
                 tr = jnp.trace(eps)
                 return lam * tr * jnp.eye(3, dtype=u_grad.dtype) + 2.0 * mu * eps
         else:
-            _eps_th = epsilon_th  # close over concrete constant
             def stress(u_grad, *args):
-                return cauchy_stress_with_thermal_strain(u_grad, lam, mu, _eps_th)
+                eps = 0.5 * (u_grad + jnp.swapaxes(u_grad, -1, -2))
+                eps_m = eps - epsilon_th
+                tr = jnp.trace(eps_m, axis1=-2, axis2=-1)
+                eye = jnp.eye(3, dtype=u_grad.dtype)
+                return lam * tr[..., None, None] * eye + 2.0 * mu * eps_m
 
         return stress
 
@@ -712,274 +748,99 @@ class LinearElasticity3D(DeviceProblem):
         # Body force enters the residual via internal_vars (standard path).
         self.internal_vars = [params['body_force']]
 
+    # ------------------------------------------------------------------
+    # Post-processing
+    # ------------------------------------------------------------------
+    def von_mises_stress(self, sol_list: list) -> jnp.ndarray:
+        """Compute von Mises stress at every quadrature point.
 
-# ============================================================================
-# Solver
-# ============================================================================
+        Uses ``self.shape_grads``, which reflects the current geometry
+        including any update from :meth:`set_params`.
 
-def solve_linear_elasticity(problem: LinearElasticity3D, solver_options=None):
-    """Solve a linear elasticity problem (forward-only convenience wrapper).
+        Parameters
+        ----------
+        sol_list : list[jnp.ndarray]
+            Solution from ``ad_wrapper`` / ``cudss_ad_wrapper``.
 
-    For the differentiable inverse problem use ``ad_wrapper(problem)``
-    directly, or :func:`coil_fem.backend.cudss.cudss_ad_wrapper` for the
-    GPU zero-copy path (requires an NVIDIA GPU of Pascal generation or newer
-    and the ``spineax`` package).
+        Returns
+        -------
+        jnp.ndarray, (num_cells, num_quads)
+            Von Mises stress [Pa].
+        """
+        fe = self.fes[0]
+        cells_sol = sol_list[0][fe.cells]  # (num_cells, num_nodes, 3)
+        shape_grads = self.shape_grads  # (num_cells, num_quads, num_nodes, dim)
 
-    Parameters
-    ----------
-    problem : LinearElasticity3D
-        Assembled FEM problem.  ``internal_vars`` are set during
-        construction, so this function can be called immediately.
-    solver_options : dict, optional
-        Options forwarded to ``jax_fem.solver.solver``
-        (default: ``{"umfpack_solver": {}}``).
+        # u_grads[c, q, i, j] = du_i/dx_j
+        u_grads = jnp.sum(
+            cells_sol[:, None, :, :, None] * shape_grads[:, :, :, None, :], axis=2
+        )  # (num_cells, num_quads, 3, 3)
 
-        Supported CPU solvers: ``"umfpack_solver"``, ``"petsc_solver"``,
-        ``"jax_solver"``, ``"amgx_solver"``.
+        lam, mu = self.lam, self.mu
+        epsilon_th = getattr(self, 'epsilon_th', None)  # None or constant (3, 3)
 
-        For GPU direct solve, use :func:`~coil_fem.backend.cudss.cudss_ad_wrapper`
-        instead of this function.
+        def vm_at_point(u_grad):
+            eps = 0.5 * (u_grad + u_grad.T)
+            eps_m = eps - epsilon_th if epsilon_th is not None else eps
+            tr = jnp.trace(eps_m)
+            sigma = lam * tr * jnp.eye(3, dtype=u_grad.dtype) + 2.0 * mu * eps_m
+            s = sigma - (jnp.trace(sigma) / 3.0) * jnp.eye(3, dtype=u_grad.dtype)
+            return jnp.sqrt(1.5 * jnp.sum(s * s) + 1e-30)
 
-    Returns
-    -------
-    sol_list : list[jnp.ndarray]
-        JAX-FEM solution list; ``sol_list[0]`` has shape ``(num_nodes, 3)``.
-    """
-    from jax_fem.solver import solver
+        return jax.vmap(jax.vmap(vm_at_point))(u_grads)  # (num_cells, num_quads)
 
-    if solver_options is None:
-        solver_options = {"umfpack_solver": {}}
-    return solver(problem, solver_options=solver_options)
+    def strain_tensors(
+        self,
+        sol_list: list,
+        shape_grads: jnp.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Compute total and thermal strain tensors at every quadrature point.
 
+        Small-strain additive decomposition ``ε = ε_elastic + ε_th`` (see
+        :func:`itc_strain`).  The total strain is purely geometric,
+        ``ε = ½(∇u + ∇uᵀ)``, derived from the displacement field; the thermal
+        eigenstrain ``ε_th = −itc · I`` is the spatially-uniform
+        constant pre-computed at construction and stored as ``self.epsilon_th``.
+        The stress-producing elastic strain is recovered as
+        ``ε_total − ε_thermal``.
 
-# ============================================================================
-# Post-processing
-# ============================================================================
+        Parameters
+        ----------
+        sol_list : list[jnp.ndarray]
+            Solution from ``ad_wrapper`` / ``cudss_ad_wrapper``;
+            ``sol_list[0]`` has shape ``(num_nodes, 3)``.
+        shape_grads : jnp.ndarray, optional
+            Physical shape-function gradients ``(num_cells, num_quads,
+            num_nodes, dim)``.  When ``None`` (default), ``self.shape_grads`` is
+            used, which reflects the geometry of the most recent
+            :meth:`set_params` call.  Pass an externally recomputed array (e.g.
+            from :func:`recompute_fe_geometry`) to avoid relying on mutated
+            solver state.
 
-def von_mises_stress(problem: LinearElasticity3D, sol_list: list) -> jnp.ndarray:
-    """Compute von Mises stress at every quadrature point.
+        Returns
+        -------
+        eps_total : jnp.ndarray, (num_cells, num_quads, 3, 3)
+            Total strain tensor at every quadrature point.
+        eps_thermal : jnp.ndarray, (3, 3)
+            Uniform thermal eigenstrain.  Zeros when no thermal parameters were
+            configured.  Left un-broadcast for memory efficiency; subtract it
+            from ``eps_total`` (broadcasts automatically) to obtain the elastic
+            strain.
+        """
+        fe = self.fes[0]
+        cells_sol = sol_list[0][fe.cells]  # (num_cells, num_nodes, 3)
+        if shape_grads is None:
+            shape_grads = self.shape_grads  # (num_cells, num_quads, num_nodes, dim)
 
-    Uses ``problem.shape_grads``, which reflects the current geometry
-    including any update from ``set_params``.
+        # u_grads[c, q, i, j] = du_i/dx_j
+        u_grads = jnp.sum(
+            cells_sol[:, None, :, :, None] * shape_grads[:, :, :, None, :], axis=2
+        )  # (num_cells, num_quads, 3, 3)
 
-    Parameters
-    ----------
-    problem : LinearElasticity3D
-    sol_list : list[jnp.ndarray]
-        Solution from :func:`solve_linear_elasticity` or ``ad_wrapper``.
+        eps_total = 0.5 * (u_grads + jnp.swapaxes(u_grads, -1, -2))
 
-    Returns
-    -------
-    jnp.ndarray, (num_cells, num_quads)
-        Von Mises stress [Pa].
-    """
-    fe = problem.fes[0]
-    cells_sol = sol_list[0][fe.cells]  # (num_cells, num_nodes, 3)
-    shape_grads = problem.shape_grads  # (num_cells, num_quads, num_nodes, dim)
-
-    # u_grads[c, q, i, j] = du_i/dx_j
-    u_grads = jnp.sum(
-        cells_sol[:, None, :, :, None] * shape_grads[:, :, :, None, :], axis=2
-    )  # (num_cells, num_quads, 3, 3)
-
-    lam, mu = problem.lam, problem.mu
-    epsilon_th = getattr(problem, 'epsilon_th', None)  # None or constant (3, 3)
-
-    def vm_at_point(u_grad):
-        eps = 0.5 * (u_grad + u_grad.T)
-        eps_m = eps - epsilon_th if epsilon_th is not None else eps
-        tr = jnp.trace(eps_m)
-        sigma = lam * tr * jnp.eye(3, dtype=u_grad.dtype) + 2.0 * mu * eps_m
-        s = sigma - (jnp.trace(sigma) / 3.0) * jnp.eye(3, dtype=u_grad.dtype)
-        return jnp.sqrt(1.5 * jnp.sum(s * s) + 1e-30)
-
-    return jax.vmap(jax.vmap(vm_at_point))(u_grads)  # (num_cells, num_quads)
-
-
-def strain_tensors(
-    problem: LinearElasticity3D,
-    sol_list: list,
-    shape_grads: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Compute total and thermal strain tensors at every quadrature point.
-
-    Small-strain additive decomposition ``ε = ε_elastic + ε_th`` (see
-    :mod:`coil_fem.thermal`).  The total strain is purely geometric,
-    ``ε = ½(∇u + ∇uᵀ)``, derived from the displacement field; the thermal
-    eigenstrain ``ε_th = −itc · I`` is the spatially-uniform
-    constant pre-computed at construction and stored as ``problem.epsilon_th``.
-    The stress-producing elastic strain is recovered as ``ε_total − ε_thermal``.
-
-    Parameters
-    ----------
-    problem : LinearElasticity3D
-    sol_list : list[jnp.ndarray]
-        Solution from :func:`solve_linear_elasticity` or ``ad_wrapper``;
-        ``sol_list[0]`` has shape ``(num_nodes, 3)``.
-    shape_grads : jnp.ndarray, optional
-        Physical shape-function gradients ``(num_cells, num_quads, num_nodes,
-        dim)``.  When ``None`` (default), ``problem.shape_grads`` is used, which
-        reflects the geometry of the most recent ``set_params`` call.  Pass an
-        externally recomputed array (e.g. from :func:`recompute_fe_geometry`)
-        to avoid relying on mutated solver state.
-
-    Returns
-    -------
-    eps_total : jnp.ndarray, (num_cells, num_quads, 3, 3)
-        Total strain tensor at every quadrature point.
-    eps_thermal : jnp.ndarray, (3, 3)
-        Uniform thermal eigenstrain.  Zeros when no thermal parameters were
-        configured.  Left un-broadcast for memory efficiency; subtract it from
-        ``eps_total`` (broadcasts automatically) to obtain the elastic strain.
-    """
-    fe = problem.fes[0]
-    cells_sol = sol_list[0][fe.cells]  # (num_cells, num_nodes, 3)
-    if shape_grads is None:
-        shape_grads = problem.shape_grads  # (num_cells, num_quads, num_nodes, dim)
-
-    # u_grads[c, q, i, j] = du_i/dx_j
-    u_grads = jnp.sum(
-        cells_sol[:, None, :, :, None] * shape_grads[:, :, :, None, :], axis=2
-    )  # (num_cells, num_quads, 3, 3)
-
-    eps_total = 0.5 * (u_grads + jnp.swapaxes(u_grads, -1, -2))
-
-    eps_th = getattr(problem, 'epsilon_th', None)
-    eps_thermal = (
-        jnp.zeros((3, 3), dtype=eps_total.dtype) if eps_th is None else eps_th
-    )
-    return eps_total, eps_thermal
-
-
-# ============================================================================
-# Visualization utilities
-# ============================================================================
-
-def dirichlet_bc_dof_mask(points: onp.ndarray, dirichlet_bc_info: list) -> onp.ndarray:
-    """Compute per-node flags for which DOFs have Dirichlet constraints.
-
-    Parameters
-    ----------
-    points : ndarray, (N, 3)
-        Mesh node coordinates.
-    dirichlet_bc_info : list
-        JAX-FEM format ``[location_fns, vecs, value_fns]``.
-
-    Returns
-    -------
-    mask : ndarray, (N, 3) int32
-        1 where the DOF is fixed, 0 otherwise.
-    """
-    if dirichlet_bc_info is None:
-        raise ValueError("dirichlet_bc_info is required")
-
-    location_fns, vecs, value_fns = dirichlet_bc_info
-    if not (len(location_fns) == len(vecs) == len(value_fns)):
-        raise ValueError("dirichlet_bc_info rows must have equal length")
-
-    pts = jnp.asarray(points, dtype=jnp.float64)
-    n = int(pts.shape[0])
-    mask = onp.zeros((n, 3), dtype=onp.int32)
-    node_ix = jnp.arange(n, dtype=jnp.int32)
-
-    for i in range(len(location_fns)):
-        lf = location_fns[i]
-        na = lf.__code__.co_argcount
-
-        if na == 1:
-            def loc_wrap(p, ind, _lf=lf):
-                return _lf(p)
-        elif na == 2:
-            loc_wrap = lf
-        else:
-            raise ValueError(f"location_fn must take 1 or 2 arguments, got {na}")
-
-        inds = onp.argwhere(jax.vmap(loc_wrap)(pts, node_ix).astype(bool)).reshape(-1)
-        v = int(vecs[i])
-        if v not in (0, 1, 2):
-            raise ValueError(f"vec index must be 0, 1, or 2, got {v}")
-        mask[inds, v] = 1
-
-    return mask
-
-
-def save_dirichlet_bc_vtu(
-    points: onp.ndarray,
-    dirichlet_bc_info: list,
-    path: str,
-    *,
-    only_constrained: bool = True,
-) -> int:
-    """Export Dirichlet BC nodes as a VTU point cloud for ParaView.
-
-    Parameters
-    ----------
-    points : ndarray, (N, 3)
-    dirichlet_bc_info : list
-        JAX-FEM format ``[location_fns, vecs, value_fns]``.
-    path : str
-        Output ``.vtu`` file path.
-    only_constrained : bool
-        If True (default), export only nodes with at least one fixed DOF.
-
-    Returns
-    -------
-    int
-        Number of points written.
-    """
-    import meshio
-
-    mask = dirichlet_bc_dof_mask(points, dirichlet_bc_info)
-    nfix = mask.sum(axis=1)
-
-    if only_constrained:
-        idx = onp.argwhere(nfix > 0).reshape(-1)
-    else:
-        idx = onp.arange(len(points))
-
-    sub = onp.asarray(points[idx], dtype=onp.float64)
-    m = mask[idx]
-    n_comp = nfix[idx].astype(onp.float64)
-
-    verts = onp.arange(len(sub), dtype=onp.int32).reshape(-1, 1)
-    meshio.Mesh(
-        points=sub,
-        cells=[("vertex", verts)],
-        point_data={
-            "fix_x": m[:, 0].astype(onp.float64),
-            "fix_y": m[:, 1].astype(onp.float64),
-            "fix_z": m[:, 2].astype(onp.float64),
-            "n_fixed_components": n_comp,
-        },
-    ).write(path)
-
-    return int(len(sub))
-
-
-def save_fixture_centers_vtu(centerline_xyz: onp.ndarray, path: str) -> None:
-    """Export fixture center points (min/max z along centreline) as VTU.
-
-    Parameters
-    ----------
-    centerline_xyz : ndarray, (n_phi, 3)
-        Centreline coordinates, typically from ``curve.gamma()``.
-    path : str
-        Output ``.vtu`` file path.
-    """
-    import meshio
-
-    cl = onp.asarray(centerline_xyz, dtype=onp.float64).reshape(-1, 3)
-    if cl.shape[0] < 1:
-        raise ValueError("centerline_xyz must have at least one point")
-
-    i_lo = int(onp.argmin(cl[:, 2]))
-    i_hi = int(onp.argmax(cl[:, 2]))
-    pts = onp.stack([cl[i_lo], cl[i_hi]], axis=0)
-    labels = onp.array([0.0, 1.0], dtype=onp.float64)
-    verts = onp.array([[0], [1]], dtype=onp.int32)
-
-    meshio.Mesh(
-        points=pts,
-        cells=[("vertex", verts)],
-        point_data={"fixture_end": labels},
-    ).write(path)
+        eps_th = getattr(self, 'epsilon_th', None)
+        eps_thermal = (
+            jnp.zeros((3, 3), dtype=eps_total.dtype) if eps_th is None else eps_th
+        )
+        return eps_total, eps_thermal

@@ -136,7 +136,7 @@ class CoilFEMObjective(Optimizable):
             raise ImportError("simsopt is required for CoilFEMObjective.")
 
         from ..geo import CurveXYZFourierJAX
-        from ..container import CoilFEM
+        from ..coil_fem import CoilFEM
         from .support import CoilSupport
 
         if isinstance(metrics, str):

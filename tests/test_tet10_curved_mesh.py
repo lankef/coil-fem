@@ -11,12 +11,12 @@ Properties checked
    ``gamma_eval((m + 0.5)/M)`` to machine precision -- not the chord
    midpoint between the adjacent corner nodes.
 2. **Init / forward-pass parity.**  The init-time mesh from
-   ``rectangle_sweep`` and the forward-pass mesh from
-   ``CoilFEM._mesh_points_from_dofs`` (which calls the same
+   ``CoilMeshRectangle`` and the forward-pass mesh from
+   ``CoilMeshRectangle.mesh_points_from_dofs`` (which calls the same
    ``_rect_sweep_points`` helper) produce identical points.
 3. **Topology unchanged.**  The connectivity returned by the new
    ``_rect_sweep_topology`` matches the legacy node ordering enough that
-   ``_solve_grid_dims`` and ``_phi_cell_indices_rect`` continue to work
+   ``CoilMesh.attach_ref_coords`` continues to work
    (i.e. corners obey ``index = m * (N*O) + n * O + o``).
 4. **AD through ``curve.dofs``.**  Gradients of a mesh-based scalar flow
    through the new pipeline.
@@ -33,6 +33,7 @@ from coil_fem.geo import CurveXYZFourierJAX
 from coil_fem.geo import make_centroid_frame, make_rmf_frame
 from coil_fem.meshing import (
     rectangle_sweep,
+    CoilMeshRectangle,
     _rect_sweep_topology,
     _rect_sweep_points,
 )
@@ -131,15 +132,13 @@ class TestCurvedMidsides:
 # ---------------------------------------------------------------------------
 
 class TestInitForwardParity:
-    """The init-time ``rectangle_sweep`` and the forward-pass
-    ``CoilFEM._mesh_points_from_dofs`` both delegate to
+    """The init-time ``CoilMeshRectangle`` and the forward-pass
+    ``CoilMeshRectangle.mesh_points_from_dofs`` both delegate to
     ``_rect_sweep_points``; the resulting points must be bit-identical.
 
-    We re-create what ``_mesh_points_from_dofs`` does inline (build a
-    fresh ``CurveXYZFourierJAX`` from stored dofs, make a framed curve,
-    call ``_rect_sweep_points``) rather than build a full ``CoilFEM`` so
-    the test doesn't need a FEM problem / support_fn / boundary
-    conditions.
+    We drive ``mesh.mesh_points_from_dofs(dofs)`` directly rather than build a
+    full ``CoilFEM`` so the test doesn't need a FEM problem / support_fn /
+    boundary conditions.
     """
 
     @pytest.mark.parametrize("mesh_type", ["TET4", "TET10"])
@@ -154,24 +153,18 @@ class TestInitForwardParity:
         n_g1, n_g2 = 3, 3
         w1, w2 = 0.05, 0.03
 
-        init_mesh = rectangle_sweep(
+        mesh = CoilMeshRectangle(
             fc, w1, w2,
             n_grid_1=n_g1, n_grid_2=n_g2,
             mesh_type=mesh_type,
         )
 
-        # Forward-pass path: rebuild curve+frame from dofs, then call
-        # ``_rect_sweep_points`` with the stored grid-point counts (= N, O,
-        # i.e. n_g1+1, n_g2+1) — exactly what ``_mesh_points_from_dofs``
-        # does internally.
+        # Forward-pass path: regenerate mesh points straight from the stored
+        # DOFs — exactly what ``CoilFEM`` calls during the differentiable solve.
         dofs0 = curve.dofs
-        curve2 = CurveXYZFourierJAX(curve.quadpoints, dofs0, curve.order)
-        fc2 = type(fc)(curve2)
-        pts_forward = np.asarray(_rect_sweep_points(
-            fc2, w1, w2, n_g1 + 1, n_g2 + 1, mesh_type=mesh_type,
-        ))
+        pts_forward = np.asarray(mesh.mesh_points_from_dofs(dofs0))
 
-        pts_init = np.asarray(init_mesh.points)
+        pts_init = np.asarray(mesh.points)
         assert pts_forward.shape == pts_init.shape
         assert np.allclose(pts_forward, pts_init, atol=1e-13)
 
@@ -182,8 +175,7 @@ class TestInitForwardParity:
 
 class TestTopologyConvention:
     """Corner-node indexing must follow ``m * (N*O) + n * O + o`` so the
-    legacy ``CoilFEM._compute_ref_coords`` reconstruction works
-    unchanged."""
+    ``CoilMesh.attach_ref_coords`` reconstruction works unchanged."""
 
     @pytest.mark.parametrize("mesh_type", ["TET4", "TET10"])
     def test_corner_index_layout(self, mesh_type):

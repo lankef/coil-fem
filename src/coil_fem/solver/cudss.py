@@ -49,7 +49,7 @@ try:
     from spineax.cudss.solver import CuDSSSolver
 except ImportError as e:
     raise ImportError(
-        "coil_fem.backend.cudss requires the optional GPU stack (spineax + "
+        "coil_fem.solver.cudss requires the optional GPU stack (spineax + "
         "NVIDIA cuDSS), which is not installed. Install it with:\n"
         "  conda install -c conda-forge cuda-nvcc=12.9.86\n"
         '  pip install --no-build-isolation -e ".[cudss]"'
@@ -57,7 +57,7 @@ except ImportError as e:
 
 if TYPE_CHECKING:
     from jax_fem.problem import Problem
-    from ..elasticity import LinearElasticity3D
+    from ..problem import LinearElasticity3D
 
 
 # ============================================================================

@@ -54,24 +54,17 @@ import jax.numpy as jnp
 
 from .geo import (
     CurveXYZFourierJAX,
-    FramedCurveCentroidJAX,
-    FramedCurveRMFJAX,
+    make_framed_curve,
     apply_symmetries_to_gammas,
     apply_symmetries_to_gammadashs,
     apply_symmetries_to_currents,
     n_coils_total,
 )
-from .meshing import (
-    rectangle_sweep,
-    disk_sweep,
-    _build_disk_o_grid_topology_np,
-    _rect_sweep_points,
-)
-from .magnetic import biot_savart, B_self_quadrature
-from .forces import lorentz_body_force
+from .meshing import CoilMesh
+from .magnetic import biot_savart, B_self_quadrature, lorentz_body_force
 
 from jax_fem.solver import ad_wrapper
-from .elasticity import (
+from .problem import (
     LinearElasticity3D,
     lame_parameters,
     recompute_fe_geometry,
@@ -82,6 +75,7 @@ from .metrics import (
     l2_von_mises,
     mean_von_mises_volume_weighted,
     total_strain_energy,
+    cauchy_stress_small_strain,
 )
 
 # ============================================================================
@@ -104,8 +98,6 @@ _METRIC_REGISTRY_MAX = frozenset({'max_von_mises', 'max_von_mises_lse'})
 
 def _build_metric_fn(name: str):
     """Return ``(problem, sol_list, lam, mu) -> scalar`` for the given name."""
-
-
     if name not in _METRIC_REGISTRY:
         raise ValueError(
             f"Unknown metric '{name}'. Available: {sorted(_METRIC_REGISTRY)}"
@@ -117,7 +109,7 @@ def _build_metric_fn(name: str):
 # Input validation helpers
 # ============================================================================
 
-def _normalise_mesh_opts(mesh_options, n_base: int) -> list[dict]:
+def _broadcast_mesh_opts(mesh_options, n_base: int) -> list[dict]:
     """Return a list of n_base dicts, broadcasting a single dict if needed."""
     if isinstance(mesh_options, dict):
         opts = [mesh_options] * n_base
@@ -149,7 +141,7 @@ def _normalise_mesh_opts(mesh_options, n_base: int) -> list[dict]:
     return opts
 
 
-def _normalise_support_fns(base_support_fns, n_base: int) -> list[Callable]:
+def _broadcast_support_fns(base_support_fns, n_base: int) -> list[Callable]:
     """Return a list of ``n_base`` support callables.
 
     Parameters
@@ -223,7 +215,7 @@ def _validate_support_dofs(base_support_dofs, n_base: int) -> list[dict | None]:
 _VALID_SOLVERS = {'umfpack', 'petsc', 'jax', 'amgx', 'cudss'}
 
 
-def _normalise_problem_options(problem_options: dict | None) -> dict:
+def _broadcast_problem_options(problem_options: dict | None) -> dict:
     """Validate and fill defaults for ``problem_options``.
 
     Parameters
@@ -263,80 +255,6 @@ def _normalise_problem_options(problem_options: dict | None) -> dict:
                 f"Valid choices: {sorted(_VALID_SOLVERS)}"
             )
     return opts
-
-
-# ============================================================================
-# Pure-JAX mesh-point helpers (no CoilMesh, preserves AD chain)
-# ============================================================================
-
-def _make_framed_curve(
-    curve: CurveXYZFourierJAX, frame_type: str
-) -> FramedCurveRMFJAX | FramedCurveCentroidJAX:
-    if frame_type == 'rmf':
-        return FramedCurveRMFJAX(curve)
-    elif frame_type == 'centroid':
-        return FramedCurveCentroidJAX(curve)
-    else:
-        raise ValueError(
-            f"mesh_options['frame'] must be 'rmf' or 'centroid', got {frame_type!r}."
-        )
-
-
-def _disk_mesh_points_jax(
-    curve: CurveXYZFourierJAX,
-    frame_type: str,
-    radius: float,
-    oxy: jax.Array,
-) -> jax.Array:
-    """Compute disk-sweep mesh points as a pure JAX expression.
-
-    ``oxy`` is the static ``(n2d, 2)`` normalised O-grid offset array
-    from :func:`.meshing._build_disk_o_grid_topology_np`.
-
-    Returns ``(n_phi * n2d, 3)`` differentiable through ``curve.dofs``.
-    """
-    fc = _make_framed_curve(curve, frame_type)
-    r0 = fc.gamma()                 # (n_phi, 3)
-    _, p, q = fc.rotated_frame()  # (n_phi, 3) each
-
-    # off shape: (n_phi, n2d, 3)
-    off = radius * (
-        oxy[None, :, 0:1] * p[:, None, :]
-        + oxy[None, :, 1:2] * q[:, None, :]
-    )
-    gamma_2d = r0[:, None, :] + off   # (n_phi, n2d, 3)
-    return gamma_2d.reshape(-1, 3)
-
-
-# ============================================================================
-# Body-force topology helpers (static, computed once at init)
-# ============================================================================
-
-def _phi_cell_indices_rect(n_phi: int, n_grid_1: int, n_grid_2: int) -> np.ndarray:
-    """Return int32 array ``phi_cell_indices`` of shape ``(n_cells,)``.
-
-    ``phi_cell_indices[c]`` is the phi (arc-length) slice index for cell ``c``
-    in a rectangular-sweep TET4 mesh.
-
-    The Freudenthal decomposition produces 6 tets per hex, and each hex belongs
-    to one phi slice.  Cells are ordered as: phi first, then cross-section.
-
-    Notes
-    -----
-    ``n_cells = n_phi * (n_grid_1 - 1) * (n_grid_2 - 1) * 6``
-    """
-    n_per_phi = (n_grid_1 - 1) * (n_grid_2 - 1) * 6
-    n_cells = n_phi * n_per_phi
-    return np.repeat(np.arange(n_phi, dtype=np.int32), n_per_phi)
-
-
-def _phi_cell_indices_disk(n_phi: int, n_quads_2d: int) -> np.ndarray:
-    """Return ``phi_cell_indices`` for a disk-sweep TET4 mesh.
-
-    ``n_cells = n_phi * n_quads_2d * 6``
-    """
-    n_per_phi = n_quads_2d * 6
-    return np.repeat(np.arange(n_phi, dtype=np.int32), n_per_phi)
 
 
 # ============================================================================
@@ -441,6 +359,14 @@ class CoilFEM:
     ``ad_wrapper.set_params``, so the adjoint sees geometry, load, and BC
     changes without rebuilding the problem.
 
+    ``CoilFEM`` is intentionally **not** a registered JAX pytree.  It is a
+    stateful container of FEM problems, ``ad_wrapper`` closures, and
+    :class:`~coil_fem.meshing.CoilMesh` objects (which are themselves not
+    pytrees), and it is always captured by closure rather than passed as an
+    argument to a JAX transformation.  Autodiff and JIT act only on the DOF
+    arrays flowing through :meth:`objective`; the container instance is treated
+    as an opaque constant.  Do not register it as a pytree.
+
     Multi-GPU
     ---------
     Independent coil solves can be parallelised with ``jax.pmap``.  No
@@ -478,10 +404,10 @@ class CoilFEM:
         self.gravity_options = gravity_options
 
         n_base = len(self.base_curves_jax)
-        self.mesh_opts = _normalise_mesh_opts(mesh_options, n_base)
-        self.base_support_fns = _normalise_support_fns(base_support_fns, n_base)
+        self.mesh_opts = _broadcast_mesh_opts(mesh_options, n_base)
+        self.base_support_fns = _broadcast_support_fns(base_support_fns, n_base)
         self._base_support_dofs = _validate_support_dofs(base_support_dofs, n_base)
-        self.problem_options = _normalise_problem_options(problem_options)
+        self.problem_options = _broadcast_problem_options(problem_options)
         self.n_total = n_coils_total(n_base, self.nfp, self.stellsym)
 
         # ── 2. Material properties ────────────────────────────────────────────
@@ -495,93 +421,17 @@ class CoilFEM:
         # as ε_th = −itc · I.
         self._itc = float(mat['itc']) if 'itc' in mat else None
 
-        # ── 3. Build initial meshes; store topology + grid metadata ───────────
-        self.meshes = []
-        self._grid_meta = []      # list of dicts with shape-specific data
-
-        for i, (curve, opt) in enumerate(zip(self.base_curves_jax, self.mesh_opts)):
-            shape = opt['shape']
+        # ── 3. Build initial meshes; each CoilMesh owns its grid metadata ─────
+        # ``CoilMesh.from_options`` dispatches on ``opt['shape']`` to the right
+        # concrete subclass, which absorbs the sweep + metadata logic.  Any
+        # auto-resolution of the grid happens once, here at construction time;
+        # the topology is then fixed for the rest of the optimization.
+        self.meshes: list[CoilMesh] = []
+        for curve, opt in zip(self.base_curves_jax, self.mesh_opts):
             frame_type = opt.get('frame', 'rmf')
             mesh_type = opt.get('mesh_type', 'TET4')
-            fc = _make_framed_curve(curve, frame_type)
-            n_phi = int(curve.quadpoints.shape[0])
-
-            if shape == 'rect':
-                init_mesh = rectangle_sweep(
-                    fc, opt['w1'], opt['w2'],
-                    n_grid_1=opt.get('n_grid_1'),
-                    n_grid_2=opt.get('n_grid_2'),
-                    aspect_ratio=opt.get('aspect_ratio', 1.0),
-                    mesh_type=mesh_type,
-                )
-                n_cells = init_mesh.cells.shape[0]
-                n_per_phi_6 = n_cells // n_phi
-                n_per_phi   = n_per_phi_6 // 6
-                # For TET10, n_nodes includes midpoint nodes which inflate the
-                # per-slice count.  Use only the corner nodes (first 4 cols) to
-                # recover the grid dimensions, which works for both TET4/TET10.
-                n_corner_nodes = int(np.unique(init_mesh.cells[:, :4]).size)
-                n_cross = n_corner_nodes // n_phi
-                n_g1, n_g2 = _solve_grid_dims(n_cross, n_per_phi)
-                # Store the metadata for the mesh. Notably, when the 
-                # mesh resolution is automatically computed, the 
-                # computation will only be done once in during the 
-                # initialization of a CoilFEM object in the rectangle_sweep call 
-                # above. After that, the mesh resolution
-                # will be fixed for the rest of the optimization.
-                meta = {
-                    'shape': 'rect',
-                    'frame': frame_type,
-                    'mesh_type': mesh_type,
-                    'w1': float(opt['w1']),
-                    'w2': float(opt['w2']),
-                    'n_grid_1': n_g1,
-                    'n_grid_2': n_g2,
-                    'n_phi': n_phi,
-                    'n_cells': n_cells,
-                    'n_quads': None,
-                    'phi_cell_idx': _phi_cell_indices_rect(n_phi, n_g1, n_g2),
-                    'cross_section_area': float(opt['w1']) * float(opt['w2']),
-                    'phi_quad': None,   # filled after FEM problem is built
-                    'uv_quad':  None,   # filled after FEM problem is built
-                }
-
-            else:  # disk
-                n_center = opt.get('n_center')
-                n_radial = opt.get('n_radial')
-                init_mesh = disk_sweep(
-                    fc, opt['radius'],
-                    n_center=n_center,
-                    n_radial=n_radial,
-                    aspect_ratio=opt.get('aspect_ratio', 1.0),
-                    mesh_type=mesh_type,
-                )
-                n_nodes = init_mesh.points.shape[0]
-                n2d = n_nodes // n_phi
-                n_cells = init_mesh.cells.shape[0]
-                n_center_eff, n_radial_eff = _infer_disk_params(n2d)
-                quads_np, oxy_np, _ = _build_disk_o_grid_topology_np(
-                    n_center_eff, n_radial_eff
-                )
-                n_quads_2d = quads_np.shape[0]
-                meta = {
-                    'shape': 'disk',
-                    'frame': frame_type,
-                    'mesh_type': mesh_type,
-                    'radius': float(opt['radius']),
-                    'n2d': n2d,
-                    'n_phi': n_phi,
-                    'n_cells': n_cells,
-                    'n_quads': None,
-                    'phi_cell_idx': _phi_cell_indices_disk(n_phi, n_quads_2d),
-                    'oxy': jnp.asarray(oxy_np, dtype=float),
-                    'cross_section_area': np.pi * float(opt['radius']) ** 2,
-                    'phi_quad': None,   # filled after FEM problem is built
-                    'uv_quad':  None,   # disk has no (u, v) coords
-                }
-
-            self.meshes.append(init_mesh)
-            self._grid_meta.append(meta)
+            fc = make_framed_curve(curve, frame_type)
+            self.meshes.append(CoilMesh.from_options(fc, opt, mesh_type))
 
         # ── 4. Build FEM problems and ad_wrappers (one per coil) ──────────────
         # Body force is a zero placeholder; set_params overwrites it each call.
@@ -618,7 +468,7 @@ class CoilFEM:
         # lives in DeviceProblem (spineax-free) and is toggled per problem via
         # the gpu_assembly flag; only the solver wrapper needs spineax.
         if _use_cudss:
-            from .backend.cudss import cudss_ad_wrapper
+            from .solver.cudss import cudss_ad_wrapper
 
         for i, mesh in enumerate(self.meshes):
             # Build the FEM problem. No location_fns needed — custom_init
@@ -633,14 +483,12 @@ class CoilFEM:
                 gpu_assembly=_use_cudss,
             )
 
-            if self._grid_meta[i]['n_quads'] is None:
-                self._grid_meta[i]['n_quads'] = len(prob.fes[0].quad_weights)
-
             # ── Pre-compute static reference coordinates phi_quad / uv_quad ──
             # These are coordinates (not interpolated functions), built once
-            # from the mesh topology.  phi_quad values at the periodic seam
-            # may exceed 1.0; interpax handles this via period=1.0.
-            self._compute_ref_coords(i, prob)
+            # from the mesh topology and stored on the CoilMesh.  phi_quad
+            # values at the periodic seam may exceed 1.0; interpax handles this
+            # via period=1.0.  This also fills mesh.n_quads.
+            mesh.attach_ref_coords(prob)
 
             self._problems.append(prob)
             if _use_cudss:
@@ -665,145 +513,6 @@ class CoilFEM:
 
             # Cache global surface node indices for this coil.
             self._surface_node_indices.append(prob.surface_node_global_indices)
-
-    # ============================================================================
-    # Static reference-coordinate pre-computation (runs once at init)
-    # ============================================================================
-
-    # VTK/JAX-FEM TET10 midpoint-to-corner edge pairs (columns 4-9).
-    _TET10_MID_EDGES = np.array(
-        [[0, 1], [1, 2], [0, 2], [0, 3], [1, 3], [2, 3]], dtype=np.int64
-    )
-
-    def _compute_ref_coords(self, coil_idx: int, prob) -> None:
-        """Pre-compute ``phi_quad`` and ``uv_quad`` for coil *coil_idx*.
-
-        ``phi_quad[c, q]`` is the curve parameter phi at FEM quadrature point
-        ``q`` of cell ``c``.  Values exceed 1.0 for cells at the periodic seam
-        (last phi slice); ``interpax`` handles these via ``period=1.0``.
-
-        ``uv_quad[c, q, :]`` holds the cross-section coordinates ``(u, v)`` in
-        ``[-1, 1]`` at each FEM quadrature point (rect meshes only).
-
-        Supports both TET4 (4-node) and TET10 (10-node) elements.  For TET10
-        the reference coordinates of the 6 midpoint nodes are derived as
-        averages of the corner pairs defined by the VTK/JAX-FEM edge ordering.
-
-        For disk meshes only ``phi_quad`` is populated (``uv_quad`` stays
-        ``None``).
-        """
-        meta  = self._grid_meta[coil_idx]
-        shape = meta['shape']
-        n_phi = meta['n_phi']
-
-        fe         = prob.fes[0]
-        cells_np   = np.asarray(fe.cells, dtype=np.int64)   # (n_cells, n_nodes)
-        sv_np      = np.asarray(fe.shape_vals)               # (n_quads, n_nodes)
-        n_cell_nodes = cells_np.shape[1]
-
-        if n_cell_nodes not in (4, 10):
-            raise ValueError(
-                f"_compute_ref_coords: only TET4 and TET10 meshes are "
-                f"supported; found {n_cell_nodes} nodes per element."
-            )
-
-        is_tet10 = (n_cell_nodes == 10)
-        corners_np = cells_np[:, :4]  # (n_cells, 4) — corner nodes only
-
-        phi_cell_idx_np = np.asarray(meta['phi_cell_idx'], dtype=np.int64)  # (n_cells,)
-
-        if shape == 'rect':
-            n_g1   = meta['n_grid_1']
-            n_g2   = meta['n_grid_2']
-            n_cross = n_g1 * n_g2
-        else:  # disk
-            n_cross = meta['n2d']
-
-        # Per-corner-node phi integer (in [0, n_phi)) from global node index.
-        phi_int = corners_np // n_cross          # (n_cells, 4)
-
-        # A node is "front" (phi+1 side) if its phi-slice differs from the
-        # cell's phi-slice.
-        i_slice  = phi_cell_idx_np[:, np.newaxis]  # (n_cells, 1)
-        is_front = (phi_int != i_slice)            # (n_cells, 4)
-
-        # Unwrapped phi_ref: back = i/n_phi, front = (i+1)/n_phi.
-        phi_corners = np.where(
-            is_front,
-            (i_slice + 1.0) / n_phi,
-            i_slice        / n_phi,
-        ).astype(np.float64)   # (n_cells, 4)
-
-        if is_tet10:
-            # Midpoint reference phi = average of the two corner endpoints.
-            e = self._TET10_MID_EDGES  # (6, 2)
-            phi_mids = 0.5 * (phi_corners[:, e[:, 0]] +
-                              phi_corners[:, e[:, 1]])  # (n_cells, 6)
-            phi_ref_local = np.concatenate(
-                [phi_corners, phi_mids], axis=1
-            )  # (n_cells, 10)
-        else:
-            phi_ref_local = phi_corners  # (n_cells, 4)
-
-        phi_quad_np = np.einsum('qn, cn -> cq', sv_np, phi_ref_local)
-        meta['phi_quad'] = jnp.asarray(phi_quad_np)   # (n_cells, n_quads)
-
-        if shape != 'rect':
-            return   # no u, v coords for disk
-
-        # Cross-section reference coords from corner node indices.
-        node_j = (corners_np % n_cross) // n_g2    # (n_cells, 4)
-        node_k = corners_np % n_g2                  # (n_cells, 4)
-        u_corners = (2.0 * node_j / (n_g1 - 1) - 1.0).astype(np.float64)
-        v_corners = (2.0 * node_k / (n_g2 - 1) - 1.0).astype(np.float64)
-
-        if is_tet10:
-            e = self._TET10_MID_EDGES
-            u_mids = 0.5 * (u_corners[:, e[:, 0]] + u_corners[:, e[:, 1]])
-            v_mids = 0.5 * (v_corners[:, e[:, 0]] + v_corners[:, e[:, 1]])
-            u_ref = np.concatenate([u_corners, u_mids], axis=1)  # (n_cells, 10)
-            v_ref = np.concatenate([v_corners, v_mids], axis=1)
-        else:
-            u_ref = u_corners
-            v_ref = v_corners
-
-        uv_ref_local = np.stack([u_ref, v_ref], axis=-1)
-        uv_quad_np   = np.einsum('qn, cnd -> cqd', sv_np, uv_ref_local)
-        meta['uv_quad'] = jnp.asarray(uv_quad_np)
-
-    # ============================================================================
-    # Pure-JAX mesh point recomputation (preserves AD chain through dofs)
-    # ============================================================================
-
-    def _mesh_points_from_dofs(
-        self, dofs_i: jax.Array, coil_idx: int
-    ) -> jax.Array:
-        """Compute ``(n_nodes, 3)`` mesh points as pure JAX, differentiable.
-
-        For rectangle-sweep meshes this calls
-        :func:`coil_fem.meshing._rect_sweep_points`, the same helper used at
-        init-time by :func:`coil_fem.meshing.rectangle_sweep`, ensuring the
-        forward-pass mesh is bit-identical to the init-time mesh.  For
-        disk-sweep meshes it uses :func:`_disk_mesh_points_jax`.  The
-        returned JAX array is passed as ``params['points']`` to
-        ``ad_wrapper`` so the adjoint traces through the mesh geometry.
-        """
-        base = self.base_curves_jax[coil_idx]
-        curve = CurveXYZFourierJAX(base.quadpoints, dofs_i, base.order)
-        meta = self._grid_meta[coil_idx]
-
-        if meta['shape'] == 'rect':
-            fc = _make_framed_curve(curve, meta['frame'])
-            pts = _rect_sweep_points(
-                fc, meta['w1'], meta['w2'],
-                meta['n_grid_1'], meta['n_grid_2'],
-                mesh_type=meta.get('mesh_type', 'TET4'),
-            )
-        else:
-            pts = _disk_mesh_points_jax(
-                curve, meta['frame'], meta['radius'], meta['oxy']
-            )
-        return pts
 
     # ============================================================================
     # Symmetry expansion
@@ -883,14 +592,16 @@ class CoilFEM:
         """
         import interpax
 
-        meta    = self._grid_meta[coil_idx]
-        A       = meta['cross_section_area']
-        n_cells = meta['n_cells']
-        n_quads = meta['n_quads']
-        phi_q   = meta['phi_quad']   # (n_cells, n_quads) — static
+        mesh    = self.meshes[coil_idx]
+        A       = mesh.cross_section_area
+        n_cells = mesh.n_cells
+        n_quads = mesh.n_quads
+        phi_q   = mesh.phi_quad   # (n_cells, n_quads) — static
 
-        base  = self.base_curves_jax[coil_idx]
-        curve = CurveXYZFourierJAX(base.quadpoints, dofs_i, base.order)
+        # Rebuild the framed curve (and its underlying curve) from the traced
+        # DOFs; ``fc.curve`` is the differentiable centerline.
+        fc    = mesh.framed_curve.with_dofs(dofs_i)
+        curve = fc.curve
         I     = all_currents[coil_idx]
 
         # ── 1. Tangent at FEM quad points (interpolated, not spread) ──────────
@@ -910,16 +621,15 @@ class CoilFEM:
         )
 
         # ── 3. B_self at FEM quad points ──────────────────────────────────────
-        cross_section: dict = {'shape': meta['shape']}
-        if meta['shape'] == 'rect':
-            cross_section['w1'] = meta['w1']
-            cross_section['w2'] = meta['w2']
+        cross_section: dict = {'shape': mesh.shape}
+        if mesh.shape == 'rect':
+            cross_section['w1'] = mesh.w1
+            cross_section['w2'] = mesh.w2
         else:
-            cross_section['radius'] = meta['radius']
+            cross_section['radius'] = mesh.radius
 
-        fc = _make_framed_curve(curve, meta['frame'])
         B_self_q = B_self_quadrature(
-            fc, I, cross_section, phi_q, meta.get('uv_quad'),
+            fc, I, cross_section, phi_q, mesh.uv_quad,
         )   # (n_cells, n_quads, 3)
 
         # ── 4. B_ext at FEM quad points via Biot-Savart on physical mesh ──────
@@ -1020,8 +730,9 @@ class CoilFEM:
         * ``'solutions'``     -- list of raw ``ad_wrapper`` outputs, one per base
           coil.  Each element is a ``list[jnp.ndarray]`` in JAX-FEM's multi-physics
           convention; ``solutions[i][0]`` has shape ``(n_nodes, 3)``.  Pass this
-          directly to JAX-FEM internals (e.g. ``von_mises_stress``) that expect the
-          full solution list.
+          directly to post-processing helpers (e.g.
+          ``LinearElasticity3D.von_mises_stress``) that expect the full solution
+          list.
         * ``'displacements'`` -- list of displacement arrays, one per base coil,
           shape ``(n_nodes, 3)``.  Equivalent to ``solutions[i][0]`` for each ``i``
           but exposed as a plain array for convenient post-processing.  Shares the
@@ -1055,8 +766,6 @@ class CoilFEM:
             finally:
                 jaxfem_log.setLevel(old_level)
 
-        from .elasticity import von_mises_stress
-
         n_base = len(self.base_curves_jax)
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
@@ -1072,7 +781,7 @@ class CoilFEM:
         fvol_list, Bself_list, Bext_list = [], [], []
         with _maybe_quiet():
             for i in range(n_base):
-                pts_i = self._mesh_points_from_dofs(base_curves_dofs[i], i)
+                pts_i = self.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
                 bf_i, B_self_i, B_ext_i = self._body_force_at_quads(
                     i, base_curves_dofs[i], pts_i,
                     all_gammas, all_gammadashs, all_currents,
@@ -1081,7 +790,7 @@ class CoilFEM:
                     i, pts_i, base_curves_dofs[i], sd[i]
                 )
                 sol = self._forward_solve(i, pts_i, bf_i, weights_i)
-                vm  = von_mises_stress(self._problems[i], sol)
+                vm  = self._problems[i].von_mises_stress(sol)
 
                 sol_list.append(sol)
                 vm_list.append(vm)
@@ -1142,7 +851,7 @@ class CoilFEM:
           one per base coil.  Uniform per coil (zeros when no thermal
           parameters were configured); left un-broadcast for memory efficiency.
         """
-        from .elasticity import strain_tensors, recompute_fe_geometry
+        from .problem import recompute_fe_geometry
 
         result = self.run(
             base_curves_dofs=base_curves_dofs,
@@ -1159,8 +868,8 @@ class CoilFEM:
                 result['mesh_points'][i],
                 prob._cells_jnp, prob._sg_ref, prob._sv, prob._qw,
             )
-            eps_total, eps_thermal = strain_tensors(
-                prob, result['solutions'][i], shape_grads=sg
+            eps_total, eps_thermal = prob.strain_tensors(
+                result['solutions'][i], shape_grads=sg
             )
             eps_total_list.append(eps_total)
             eps_thermal_list.append(eps_thermal)
@@ -1169,6 +878,35 @@ class CoilFEM:
             'eps_total':   eps_total_list,    # list of (n_cells, n_quads, 3, 3)
             'eps_thermal': eps_thermal_list,  # list of (3, 3)
         }
+
+    @staticmethod
+    def strain_energy_density(
+        u_grad: jnp.ndarray, lam: float, mu: float, *, epsilon_th=None
+    ) -> jnp.ndarray:
+        """0.5 σ : ε_m — elastic (mechanical) strain-energy density per quad point.
+
+        Uses the mechanical strain ``ε_m = ε − ε_th`` when ``epsilon_th`` is
+        provided, so thermal pre-strain does not spuriously contribute to the
+        elastic energy.  Consumed by the ``strain_energy`` metric
+        (:func:`coil_fem.metrics.total_strain_energy`).
+
+        Parameters
+        ----------
+        u_grad : jnp.ndarray, shape ``(..., 3, 3)``
+            Displacement gradient at each quadrature point.
+        lam, mu : float
+            Lamé parameters.
+        epsilon_th : jnp.ndarray or None
+            Constant thermal eigenstrain ``(3, 3)``; ``None`` for isothermal.
+
+        Returns
+        -------
+        jnp.ndarray, shape ``(...,)``
+        """
+        eps = 0.5 * (u_grad + jnp.swapaxes(u_grad, -1, -2))
+        eps_m = eps - epsilon_th if epsilon_th is not None else eps
+        sig = cauchy_stress_small_strain(u_grad, lam, mu, epsilon_th=epsilon_th)
+        return 0.5 * jnp.sum(sig * eps_m, axis=(-2, -1))
 
     def objective(
         self,
@@ -1263,7 +1001,7 @@ class CoilFEM:
             for m in metrics
         }
         for i in range(n_base):
-            pts_i = self._mesh_points_from_dofs(base_curves_dofs[i], i)
+            pts_i = self.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
             bf_i, _, _ = self._body_force_at_quads(
                 i, base_curves_dofs[i], pts_i,
                 all_gammas, all_gammadashs, all_currents,
@@ -1415,7 +1153,7 @@ class CoilFEM:
         written: list[str] = []
 
         for i, coil_mesh in enumerate(self.meshes):
-            pts_i  = self._mesh_points_from_dofs(base_curves_dofs[i], i)
+            pts_i  = self.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
             pts_np = onp.asarray(pts_i, dtype=onp.float64)
             n_nodes = pts_np.shape[0]
 
@@ -1489,7 +1227,7 @@ class CoilFEM:
 
         sc = None
         for i in range(n_base):
-            pts_i  = self._mesh_points_from_dofs(base_curves_dofs[i], i)
+            pts_i  = self.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
             pts_np = onp.asarray(pts_i, dtype=onp.float64)
             n_nodes = pts_np.shape[0]
 
@@ -1637,42 +1375,3 @@ class CoilFEM:
             written.append(mesh_path)
 
         return written
-
-
-# ============================================================================
-# Geometry helpers (private utilities)
-# ============================================================================
-
-def _solve_grid_dims(n_cross: int, n_per_phi: int) -> tuple[int, int]:
-    """Recover ``(n_g1, n_g2)`` from ``n_g1*n_g2 = n_cross`` and
-    ``(n_g1-1)*(n_g2-1) = n_per_phi``.
-
-    Tries all divisors of ``n_cross`` that satisfy the constraint.
-    """
-    for g1 in range(2, n_cross + 1):
-        if n_cross % g1 == 0:
-            g2 = n_cross // g1
-            if (g1 - 1) * (g2 - 1) == n_per_phi:
-                return g1, g2
-    raise ValueError(
-        f"Cannot recover grid dims: n_cross={n_cross}, n_per_phi={n_per_phi}"
-    )
-
-
-def _infer_disk_params(n2d: int) -> tuple[int, int]:
-    """Recover ``(n_center, n_radial)`` from the total 2D node count ``n2d``
-    of the O-grid disk topology.
-
-    The O-grid formula: ``n2d = n_center^2 + 4*n_center*(n_radial-1)``
-    """
-    # Try all reasonable n_center values
-    for nc in range(2, 50):
-        remainder = n2d - nc * nc
-        if remainder > 0 and remainder % (4 * nc) == 0:
-            nr = remainder // (4 * nc) + 1
-            if nr >= 2:
-                return nc, nr
-    raise ValueError(
-        f"Cannot infer disk O-grid params from n2d={n2d}. "
-        "Provide 'n_center' and 'n_radial' explicitly in mesh_options."
-    )

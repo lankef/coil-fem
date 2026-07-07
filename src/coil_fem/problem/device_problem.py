@@ -27,7 +27,7 @@ Design notes
   needs only ``jax`` + ``jax_fem``, so importing ``DeviceProblem`` is always
   safe even on CPU-only machines.  The heavy spineax/cuDSS dependency is pulled
   in lazily, only when the cuDSS solver is actually constructed
-  (see :mod:`coil_fem.backend.cudss`).
+  (see :mod:`coil_fem.solver.cudss`).
 * When ``gpu_assembly=False`` (the default) the class is byte-for-byte
   equivalent to the stock ``Problem`` — ``compute_newton_vars`` simply defers
   to ``super()``.
