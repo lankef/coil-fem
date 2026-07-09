@@ -52,7 +52,7 @@ exclude_patterns = [
     "**/.ipynb_checkpoints",
 ]
 
-html_theme = "alabaster"
+html_theme = "sphinx_rtd_theme"
 html_static_path = ["_static"]
 
 # Set when building on Read the Docs (canonical URL for sitemaps / meta tags).
