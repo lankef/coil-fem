@@ -1,14 +1,10 @@
-"""
-Pure JAX implementation of CurveXYZFourier as a JAX pytree.
+"""Pure-JAX implementation of ``CurveXYZFourier`` as a JAX pytree.
 
-DOF layout (per coordinate x, y, z)::
-
-    [c0, s1, c1, s2, c2, ..., s_order, c_order]
-
-where ``ci`` is the cosine coefficient for mode *i* and ``si`` the sine coefficient.
-The full ``dofs`` array has shape ``(3*(2*order+1),)``.
-
-Pytree leaves (traced): ``quadpoints``, ``dofs``. Pytree aux (static): ``order``.
+Provides :class:`CurveXYZFourierJAX`, a differentiable Fourier-series curve
+compatible with JAX transformations.  DOF layout (per coordinate x, y, z):
+``[c0, s1, c1, s2, c2, ..., s_order, c_order]`` with full shape
+``(3*(2*order+1),)``.  Pytree leaves: ``quadpoints``, ``dofs``; static aux:
+``order``.
 """
 
 import jax
@@ -17,8 +13,7 @@ import jax.numpy as jnp
 
 @jax.tree_util.register_pytree_node_class
 class CurveXYZFourierJAX:
-    r"""
-    JAX pytree implementation of CurveXYZFourier.
+    r"""JAX pytree implementation of ``CurveXYZFourier``.
 
     The curve is parameterised by :math:`\phi \in [0, 1)` and represented as
 
@@ -45,9 +40,9 @@ class CurveXYZFourierJAX:
         self.dofs = jnp.asarray(dofs, dtype=float)
         self.order = order  # static -- lives in aux_data, not in leaves
 
-    # ------------------------------------------------------------------ #
-    # JAX pytree protocol                                                   #
-    # ------------------------------------------------------------------ #
+    # ============================================================================
+    # JAX pytree protocol
+    # ============================================================================
 
     def tree_flatten(self):
         children = (self.quadpoints, self.dofs)
@@ -59,17 +54,16 @@ class CurveXYZFourierJAX:
         quadpoints, dofs = children
         return cls(quadpoints, dofs, aux_data)
 
-    # ------------------------------------------------------------------ #
-    # Simsopt interop                                                       #
-    # ------------------------------------------------------------------ #
+    # ============================================================================
+    # Simsopt interop
+    # ============================================================================
 
     @classmethod
     def from_simsopt(cls, curve):
-        """
-        Construct a CurveXYZFourierJAX from a simsopt CurveXYZFourier.
+        """Construct a ``CurveXYZFourierJAX`` from a simsopt ``CurveXYZFourier``.
 
         The DOF layout is identical between the two representations
-        ([c0, s1, c1, …] per coordinate), so no reordering is needed.
+        (``[c0, s1, c1, …]`` per coordinate), so no reordering is needed.
         """
         return cls(
             quadpoints=curve.quadpoints,
@@ -78,12 +72,7 @@ class CurveXYZFourierJAX:
         )
 
     def to_simsopt(self):
-        """
-        Convert this CurveXYZFourierJAX to a simsopt CurveXYZFourier.
-
-        Returns a new simsopt CurveXYZFourier with the same quadpoints,
-        order, and DOFs.
-        """
+        """Convert to a simsopt ``CurveXYZFourier`` with the same quadpoints, order, and DOFs."""
         import numpy as np
         from simsopt.geo import CurveXYZFourier
 
@@ -91,26 +80,23 @@ class CurveXYZFourierJAX:
         curve.set_dofs(np.asarray(self.dofs))
         return curve
 
-    # ------------------------------------------------------------------ #
-    # Public interface                                                      #
-    # ------------------------------------------------------------------ #
+    # ============================================================================
+    # Public interface
+    # ============================================================================
 
     def gamma_eval(self, phi, diff_order: int = 0):
-        """
-        Evaluate the curve (or its derivative) at arbitrary angles phi.
+        """Evaluate the curve or its derivative at arbitrary parameter values.
 
-        Uses the analytic formula for the n-th derivative of a Fourier series:
+        Parameters
+        ----------
+        phi : array-like
+            Curve parameter values in ``[0, 1)``, arbitrary shape.
+        diff_order : int
+            Derivative order (0 = positions, 1 = first derivative, …).
 
-            d^n/dphi^n sin(2*pi*j*phi) = (2*pi*j)^n * sin(2*pi*j*phi + n*pi/2)
-            d^n/dphi^n cos(2*pi*j*phi) = (2*pi*j)^n * cos(2*pi*j*phi + n*pi/2)
-
-        Args:
-            phi:        Array-like of angles in [0, 1), arbitrary shape.
-            diff_order: Non-negative integer; 0 returns positions, 1 returns
-                        first derivatives, etc.
-
-        Returns:
-            Array of shape ``phi.shape + (3,)``.
+        Returns
+        -------
+        jax.Array, shape ``phi.shape + (3,)``
         """
         phi = jnp.asarray(phi, dtype=float)
         phi_shape = phi.shape
@@ -156,11 +142,11 @@ class CurveXYZFourierJAX:
         return self.gamma_eval(self.quadpoints, 3)
 
     def kappa(self):
-        """
-        Curvature kappa = ||gamma' x gamma''|| / ||gamma'||^3.
+        r"""Curvature :math:`\kappa = \|\gamma' \times \gamma''\| / \|\gamma'\|^3`.
 
-        Returns:
-            Array of shape (nquad,).
+        Returns
+        -------
+        jax.Array, shape (nquad,)
         """
         d1 = self.gammadash()
         d2 = self.gammadashdash()
@@ -170,11 +156,11 @@ class CurveXYZFourierJAX:
         )
 
     def torsion(self):
-        """
-        Torsion tau = (gamma' x gamma'') . gamma''' / ||gamma' x gamma''||^2.
+        r"""Torsion :math:`\tau = (\gamma' \times \gamma'') \cdot \gamma''' / \|\gamma' \times \gamma''\|^2`.
 
-        Returns:
-            Array of shape (nquad,).
+        Returns
+        -------
+        jax.Array, shape (nquad,)
         """
         d1 = self.gammadash()
         d2 = self.gammadashdash()
@@ -183,17 +169,12 @@ class CurveXYZFourierJAX:
         return jnp.sum(cross * d3, axis=1) / jnp.sum(cross ** 2, axis=1)
 
     def incremental_arclength(self):
-        """
-        Incremental arclength at each quadrature point.
+        r"""Incremental arclength :math:`ds = \|\gamma'(\phi)\| d\phi` at each quadrature point.
 
-        Returns the differential arclength element:
-            ds = ||gamma'(phi)|| dphi
-
-        where gamma'(phi) is the derivative of the position vector with respect
-        to the parameterization variable phi.
-
-        Returns:
-            Array of shape (nquad,) containing ||gamma'|| at each quadrature point.
+        Returns
+        -------
+        jax.Array, shape (nquad,)
+            :math:`\|\gamma'(\phi)\|` at each quadrature point.
         """
         d1 = self.gammadash()
         return jnp.linalg.norm(d1, axis=1)

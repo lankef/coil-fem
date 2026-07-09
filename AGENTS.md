@@ -102,9 +102,68 @@ data/                          # Coil geometry files (gitignored)
 - **JIT/vmap:** Use `jax.jit` and `jax.vmap` for vectorized operations. Prefer `functools.partial` for binding static args.
 - **Optional heavy deps:** Guard imports with `try/except ImportError` and set a `_HAS_*` sentinel if a dependency is truly optional.
 
-### Docstrings
+### Docstrings and Comments
 
-Use NumPy-style docstrings with `Parameters`, `Returns`, and `Examples` sections. Include math with `.. math::` for Sphinx rendering.
+#### Module docstrings
+
+Every `.py` file must start with a module docstring. Format: one-sentence summary on the opening `"""` line, followed by an optional short paragraph (≤3 sentences) of **user-facing** context — what the module provides and when to use it. No internal design rationale, no change history, no step-by-step descriptions of the implementation.
+
+```python
+"""Structured volume meshes for coil cross-sections.
+
+Sweeps a rectangular or disk cross-section grid along a framed curve to
+produce a ``CoilMesh`` (TET4 or TET10) used by :class:`~coil_fem.CoilFEM`.
+"""
+```
+
+#### Function and class docstrings
+
+Use **NumPy style** throughout. The one-line summary goes on the same line as the opening `"""`. Use `Parameters`, `Returns`, `Raises`, `Notes`, and `Examples` sections as needed. Include math with `.. math::` for Sphinx rendering.
+
+```python
+def foo(x: jax.Array, scale: float = 1.0) -> jax.Array:
+    """One-line summary of what the function does.
+
+    Optional 1-2 sentence extended description.
+
+    Parameters
+    ----------
+    x : jax.Array, shape (N, 3)
+        Description of x.
+    scale : float
+        Description of scale (default 1.0).
+
+    Returns
+    -------
+    jax.Array, shape (N, 3)
+        Description of return value.
+
+    Raises
+    ------
+    ValueError
+        When x has the wrong shape.
+    """
+```
+
+Private helpers (names starting with `_`) only need a one-line summary.
+
+#### What to keep out of docstrings
+
+- No descriptions of prior implementations ("This replaces the former …").
+- No internal design rationale ("Why this class exists", "Design notes", "Path C", numbered pipeline steps). Move these to inline comments if they are genuinely needed by a maintainer reading the code.
+- No architecture "brags". The docstring goal is to help the **user** understand the API, not to explain how clever the implementation is.
+
+#### Section headers in code
+
+All inline section-divider comments use the `# ===` style:
+
+```python
+# ============================================================================
+# Section Name
+# ============================================================================
+```
+
+Do **not** use `# ── Title ──────`, `# --- Title ---`, `# ---- # Title # ----`, or `# ---\n# Title\n# ---` variants.
 
 ### Module Scope
 

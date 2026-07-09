@@ -1,14 +1,11 @@
 """FEM ``Problem`` subpackage for coil-fem.
 
-Exposes the differentiable linear-elasticity problem and its device-assembly
-base class from a single namespace so callers can simply do::
+Exposes :class:`LinearElasticity3D` (differentiable linear-elasticity with
+Winkler BCs and thermal eigenstrain) and :class:`DeviceProblem` (JAX
+device-assembly base class for the cuDSS solver backend) from a single
+namespace::
 
     from coil_fem.problem import LinearElasticity3D, DeviceProblem
-
-``linear_elasticity`` holds :class:`LinearElasticity3D` (Path-C geometry
-differentiation, Winkler BCs, thermal eigenstrain) plus material/BC/geometry
-and post-processing helpers.  ``device_problem`` holds :class:`DeviceProblem`,
-the JAX device-assembly ``Problem`` subclass used by the cuDSS solver backend.
 """
 
 from .device_problem import DeviceProblem

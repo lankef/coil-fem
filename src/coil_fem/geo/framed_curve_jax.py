@@ -43,9 +43,9 @@ import jax
 import jax.numpy as jnp
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Pure-JAX centroid frame  (mirrors simsopt rotated_centroid_frame)
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _rotated_centroid_frame_pure(gamma, gammadash, alpha):
     """Pure-JAX centroid frame rotated by *alpha* around the tangent.
@@ -71,9 +71,9 @@ def _rotated_centroid_frame_pure(gamma, gammadash, alpha):
     return t, p, q
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Pure-JAX RMF helpers  (Wang et al. 2008 double-reflection algorithm)
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 # Squared-eps offset (~1e-30 → forward bias ~1e-15, well below float64
 # precision).  Used to make ``||x||`` differentiable at ``x = 0``: the
@@ -220,9 +220,9 @@ def _rotated_rmf_frame_pure(gamma, gammadash, alpha):
     return t, p, q
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # JIT boundaries around the frame computation
-# ---------------------------------------------------------------------------
+# ============================================================================
 # The RMF frame uses ``jax.lax.scan`` (the double-reflection sweep in
 # :func:`_rmf_normals_pure_jax`).  When the frame is evaluated *eagerly*
 # (i.e. not inside an enclosing ``jax.jit``), every call re-lowers and
@@ -260,9 +260,9 @@ def _frame_and_dash_jitted(
     )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Base class
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 @jax.tree_util.register_pytree_node_class
 class FramedCurveJAX:
@@ -382,9 +382,9 @@ class FramedCurveJAX:
         curve, alpha = children
         return cls(curve, alpha)
 
-    # ------------------------------------------------------------------
+    # ============================================================================
     # Curve pass-throughs
-    # ------------------------------------------------------------------
+    # ============================================================================
 
     def gamma(self):
         """Curve position at quadrature points, shape (nquad, 3)."""
@@ -416,9 +416,9 @@ class FramedCurveJAX:
         """
         return self.curve.gamma_eval(jnp.asarray(phi, dtype=float))
 
-    # ------------------------------------------------------------------
+    # ============================================================================
     # Frame interface
-    # ------------------------------------------------------------------
+    # ============================================================================
 
     # Subclasses set this to a module-level pure frame function
     # ``(gamma, gammadash, alpha) -> (t, p, q)``.  It is used as a *static*
@@ -490,9 +490,9 @@ class FramedCurveJAX:
             "(FramedCurveCentroidJAX, FramedCurveRMFJAX)."
         )
 
-    # ------------------------------------------------------------------
+    # ============================================================================
     # Frame curvatures  κ₁, κ₂, κ₃
-    # ------------------------------------------------------------------
+    # ============================================================================
 
     def frame_normal_curvature(self):
         r"""Frame normal curvature :math:`\kappa_1 = (d\mathbf{t}/dl)\cdot\mathbf{p}`.
@@ -554,9 +554,9 @@ class FramedCurveJAX:
         return self.frame_torsion()
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Centroid frame
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 @jax.tree_util.register_pytree_node_class
 class FramedCurveCentroidJAX(FramedCurveJAX):
@@ -613,9 +613,9 @@ class FramedCurveCentroidJAX(FramedCurveJAX):
         return t, ca * p0 - sa * q0, sa * p0 + ca * q0
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Rotation-minimizing frame
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 @jax.tree_util.register_pytree_node_class
 class FramedCurveRMFJAX(FramedCurveJAX):
@@ -676,9 +676,9 @@ class FramedCurveRMFJAX(FramedCurveJAX):
         return t.reshape(out_shape), p.reshape(out_shape), q.reshape(out_shape)
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Convenience constructors
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _to_jax_curve(curve):
     """Accept either a CurveXYZFourierJAX or a simsopt CurveXYZFourier."""

@@ -1,36 +1,11 @@
-"""Customized JAX-FEM ``Problem`` for the cuDSS GPU backend.
+"""JAX-FEM ``Problem`` variant whose Jacobian can stay on the JAX device.
 
-:class:`DeviceProblem` is a drop-in subclass of :class:`jax_fem.problem.Problem`
-introduced **solely for compatibility with the cuDSS solver backend**
-(``problem_options={'solver': 'cudss'}``).  It exists so that the on-device
-Jacobian-assembly behaviour can be toggled with a single constructor flag
-instead of synthesizing temporary subclasses / mixins at runtime.
-
-Why this class exists
----------------------
-JAX-FEM's default :meth:`Problem.compute_newton_vars` copies the per-cell
-Jacobian to host (``self.V = onp.array(cells_jac_flat.reshape(-1))``) before
-building a scipy/PETSc CSR matrix.  The cuDSS backend instead consumes the
-Jacobian values directly on the JAX device, so this host round-trip is pure
-overhead.  When ``gpu_assembly=True`` the override keeps the flat COO
-Jacobian values in ``self.V_jax`` (a JAX device array) and never populates the
-host ``self.V``.
-
-Design notes
-------------
-* The override only uses **generic** ``Problem`` machinery
-  (``cells_list``, ``split_and_compute_cell``, ``compute_face``,
-  ``compute_residual_vars_helper``); it is not specific to any particular
-  physics, so it lives at the ``Problem`` layer and can be reused by any
-  FEM problem that wants the cuDSS backend.
-* It deliberately has **no spineax / cuDSS import**.  The device-assembly path
-  needs only ``jax`` + ``jax_fem``, so importing ``DeviceProblem`` is always
-  safe even on CPU-only machines.  The heavy spineax/cuDSS dependency is pulled
-  in lazily, only when the cuDSS solver is actually constructed
-  (see :mod:`coil_fem.solver.cudss`).
-* When ``gpu_assembly=False`` (the default) the class is byte-for-byte
-  equivalent to the stock ``Problem`` — ``compute_newton_vars`` simply defers
-  to ``super()``.
+:class:`DeviceProblem` is a thin drop-in subclass of
+:class:`jax_fem.problem.Problem`.  Setting ``gpu_assembly=True`` keeps the
+flat COO Jacobian values in ``self.V_jax`` (a JAX device array) and skips
+the host copy normally done by ``compute_newton_vars``, making it compatible
+with the cuDSS GPU solver backend.  The default ``gpu_assembly=False``
+behaviour is byte-for-byte identical to the stock ``Problem``.
 """
 
 from __future__ import annotations
@@ -49,30 +24,21 @@ from jax_fem.problem import Problem
 class DeviceProblem(Problem):
     """``Problem`` variant whose Jacobian assembly can stay on the JAX device.
 
-    This is a thin compatibility shim for the cuDSS backend; see the module
-    docstring for the rationale.
-
     Parameters
     ----------
     gpu_assembly : bool, default False
-        When ``True``, :meth:`compute_newton_vars` keeps the flat COO Jacobian
-        values on the JAX device in ``self.V_jax`` and skips the host
-        ``self.V`` copy.  When ``False``, behaviour is identical to the stock
-        :class:`jax_fem.problem.Problem`.
+        When ``True``, keeps the flat COO Jacobian in ``self.V_jax`` and
+        skips the host copy in :meth:`compute_newton_vars`.  Required for the
+        cuDSS backend; harmless otherwise.
 
-        After each call to :meth:`Problem.newton_update`, ``self.V_jax`` holds
-        the flat COO Jacobian values; ``self.V`` (host numpy) is **not**
-        updated.
-
-    Notes
-    -----
-    ``gpu_assembly`` is a dataclass field placed after all of ``Problem``'s
-    fields (which all carry defaults), so it can be selected at construction::
+    Examples
+    --------
+    ::
 
         problem = LinearElasticity3D(
             mesh, vec=3, dim=3, ele_type=mesh.ele_type,
             additional_info=(...),
-            gpu_assembly=True,   # enable the cuDSS-compatible path
+            gpu_assembly=True,
         )
     """
 
