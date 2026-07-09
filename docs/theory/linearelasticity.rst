@@ -9,6 +9,7 @@ and a specified uniform integral thermal contraction. The governing equations
 are as follows:
 
 .. math::
+   :nowrap:
 
    \begin{alignat}{3}
        \nabla \cdot \boldsymbol{\sigma}(\mathbf{u}) + \mathbf{F}_\text{body} &= 0,
