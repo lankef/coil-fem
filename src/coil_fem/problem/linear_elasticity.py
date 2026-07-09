@@ -1,55 +1,12 @@
-"""
-3D linear isotropic elasticity for JAX-FEM.
+"""3D linear isotropic elasticity for JAX-FEM.
 
-Main API
---------
-* :class:`LinearElasticity3D` - JAX-FEM ``Problem`` subclass; supports
-  ``ad_wrapper`` with geometry differentiation (Path C) and differentiable
-  Winkler spring-foundation BCs via ``params['support_weights']``.
-* :func:`dirichlet_bc` - Build Dirichlet BC info from a selection-rule callable.
-
-Solving
--------
-Solve via ``jax_fem.solver.ad_wrapper(problem)`` (CPU, differentiable) or
-:func:`coil_fem.solver.cudss.cudss_ad_wrapper` (GPU zero-copy path); both return
-JAX-FEM's ``sol_list`` whose first entry ``sol_list[0]`` is the displacement
-field of shape ``(num_nodes, 3)``.  :class:`~coil_fem.CoilFEM` drives this
-internally.
-
-Path C: JAX-native FE geometry
--------------------------------
-:meth:`LinearElasticity3D.set_params` recomputes **all** geometry-dependent FE
-arrays (``shape_grads``, ``JxW``, ``v_grads_JxW``, ``physical_quad_points``)
-from ``params['points']`` using pure JAX ops.  Because ``jax_fem.solver.ad_wrapper``
-differentiates the residual through ``set_params`` via ``jax.vjp``, this exposes
-the gradient of the FEM solution with respect to mesh node positions without
-rewriting the adjoint.
-
-Differentiable Winkler BC
---------------------------
-When ``winkler_k_scalar`` is set at construction, the Winkler spring stiffness
-is provided per surface-node at run-time as ``params['support_weights']`` — a
-``(n_surface_nodes,)`` JAX array of weights in ``[0, 1]``.  The actual
-stiffness at each surface quadrature point is interpolated from node weights
-using face shape functions and scaled by ``winkler_k_scalar``.  The weight
-array is absorbed into ``nanson_scale`` so ``get_surface_maps`` returns the
-trivial identity surface map; no changes to JAX-FEM assembly are needed.
-
-For a differentiable inverse problem (e.g. optimise coil geometry + currents)::
-
-    params = {
-        'points':          jnp.array(mesh.points),   # (N, 3)  from CoilMesh
-        'body_force':      lorentz_at_quads,          # (num_cells, num_quads, 3)
-        'support_weights': weights,                   # (n_surface_nodes,) optional
-    }
-    fwd_pred = ad_wrapper(problem)
-    sol = fwd_pred(params)   # differentiable w.r.t. all params entries
-
-Post-processing
----------------
-* :meth:`LinearElasticity3D.von_mises_stress` - Per-quadrature-point von Mises
-  stress.
-* :meth:`LinearElasticity3D.strain_tensors` - Total and thermal strain tensors.
+Provides :class:`LinearElasticity3D`, a JAX-FEM ``Problem`` subclass that
+supports fully-differentiable solves via ``ad_wrapper`` with respect to mesh
+node positions (``params['points']``), volumetric body forces
+(``params['body_force']``), and per-node Winkler spring weights
+(``params['support_weights']``).  Companion helpers :func:`lame_parameters`,
+:func:`itc_strain`, :func:`dirichlet_bc`, and :func:`recompute_fe_geometry`
+cover common setup tasks.
 """
 
 from __future__ import annotations
@@ -67,7 +24,20 @@ from .device_problem import DeviceProblem
 # ============================================================================
 
 def lame_parameters(E: float, nu: float) -> tuple[float, float]:
-    """Convert Young's modulus and Poisson's ratio to Lamé parameters."""
+    """Convert Young's modulus and Poisson's ratio to Lamé parameters.
+
+    Parameters
+    ----------
+    E : float
+        Young's modulus [Pa].
+    nu : float
+        Poisson's ratio.
+
+    Returns
+    -------
+    lam, mu : float
+        First Lamé parameter [Pa] and shear modulus [Pa].
+    """
     lam = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
     mu = E / (2.0 * (1.0 + nu))
     return lam, mu
@@ -226,48 +196,36 @@ def recompute_fe_geometry(points, cells, shape_grads_ref, shape_vals, quad_weigh
 # ============================================================================
 
 class LinearElasticity3D(DeviceProblem):
-    """Linear isotropic elasticity with JAX-native FE geometry (Path C).
+    """Linear isotropic elasticity, fully differentiable via ``ad_wrapper``.
 
-    Implements small-strain Hooke's law: σ = λ tr(ε) I + 2μ ε.
+    Implements small-strain Hooke's law ``σ = λ tr(ε) I + 2μ ε``.
+    ``set_params`` recomputes all FE geometry arrays from ``params['points']``
+    using pure JAX, exposing gradients through mesh node positions.  Optional
+    Winkler spring-foundation BCs are activated by passing ``winkler_k_scalar``
+    in ``additional_info``; per-node weights are then supplied at run-time as
+    ``params['support_weights']``.
 
-    ``set_params`` recomputes all geometry-dependent FE arrays from
-    ``params['points']`` using pure JAX, so ``jax_fem.solver.ad_wrapper``
-    propagates gradients through mesh node positions without any changes to the
-    adjoint machinery.
+    Parameters
+    ----------
+    ``additional_info`` is a tuple ``(E, nu, body_force[, winkler_k_scalar[, itc]])``:
 
-    Parameters passed via ``additional_info``
-    -----------------------------------------
     E : float
         Young's modulus [Pa].
     nu : float
         Poisson's ratio.
-    body_force : tuple(float, float, float) or callable(x) -> (3,)
-        Body force [N/m³].  For a constant force (e.g. gravity) pass a 3-tuple.
-        For a position-dependent force pass a callable ``f(x) -> jnp.array(3)``.
-        This is used for the **forward-only** path; for the differentiable path
-        pass ``params['body_force']`` to ``set_params`` instead.
+    body_force : tuple[float, float, float] or callable
+        Body force [N/m³] for forward-only solves.  For the differentiable
+        path supply ``params['body_force']`` instead.
     winkler_k_scalar : float, optional
-        Base Winkler spring stiffness [N/m³].  When set, ``custom_init``
-        detects exterior faces topologically and builds the Winkler surface
-        from scratch — no ``location_fns`` needed.  Per-node weights in
-        ``[0, 1]`` are supplied at run-time through
-        ``params['support_weights']`` in :meth:`set_params`; the actual
-        per-quad stiffness is ``winkler_k_scalar * interp(support_weights)``.
+        Base Winkler spring stiffness [N/m³].  Exterior faces are detected
+        automatically; no ``location_fns`` needed.
     itc : float, optional
-        Isotropic **integral thermal contraction**: the (positive) dimensionless
-        linear thermal contraction ``ΔL/L`` accumulated on cooldown to the
-        service temperature.  When given, the thermal eigenstrain
-        ``ε_th = −itc · I`` is pre-computed once at construction and baked
-        into the constitutive law.  ``itc`` is not a differentiable DOF.
-        This replaces the former ``(alpha, T_init, T_final)`` triple and is
-        parametrised directly by the measured integral contraction (no
-        constant-CTE assumption).
+        Integral thermal contraction ``ΔL/L`` (positive, dimensionless).
+        Pre-computes eigenstrain ``ε_th = −itc · I`` at construction.
 
-    Example — forward-only (no Winkler BC)
-    ----------------------------------------
-    Pass the **physical** body force (positive downward = negative z for
-    gravity).  :meth:`get_mass_map` internally negates it to match JAX-FEM's
-    residual convention ``R = laplace_val + mass_val``::
+    Examples
+    --------
+    Forward-only solve (no Winkler BC)::
 
         from jax_fem.solver import solver
 
@@ -279,22 +237,19 @@ class LinearElasticity3D(DeviceProblem):
         )
         sol = solver(problem, solver_options={"umfpack_solver": {}})
 
-    Example — differentiable path with Winkler BC
-    -----------------------------------------------
-    Pass ``winkler_k_scalar`` in ``additional_info``; no ``location_fns``
-    required — exterior faces are detected automatically::
+    Differentiable solve with Winkler BC::
 
         problem = LinearElasticity3D(
             mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-            additional_info=(200e9, 0.3, (0., 0., 0.), 1e9),  # winkler_k_scalar=1e9
+            additional_info=(200e9, 0.3, (0., 0., 0.), 1e9),
         )
         fwd_pred = ad_wrapper(problem)
         params = {
             'points':          jnp.array(mesh.points),
             'body_force':      lorentz_at_quads,
-            'support_weights': weights,   # (n_surface_nodes,) in [0, 1]
+            'support_weights': weights,
         }
-        sol = fwd_pred(params)   # differentiable w.r.t. all entries
+        sol = fwd_pred(params)
     """
 
     def custom_init(
@@ -355,18 +310,6 @@ class LinearElasticity3D(DeviceProblem):
         self._sv     = jnp.asarray(fe.shape_vals)          # (num_quads, num_nodes)
         self._qw     = jnp.asarray(fe.quad_weights)        # (num_quads,)
 
-        # ── Boundary Condition Construction ──────────────────────────────────
-        #
-        # All BC surface structures are built here, in one place, from scratch.
-        # Problem.__init__ was called with location_fns=None, so boundary_inds_list
-        # is empty and I/J contain only the bulk volume block.
-        #
-        # To add a second BC surface type in the future (e.g. a Dirichlet lift
-        # surface or a Neumann traction), append another block here following
-        # the same pattern: detect faces → (optionally upgrade quadrature) →
-        # build the six boundary structures → append face I/J.
-        #
-        # ── Winkler exterior-surface BC ───────────────────────────────────────
         if self._winkler_k_scalar is not None:
             if len(self.boundary_inds_list) != 0:
                 raise ValueError(

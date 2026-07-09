@@ -1,33 +1,15 @@
-"""
-Magnetic field computation for stellarator coils.
+"""Magnetic field computation for stellarator coils.
 
-Public API
-----------
-biot_savart(target_points, source_gammas, source_gammadashs, source_currents)
-    Core Biot-Savart kernel: B at arbitrary target points from filament sources.
-    Callers that need to exclude the self-contribution zero the relevant current:
-    ``source_currents.at[coil_idx].set(0.0)``.
-
-B_self_quadrature(framed_curve, current, cross_section, phi_quad, uv_quad)
-    Self-field at FEM quadrature points using the full Landreman-Hurwitz-
-    Antonsen (2025) formula for a rectangular cross-section.  Disk cross-
-    sections raise ``NotImplementedError``.
-
-lorentz_body_force(J, B)
-    Lorentz body-force density ``f = J x B``.  The caller builds the current
-    density ``J`` (e.g. ``(I / A) t_hat``), keeping this agnostic to the current
-    model (uniform, cable, skin-effect, ...).
+Provides :func:`biot_savart` (filament Biot-Savart kernel),
+:func:`B_self_quadrature` (self-field at FEM quadrature points via the
+Landreman-Hurwitz-Antonsen 2025 formula for rectangular cross-sections), and
+:func:`lorentz_body_force` (``J × B`` body-force density).
 
 Cross-section coordinate convention (LHA 2025)
-----------------------------------------------
+-----------------------------------------------
 Points inside the cross-section are parametrised as
-
-    r(phi, u, v) = r_c(phi)
-                 + (u * a / 2) * p(phi)
-                 + (v * b / 2) * q(phi),
-
-where a = w1 (full width in p), b = w2 (full width in q), and u, v in [-1, 1]
-with the four corners at s_u, s_v = +/-1.  The centerline is u = v = 0.
+``r(φ, u, v) = r_c(φ) + (u·a/2)·p(φ) + (v·b/2)·q(φ)``,
+where ``a = w1``, ``b = w2``, and ``u, v ∈ [-1, 1]``.
 
 References
 ----------

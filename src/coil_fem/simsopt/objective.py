@@ -1,8 +1,10 @@
-"""
-Thin :class:`simsopt.Optimizable` wrapper around :class:`~coil_fem.CoilFEM`.
+"""Simsopt ``Optimizable`` wrapper around :class:`~coil_fem.CoilFEM`.
 
-Magnetic field and equilibrium data stay **outside** the optimisable graph as
-numpy constants; this module only connects coil geometry DOFs to coil_fem.
+Connects coil geometry DOFs to the structural FEM pipeline via
+:class:`CoilFEMObjective`, exposing :meth:`~CoilFEMObjective.J` and
+:meth:`~CoilFEMObjective.dJ` for use in simsopt optimisation loops.
+Magnetic field / equilibrium data stay outside the optimisable graph as
+numpy constants.
 """
 
 from __future__ import annotations
@@ -29,33 +31,10 @@ except ImportError:  # pragma: no cover
 
 
 class CoilFEMObjective(Optimizable):
-    """
-    Simsopt :class:`~simsopt._core.optimizable.Optimizable` wrapping
-    :class:`~coil_fem.CoilFEM`.
+    """Simsopt ``Optimizable`` wrapping :class:`~coil_fem.CoilFEM`.
 
-    Computes a weighted sum of FEM-based structural metrics over base coils and
+    Computes a weighted sum of FEM structural metrics over base coils and
     exposes :meth:`J` / :meth:`dJ` for use in simsopt optimisation loops.
-
-    **How simsopt Optimizable objects work (brief primer)**
-
-    Every :class:`~simsopt._core.optimizable.Optimizable` node stores degrees
-    of freedom (DOFs) and participates in a DAG of objectives.
-
-    * ``obj.x`` — flat numpy array of all **free** DOFs from ``obj`` *and all
-      its ancestors* (the ``depends_on`` chain).  Ancestors are de-duplicated by
-      the identity of their ``DOFs`` storage object, so shared parents (e.g.
-      curves used by both ``Jforce`` and this objective) appear exactly *once*.
-    * ``obj.x = dofs`` — distributes values back to each ancestor automatically.
-    * ``obj.J()`` — scalar objective value.
-    * ``obj.dJ()`` — flat gradient matching ``obj.x``.  The method body (before
-      the ``@derivative_dec`` decoration) returns a
-      :class:`~simsopt._core.derivative.Derivative` mapping
-      ``{opt: grad_array}``; the decorator contracts it into a flat numpy array.
-    * ``Derivative.__add__`` accumulates gradients for shared keys, so
-      ``OptimizableSum`` (``JF + Jstress``) de-duplicates shared parents
-      automatically.
-    * ``recompute_bell()`` is called by simsopt whenever any ancestor's DOFs
-      change; override it to invalidate caches.
 
     Parameters
     ----------
@@ -160,7 +139,9 @@ class CoilFEMObjective(Optimizable):
                 f"len(metric_weights)={len(metric_weights)}."
             )
 
-        # ── Extract simsopt curve / current objects from the supplied coils ──
+        # ============================================================================
+        # Extract simsopt curve / current objects from the supplied coils
+        # ============================================================================
         assert len(base_curves) == len(base_currents)
         self._base_curves = base_curves
         self._base_currents = base_currents
@@ -175,7 +156,9 @@ class CoilFEMObjective(Optimizable):
         self._gravity_options  = gravity_options
         self._verbose          = verbose
 
-        # ── Per-coil support models (broadcast a single one if given) ────────
+        # ============================================================================
+        # Per-coil support models (broadcast a single one if given)
+        # ============================================================================
         if isinstance(base_supports, CoilSupport):
             base_supports = [base_supports] * len(base_curves)
         if len(base_supports) != len(base_curves):
@@ -185,7 +168,9 @@ class CoilFEMObjective(Optimizable):
             )
         self._base_supports = list(base_supports)
 
-        # ── Convert to JAX objects for CoilFEM construction ──────────────────
+        # ============================================================================
+        # Convert to JAX objects for CoilFEM construction
+        # ============================================================================
         base_curves_jax = [
             CurveXYZFourierJAX.from_simsopt(c) for c in self._base_curves
         ]
@@ -193,7 +178,9 @@ class CoilFEMObjective(Optimizable):
             [c.get_value() for c in self._base_currents]
         )
 
-        # ── Build the internal CoilFEM object (mesh topology fixed here) ─────
+        # ============================================================================
+        # Build the internal CoilFEM object (mesh topology fixed here)
+        # ============================================================================
         self.fem = CoilFEM(
             base_curves_jax,
             base_currents_jax,
@@ -234,14 +221,18 @@ class CoilFEMObjective(Optimizable):
             ),
         )
 
-    # ── Cache invalidation ────────────────────────────────────────────────────
+    # ============================================================================
+    # Cache invalidation
+    # ============================================================================
 
     def recompute_bell(self, child=None, parent=None):
         """Invalidate cached J / dJ when any ancestor DOFs change."""
         self._needs_J = True
         self._needs_dJ = True
 
-    # ── Core computation ──────────────────────────────────────────────────────
+    # ============================================================================
+    # Core computation
+    # ============================================================================
 
     def _read_dofs(self):
         """Read coil / current / support DOFs live from the simsopt graph."""
@@ -300,7 +291,9 @@ class CoilFEMObjective(Optimizable):
         self._grad_supports = list(grad_sdofs)         # list[dict]
         self._needs_dJ = False
 
-    # ── simsopt interface ─────────────────────────────────────────────────────
+    # ============================================================================
+    # simsopt interface
+    # ============================================================================
 
     def J(self):
         """Weighted sum of FEM metrics (scalar)."""
@@ -337,7 +330,9 @@ class CoilFEMObjective(Optimizable):
 
     return_fn_map = {'J': J, 'dJ': dJ}
 
-    # ── Forward FEM ───────────────────────────────────────────────────────────
+    # ============================================================================
+    # Forward FEM
+    # ============================================================================
 
     def run(self):
         """Forward FEM for all base coils at the *current* simsopt DOFs.
@@ -455,7 +450,9 @@ class CoilFEMObjective(Optimizable):
             base_support_dofs=base_support_dofs,
         )
 
-    # ── Properties ────────────────────────────────────────────────────────────
+    # ============================================================================
+    # Properties
+    # ============================================================================
 
     @property
     def n_nodes(self) -> int:
@@ -468,7 +465,9 @@ class CoilFEMObjective(Optimizable):
         """The mesh cells count."""
         return self.fem.n_cells
     
-    # ── Visualisation ─────────────────────────────────────────────────────────
+    # ============================================================================
+    # Visualisation
+    # ============================================================================
 
     def plot_support(self, **kwargs):
         """Plot Winkler support weights at the *current* DOFs.

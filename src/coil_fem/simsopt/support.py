@@ -1,5 +1,4 @@
-"""
-Simsopt-optimizable coil support models.
+"""Simsopt-optimizable coil support models.
 
 A *support* describes where a coil is structurally clamped.  In
 :class:`~coil_fem.CoilFEM` this enters as a ``support_fn`` returning
@@ -171,7 +170,21 @@ class CoilSupportDiscrete(CoilSupport):
 
     @staticmethod
     def support_fn(surface_points, curve_jax, dofs, *, clamp_radius, sigmoid_eps):
+        """Per-surface-node Winkler weights: smooth union of ``clamp_num`` spheres.
 
+        Parameters
+        ----------
+        surface_points : jax.Array, shape (n_surface_nodes, 3)
+        curve_jax : CurveXYZFourierJAX
+        dofs : dict
+            ``{'phis': jax.Array, shape (clamp_num,)}`` — clamp arc-length locations.
+        clamp_radius : float
+        sigmoid_eps : float
+
+        Returns
+        -------
+        jax.Array, shape (n_surface_nodes,)
+        """
         phis = dofs['phis']
         gamma_support = curve_jax.gamma_eval(phis)            # (n_support, 3)
         # distances = jnp.sqrt(jnp.sum(
@@ -192,6 +205,15 @@ class CoilSupportTopBottom(CoilSupport):
 
     Has no optimisable DOFs (``support_dofs_jax={}``); ``clamp_radius`` and
     ``sigmoid_eps`` are fixed constants.
+
+    Parameters
+    ----------
+    clamp_radius : float
+        Sphere radius [m] around the top and bottom curve points.
+    sigmoid_eps : float
+        Edge sharpness of each sphere (default 0.1).
+    dofs : DOFs or None
+        Simsopt ``DOFs`` object for restoring serialised state.
     """
 
     def __init__(self, clamp_radius, sigmoid_eps=0.1, dofs=None):
@@ -207,6 +229,21 @@ class CoilSupportTopBottom(CoilSupport):
 
     @staticmethod
     def support_fn(surface_points, curve_jax, dofs, *, clamp_radius, sigmoid_eps):
+        """Per-surface-node Winkler weights: soft union of top and bottom spheres.
+
+        Parameters
+        ----------
+        surface_points : jax.Array, shape (n_surface_nodes, 3)
+        curve_jax : CurveXYZFourierJAX
+        dofs : dict
+            Empty (no optimisable parameters).
+        clamp_radius : float
+        sigmoid_eps : float
+
+        Returns
+        -------
+        jax.Array, shape (n_surface_nodes,)
+        """
         gamma  = curve_jax.gamma()                         # (n_quad, 3)
         top    = gamma[jnp.argmax(gamma[:, 2])]            # (3,) highest point
         bottom = gamma[jnp.argmin(gamma[:, 2])]            # (3,) lowest point

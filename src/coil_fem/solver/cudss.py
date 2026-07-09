@@ -1,29 +1,14 @@
-"""GPU sparse direct solver for JAX-FEM using spineax / cuDSS.
+"""GPU sparse direct solver for JAX-FEM using spineax / NVIDIA cuDSS.
 
-Zero-copy path
---------------
-JAX-FEM's default ``compute_newton_vars`` copies the per-cell Jacobian to
-host (``self.V = onp.array(cells_jac_flat.reshape(-1))``) before building a
-scipy/PETSc CSR matrix.  This module eliminates that round-trip:
+Provides :class:`CuDSSNewtonSolver` and :func:`cudss_ad_wrapper`, a drop-in
+replacement for ``jax_fem.solver.ad_wrapper`` that keeps the Jacobian on the
+GPU device throughout the Newton loop and reuses the cuDSS factorisation for
+both the forward and adjoint solves.
 
-1. ``DeviceProblem`` (``coil_fem.problem``) overrides ``compute_newton_vars``
-   when constructed with ``gpu_assembly=True``, keeping the cell Jacobian as
-   a JAX device array (``self.V_jax``) instead of copying it to host.
-2. ``build_csr_pattern`` pre-computes, once on host, the COO→CSR scatter
-   permutation and the symmetric-elimination metadata (diagonal slots, etc.).
-3. ``assemble_csr_values`` scatters ``V_jax`` into CSR values on-device.
-4. ``apply_symmetric_dirichlet`` applies symmetric Dirichlet BC elimination
-   entirely in JAX (no host touch).
-5. ``CuDSSNewtonSolver`` drives the Newton loop using spineax's cuDSS wrapper.
-6. ``cudss_ad_wrapper`` is a drop-in replacement for
-   ``jax_fem.solver.ad_wrapper`` with a hand-written custom_vjp that reuses
-   the same cuDSS factorization for the adjoint (A is symmetric).
-
-Requirements
-------------
-- NVIDIA GPU (Pascal generation or newer)
-- spineax[cuda12] or spineax[cuda13]  (https://github.com/johnviljoen/spineax)
-- jax_enable_x64 = True  (float64 FEM)
+Requires an NVIDIA GPU, ``spineax`` (see ``.[cudss]`` install extra), and
+``jax_enable_x64 = True``.  ``spineax`` is an optional dependency: this module
+imports cleanly without it; the solver raises a helpful error only when actually
+constructed.
 """
 
 from __future__ import annotations
@@ -46,9 +31,8 @@ from jax_fem.solver import (
     apply_bc,
 )
 
-# spineax (+ NVIDIA cuDSS) is an optional GPU dependency. 
-# import lazily so that doc compile does not break on 
-# machines without the [cudss] extras installed.
+# spineax (+ NVIDIA cuDSS) is optional; check availability without importing
+# so this module loads cleanly on CPU-only doc-build machines.
 _HAS_SPINEAX = importlib.util.find_spec("spineax") is not None
 
 _SPINEAX_INSTALL_HINT = (

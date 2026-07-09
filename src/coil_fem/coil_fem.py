@@ -1,47 +1,10 @@
-"""
-CoilFEM -- container class for differentiable FEM analysis of stellarator coils.
+"""Container class for differentiable FEM structural analysis of stellarator coils.
 
-Orchestrates the full pipeline from base-coil DOFs, currents, and support
-parameters to per-metric structural objectives:
-
-    base_curves_dofs, base_currents_dofs, base_support_dofs
-        -> symmetry expansion (pure JAX, differentiable)
-        -> Lorentz body force at mesh quadrature points
-        -> Winkler BC weights from support_fn (differentiable)
-        -> JAX-FEM solve via ad_wrapper (adjoint differentiable)
-        -> dict of scalar metrics (von Mises, strain energy, ...)
-        -> jax.grad gives one adjoint FEM solve per base coil
-
-Architecture choices
---------------------
-- All scalar objectives are computed in a single forward pass through
-  :meth:`objective`.  Using ``jax.grad`` on this function triggers exactly
-  **one** adjoint FEM solve per base coil, regardless of metric count.
-
-- Mesh topology (``cells``) and reference-element data are static (never
-  traced by JAX).  Only ``points``, ``body_force``, and ``support_weights``
-  flow through ``set_params``.
-
-- Mesh points are recomputed in pure JAX by computing the curve frame at
-  the stored quadrature points and broadcasting offsets -- no scipy
-  interpolation, fully differentiable through DOFs.
-
-- Body force per FEM cell is assigned by topological phi-index
-  (cell_c belongs to phi slice phi_cell_indices[c]) rather than by
-  physical distance, which avoids needing physical quad positions before
-  the solve and keeps the assignment static.
-
-- Winkler BC: ``support_fn(surface_points, curve_jax, dofs)`` returns per-node
-  weights in ``[0, 1]`` that are absorbed into the FEM surface integral via
-  ``nanson_scale``.  Gradients flow: base_support_dofs → weights → k_at_quad →
-  residual → adjoint.
-
-- For multi-GPU parallelism across independent coils, wrap the inner solve
-  loop with ``jax.pmap``.  No special data structures needed.
-
-Dependencies
-------------
-Requires ``jax-fem`` and ``meshio`` (both are core package dependencies).
+Takes base-coil DOFs, currents, and support parameters; applies stellarator
+symmetry; assembles Lorentz body forces and Winkler spring BCs; and returns
+differentiable scalar structural metrics via :meth:`CoilFEM.objective`.
+Calling ``jax.grad`` on :meth:`objective` triggers exactly one adjoint FEM
+solve per base coil regardless of metric count.
 """
 
 from __future__ import annotations
@@ -368,18 +331,9 @@ class CoilFEM:
     ``ad_wrapper.set_params``, so the adjoint sees geometry, load, and BC
     changes without rebuilding the problem.
 
-    ``CoilFEM`` is intentionally **not** a registered JAX pytree.  It is a
-    stateful container of FEM problems, ``ad_wrapper`` closures, and
-    :class:`~coil_fem.meshing.CoilMesh` objects (which are themselves not
-    pytrees), and it is always captured by closure rather than passed as an
-    argument to a JAX transformation.  Autodiff and JIT act only on the DOF
-    arrays flowing through :meth:`objective`; the container instance is treated
-    as an opaque constant.  Do not register it as a pytree.
-
-    Multi-GPU
-    ---------
-    Independent coil solves can be parallelised with ``jax.pmap``.  No
-    inter-device communication is required.
+    ``CoilFEM`` is intentionally **not** a registered JAX pytree; it is a
+    stateful container captured by closure.  Only the DOF arrays passed to
+    :meth:`objective` participate in autodiff.
     """
 
     def __init__(
@@ -522,22 +476,11 @@ class CoilFEM:
     # ============================================================================
 
     def _set_jaxfem_log_level(self):
-        """Set the ``jax_fem`` logger level once from :attr:`verbose`.
+        """Set the ``jax_fem`` logger level from :attr:`verbose`.
 
-        All JAX-FEM output (both jax_fem's own messages and coil-fem's cuDSS
-        solver messages) is routed through the single ``jax_fem`` logger, so a
-        single level change gates everything:
-
-        * ``verbose == 0`` — level ``WARNING`` (suppresses INFO + DEBUG).
-        * ``verbose == 1`` — level ``INFO`` (INFO lines only, no DEBUG).
-        * ``verbose >= 2`` — level ``DEBUG`` (full solver verbosity).
-
-        This is applied persistently at construction rather than through a
-        transient context manager.  The adjoint (VJP) solve triggered by
-        ``jax.grad`` executes its ``custom_vjp`` backward rule *after* the
-        forward trace returns, so a context scoped to the forward pass would
-        not cover it.  Setting the level once keeps forward and adjoint solves
-        equally quiet.
+        * ``verbose == 0`` — ``WARNING`` (silent).
+        * ``verbose == 1`` — ``INFO``.
+        * ``verbose >= 2`` — ``DEBUG``.
         """
         level = {0: logging.WARNING, 1: logging.INFO}.get(
             self.verbose, logging.DEBUG

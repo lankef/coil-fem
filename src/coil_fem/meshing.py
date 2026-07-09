@@ -1,3 +1,14 @@
+"""Structured volume meshes for coil cross-sections.
+
+Sweeps a rectangular (:class:`CoilMeshRectangle`) or disk
+(:class:`CoilMeshDisk`) cross-section grid along a framed centerline curve
+to produce a tetrahedral :class:`CoilMesh` (TET4 or TET10).  The
+differentiable method :meth:`CoilMesh.mesh_points_from_dofs` regenerates node
+positions from updated curve DOFs, enabling gradient flow through the mesh
+geometry.  Use :func:`rectangle_sweep` or :func:`disk_sweep` for mesh
+generation, or :meth:`CoilMesh.from_options` for dict-driven dispatch.
+"""
+
 import abc
 
 import numpy as np
@@ -8,8 +19,9 @@ from functools import partial
 from jax_fem.generate_mesh import Mesh as JAXFEMMesh
 
 
-
-# ── Compile-time constants ───────────────────────────────────────────────────
+# ============================================================================
+# Compile-time constants
+# ============================================================================
 #
 #  Hex vertex layout (offsets from base cell (m, n, o)):
 #
@@ -170,7 +182,9 @@ def _build_disk_o_grid_topology_np(n_center: int, n_radial: int):
     return quads, oxy, n2d
 
 
-# ─── Validation ───────────────────────────────────────────────────────────────
+# ============================================================================
+# Validation
+# ============================================================================
 
 # JIT notes:
 #   - The arithmetic (cross products, einsum) is fully JIT-safe.
@@ -566,16 +580,11 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
 
     Notes
     -----
-    ``CoilMesh`` is intentionally **not** a registered JAX pytree.  It is a
-    mutable Python container (:meth:`attach_ref_coords` fills reference-coordinate
-    fields in place after construction) that mixes static metadata with constant
-    arrays and holds a ``framed_curve`` carrying the initial DOFs.  It is only
-    ever accessed through the owning :class:`~coil_fem.CoilFEM` via closure and is
-    never passed as an argument to a JAX transformation, so it behaves as an
-    opaque constant during tracing.  Registering it as a pytree would surface the
-    stale initial DOFs as leaves and conflict with the in-place mutation.  Only
-    the traced ``dofs`` flowing through :meth:`mesh_points_from_dofs` participate
-    in autodiff.
+    ``CoilMesh`` is not a registered JAX pytree.  It is a mutable container
+    that holds static topology data alongside a ``framed_curve`` with the
+    initial DOFs; it is always accessed by closure and never passed as a JAX
+    argument.  Only the traced ``dofs`` flowing through
+    :meth:`mesh_points_from_dofs` participate in autodiff.
     """
 
     #: Cross-section family: ``'rect'`` or ``'disk'`` (set by concrete subclasses).
@@ -597,20 +606,15 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
         ele_type : str
             Element type: 'TET4' or 'TET10'.
         """
-        # Convert to JAX arrays for our methods, but store as numpy for JAX-FEM compatibility
         points_np = np.asarray(points, dtype=np.float64)
         cells_np = np.asarray(cells, dtype=np.int32)
-        
-        # Initialize parent class
         super().__init__(points_np, cells_np, ele_type)
-        
-        # Cache JAX arrays for our quality metrics
         self._points_jax = jnp.asarray(self.points)
         self._cells_jax = jnp.asarray(self.cells)
 
-    # ------------------------------------------------------------------
+    # ============================================================================
     # Shared metadata / construction helpers
-    # ------------------------------------------------------------------
+    # ============================================================================
 
     def _set_metadata(self, framed_curve, cross_section_area, n_cross, phi_cell_idx):
         """Store the metadata common to every cross-section shape.
@@ -680,9 +684,9 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
         """
         raise NotImplementedError
 
-    # ------------------------------------------------------------------
+    # ============================================================================
     # Reference-coordinate pre-computation (phase 2; needs the FEM problem)
-    # ------------------------------------------------------------------
+    # ============================================================================
 
     def attach_ref_coords(self, prob) -> None:
         """Populate ``n_quads``/``phi_quad``/``uv_quad`` from a built problem.
@@ -872,9 +876,9 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
         return jnp.max(prod3 / vol)
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Concrete cross-section meshes
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 class CoilMeshRectangle(CoilMesh):
     """Rectangular cross-section swept along a framed curve.

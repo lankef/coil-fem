@@ -1,18 +1,13 @@
-"""
-Pure JAX port of simsopt's coil symmetry expansion.
+"""Pure JAX stellarator-symmetry expansion for coil geometry and currents.
 
-Applies nfp-fold rotational symmetry about the z-axis and optional stellarator
-symmetry (y, z flip + current sign reversal) to arrays of pre-evaluated curve
-geometry and current values.  All operations are pure ``jnp`` -- fully
-differentiable through any upstream DOF computation.
+Applies ``nfp``-fold rotational symmetry about the z-axis and optional
+stellarator symmetry (y, z flip + current sign reversal) to arrays of
+pre-evaluated curve geometry and current values.  All operations are pure
+``jnp`` — fully differentiable through any upstream DOF computation.
 
-Expansion order mirrors simsopt ``apply_symmetries_to_curves`` exactly:
-    for k in 0..nfp-1:
-        for flip in [False] (or [False, True] if stellsym):
-            for i in 0..n_base-1:
-                append transformed coil (k, flip, i)
-
-So the first ``n_base`` entries are always the original base coils (k=0, flip=False).
+Expansion order mirrors simsopt ``apply_symmetries_to_curves``:
+the first ``n_base`` entries are always the original base coils
+(``k=0``, ``flip=False``).
 """
 
 from __future__ import annotations
@@ -21,9 +16,9 @@ import jax.numpy as jnp
 import jax
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Low-level geometry transforms (pure jnp, differentiable)
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _rotate_points_z(pts: jax.Array, phi: float) -> jax.Array:
     """Rotate ``(N, 3)`` point array by angle *phi* about the z-axis.
@@ -50,9 +45,9 @@ def _flip_points(pts: jax.Array) -> jax.Array:
     return pts * signs
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Symmetry expansion
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def apply_symmetries_to_gammas(
     base_gammas: jax.Array,
