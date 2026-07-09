@@ -3,6 +3,11 @@ coil-fem
 
 A differentiable structural mechanics toolkit for stellarator coils.
 
+Publication
+===========
+
+`Towards joint optimization of stellarator coils and support structures <https://arxiv.org/abs/2607.05749>`_. 
+
 Installation
 ============
 
