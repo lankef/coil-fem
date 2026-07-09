@@ -555,8 +555,6 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
         Element connectivity (TET4 or TET10).
     ele_type : str
         Element type: ``'TET4'`` or ``'TET10'``.
-    shape : str
-        Cross-section family: ``'rect'`` or ``'disk'`` (class attribute).
     framed_curve : FramedCurveJAX
         Framed centerline used to generate the mesh; :meth:`mesh_points_from_dofs`
         rebuilds it from new DOFs via :meth:`FramedCurveJAX.with_dofs`.
@@ -580,7 +578,7 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
     in autodiff.
     """
 
-    # Cross-section family; overridden by concrete subclasses.
+    #: Cross-section family: ``'rect'`` or ``'disk'`` (set by concrete subclasses).
     shape: str | None = None
 
     # VTK / JAX-FEM TET10 midside edge order (columns 4-9 of each cell), used to
@@ -924,9 +922,9 @@ class CoilMeshRectangle(CoilMesh):
             length_per_quadpoint = jnp.mean(ds) / ds.shape[0]
             target_size = length_per_quadpoint * aspect_ratio
             if n_grid_1 is None:
-                n_grid_1 = max(2, int(jnp.ceil(w1 / target_size)))
+                n_grid_1 = max(1, int(jnp.round(w1 / target_size)))
             if n_grid_2 is None:
-                n_grid_2 = max(2, int(jnp.ceil(w2 / target_size)))
+                n_grid_2 = max(1, int(jnp.round(w2 / target_size)))
 
         M = int(framed_curve.curve.quadpoints.shape[0])
         N = n_grid_1 + 1   # node counts per cross-section direction

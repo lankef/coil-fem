@@ -93,8 +93,17 @@ class CoilFEMObjective(Optimizable):
     gravity_options : dict or None
         Gravity body-force options forwarded to
         :class:`~coil_fem.CoilFEM`.  When ``None`` (default) no
-        gravity load is applied.  When provided, must contain ``'density'``
-        [kg/m³] and optionally ``'g_vec'`` (default ``(0, 0, -9.80665)``).
+        gravity load is applied.  When provided, may contain ``'g_vec'``
+        (default ``(0, 0, -9.80665)``); the mass density is always taken
+        from ``material_options['density']``.
+    verbose : int
+        JAX-FEM logging verbosity forwarded to :class:`~coil_fem.CoilFEM`,
+        controlling output during construction, forward solves, and gradient
+        evaluations:
+
+        * ``0`` (default) — no logging (suppresses all JAX-FEM output).
+        * ``1`` — INFO messages only (``[INFO]`` lines).
+        * ``2`` — DEBUG messages too (full solver verbosity).
 
     Examples
     --------
@@ -131,6 +140,7 @@ class CoilFEMObjective(Optimizable):
         material_options=None,
         problem_options=None,
         gravity_options=None,
+        verbose: int = 0,
     ):
         if not _HAS_SIMSOPT:
             raise ImportError("simsopt is required for CoilFEMObjective.")
@@ -163,6 +173,7 @@ class CoilFEMObjective(Optimizable):
         self._material_options = material_options
         self._problem_options  = problem_options
         self._gravity_options  = gravity_options
+        self._verbose          = verbose
 
         # ── Per-coil support models (broadcast a single one if given) ────────
         if isinstance(base_supports, CoilSupport):
@@ -194,6 +205,7 @@ class CoilFEMObjective(Optimizable):
             gravity_options=gravity_options,
             material_options=material_options,
             problem_options=problem_options,
+            verbose=verbose,
         )
 
         self._metrics = tuple(metrics)
@@ -381,61 +393,46 @@ class CoilFEMObjective(Optimizable):
         list[str]
             Paths of all files written, in order.
         """
-        base_curves_dofs = [
-            jnp.asarray(c.get_dofs()) for c in self._base_curves
-        ]
-        base_currents_dofs = jnp.array(
-            [c.get_value() for c in self._base_currents]
-        )
-        base_support_dofs = [s.support_dofs for s in self._base_supports]
-        # #region agent log
-        try:
-            import json as _json, time as _time
-            with open("/home/lf2869/Documents/Codes/coil-fem/.cursor/debug-a5fc55.log", "a") as _f:
-                _f.write(_json.dumps({
-                    "sessionId": "a5fc55", "runId": "feat", "hypothesisId": "A",
-                    "location": "simsopt_bridge.py:save_run_vtu",
-                    "message": "live support dofs before fem.save_run_vtu",
-                    "data": {
-                        "n_supports": len(self._base_supports),
-                        "support_types": [type(s).__name__ for s in self._base_supports],
-                        "support_dof_is_dict": [isinstance(d, dict) for d in base_support_dofs],
-                        "support_dof_is_none": [d is None for d in base_support_dofs],
-                        "support_dof_keys": [
-                            (list(d.keys()) if isinstance(d, dict) else None)
-                            for d in base_support_dofs
-                        ],
-                        "n_curves": len(base_curves_dofs),
-                        "curve_dof_lens": [int(jnp.asarray(c).shape[0]) for c in base_curves_dofs],
-                        "n_currents": int(jnp.asarray(base_currents_dofs).shape[0]),
-                    },
-                    "timestamp": int(_time.time() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
-        paths = self.fem.save_run_vtu(
+        base_curves_dofs, base_currents_dofs, base_support_dofs = self._read_dofs()
+        return self.fem.save_run_vtu(
             out_dir,
             prefix=prefix,
             base_curves_dofs=base_curves_dofs,
             base_currents_dofs=base_currents_dofs,
             base_support_dofs=base_support_dofs,
         )
-        # #region agent log
-        try:
-            import json as _json2, time as _time2
-            with open("/home/lf2869/Documents/Codes/coil-fem/.cursor/debug-a5fc55.log", "a") as _f:
-                _f.write(_json2.dumps({
-                    "sessionId": "a5fc55", "runId": "feat", "hypothesisId": "C",
-                    "location": "simsopt_bridge.py:save_run_vtu",
-                    "message": "fem.save_run_vtu completed",
-                    "data": {"n_files": len(paths), "out_dir": out_dir, "prefix": prefix},
-                    "timestamp": int(_time2.time() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
-        return paths
+
+    def save_support_vtu(self, out_dir: str = ".", *, prefix: str = "coil"):
+        """Export per-coil Winkler support weights as VTU files at the *current* DOFs.
+
+        Reads coil geometry and support parameters live from the simsopt DOF
+        graph and forwards them to
+        :meth:`coil_fem.CoilFEM.save_support_vtu`.  Because the support
+        ``dofs`` are read from each support's
+        :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`, this works
+        uniformly across support types (e.g. an empty ``{}`` for DOF-free
+        supports such as :class:`~coil_fem.simsopt.CoilSupportTopBottom`, or
+        ``{'phis': ...}`` for :class:`~coil_fem.simsopt.CoilSupportDiscrete`).
+
+        Parameters
+        ----------
+        out_dir : str
+            Output directory.  Created if it does not exist.
+        prefix : str
+            File-name prefix (default ``"coil"``).
+
+        Returns
+        -------
+        list[str]
+            Paths of all files written, in order.
+        """
+        base_curves_dofs, _, base_support_dofs = self._read_dofs()
+        return self.fem.save_support_vtu(
+            out_dir,
+            prefix=prefix,
+            base_curves_dofs=base_curves_dofs,
+            base_support_dofs=base_support_dofs,
+        )
 
     def compute_strain_tensors(self):
         """Total and thermal strain tensors at the *current* simsopt DOFs.
@@ -458,6 +455,19 @@ class CoilFEMObjective(Optimizable):
             base_support_dofs=base_support_dofs,
         )
 
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def n_nodes(self) -> int:
+        """The mesh nodes count."""
+        return self.fem.n_nodes
+
+    
+    @property
+    def n_cells(self) -> int:
+        """The mesh cells count."""
+        return self.fem.n_cells
+    
     # ── Visualisation ─────────────────────────────────────────────────────────
 
     def plot_support(self, **kwargs):
@@ -465,13 +475,18 @@ class CoilFEMObjective(Optimizable):
 
         Thin wrapper around :meth:`coil_fem.CoilFEM.plot_support`
         that feeds it the current coil geometry and support parameters read
-        live from the simsopt DOF graph.  All keyword arguments (``ax``,
-        ``s``, ``cmap``) are forwarded.
+        live from the simsopt DOF graph.  All keyword arguments are forwarded,
+        including ``ax``, ``s``, ``cmap``, ``color``, ``simple_mode``, and any
+        extra ``**kwargs`` passed through to :meth:`ax.scatter` (e.g.
+        ``marker``, ``facecolors``, ``edgecolors``).  See
+        :meth:`coil_fem.CoilFEM.plot_support` for the ``simple_mode`` semantics
+        (support weight encoded as per-point alpha, no colorbar).
 
         Returns
         -------
-        (fig, ax) : tuple
-            The matplotlib figure and 3-D axes used for the plot.
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D
+            The 3-D axes used for the plot.  The parent figure is available as
+            ``ax.get_figure()``.
         """
 
         base_curves_dofs = [
@@ -483,3 +498,56 @@ class CoilFEMObjective(Optimizable):
             base_support_dofs=base_support_dofs,
             **kwargs,
         )
+
+    def plot(self, engine: str = "matplotlib", ax=None, show: bool = True,
+             axis_equal: bool = True, **kwargs):
+        """Plot the von Mises stress surface over the support scatter.
+
+        simsopt-compatible visualisation so this objective can be passed to
+        :func:`simsopt.geo.plot` alongside coils and surfaces: that helper
+        calls ``item.plot(ax=ax, show=..., **kwargs)`` on each item and expects
+        the shared axes back.  This method reads coil geometry, currents, and
+        support parameters live from the simsopt DOF graph and delegates to
+        :meth:`coil_fem.CoilFEM.plot`.
+
+        Parameters
+        ----------
+        engine : str
+            Graphics engine.  Only ``"matplotlib"`` is supported.
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None
+            Existing 3-D axes to draw on (e.g. created by a previous item in
+            :func:`simsopt.geo.plot`).  ``None`` creates a new figure/axes.
+        show : bool
+            Whether to call ``matplotlib.pyplot.show`` after plotting.  Set to
+            ``False`` when more objects will be drawn on the same axes.
+        axis_equal : bool
+            Whether to scale the three axes equally.
+        **kwargs
+            Extra keyword arguments forwarded to
+            :meth:`coil_fem.CoilFEM.plot` (e.g. ``cmap``, ``support_color``,
+            ``support_s``).
+
+        Returns
+        -------
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D
+            The 3-D axes used for the plot, so it can be forwarded to the next
+            item in :func:`simsopt.geo.plot`.
+        """
+        if engine != "matplotlib":
+            raise NotImplementedError(
+                "CoilFEMObjective.plot supports the matplotlib engine only."
+            )
+
+        base_curves_dofs, base_currents_dofs, base_support_dofs = self._read_dofs()
+        ax = self.fem.plot(
+            base_curves_dofs=base_curves_dofs,
+            base_currents_dofs=base_currents_dofs,
+            base_support_dofs=base_support_dofs,
+            ax=ax,
+            axis_equal=axis_equal,
+            **kwargs,
+        )
+        if show:
+            import matplotlib.pyplot as plt
+            plt.show()
+        return ax

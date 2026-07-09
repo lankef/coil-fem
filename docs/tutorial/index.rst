@@ -1,11 +1,11 @@
 Tutorials
 =========
 
-Tutorial notebooks live in the ``docs/tutorial/`` directory alongside this documentation.
-You can open them with Jupyter or link them from these pages once they are integrated
-with nbsphinx or MyST-NB.
+Worked examples of the ``coil-fem`` workflow.  The notebooks below are rendered
+from their stored outputs; open the source ``.ipynb`` files under
+``docs/tutorial/`` to run them yourself.
 
 .. toctree::
    :maxdepth: 1
 
-   notebooks
+   optimization_simsopt

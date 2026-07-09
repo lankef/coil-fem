@@ -99,7 +99,8 @@ def itc_strain(itc: jnp.ndarray) -> jnp.ndarray:
 
     Returns
     -------
-    jnp.ndarray, shape (3, 3)
+    jnp.ndarray (3, 3)
+        Thermal eigenstrain tensor ``ε_th = −itc · I``.
     """
     s = jnp.asarray(itc, dtype=float).reshape(())
     return -s * jnp.eye(3, dtype=jnp.float64)

@@ -3,17 +3,22 @@ API reference
 
 Generated from module docstrings. Optional dependencies (``jax-fem``, ``simsopt``) are mocked when building docs without those packages installed.
 
+Each object is documented once, at its public import path (the namespace it is
+re-exported into, e.g. :class:`coil_fem.problem.DeviceProblem`).  The API pages
+below are intentionally **not** recursive, so a defining submodule such as
+``coil_fem.problem.device_problem`` never gets its own page; autodoc registers
+that internal path only as a ``:canonical:`` alias.  This relies on ``__all__``
+being defined in each package's ``__init__.py``.
+
 .. currentmodule:: coil_fem
 
 .. autosummary::
    :toctree: generated
-   :recursive:
 
    coil_fem
-   magnetic
-   metrics
    meshing
+   metrics
    geo
-   simsopt
-   solver
    problem
+   simsopt
+   solver.cudss

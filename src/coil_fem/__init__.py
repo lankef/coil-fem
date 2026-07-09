@@ -17,3 +17,10 @@ DeviceProblem), and coil_fem (CoilFEM container).
 
 from .coil_fem import CoilFEM
 from .magnetic import biot_savart, B_self_quadrature, lorentz_body_force
+
+__all__ = [
+    "CoilFEM",
+    "biot_savart",
+    "B_self_quadrature",
+    "lorentz_body_force",
+]

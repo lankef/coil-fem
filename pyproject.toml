@@ -26,6 +26,7 @@ dev = [
 ]
 docs = [
     "sphinx>=7",
+    "myst-nb>=1.0",
 ]
 # GPU sparse direct solver (spineax + NVIDIA cuDSS).
 # Requires a real `nvcc` (e.g. `conda install -c conda-forge cuda-nvcc=12.9.86`)

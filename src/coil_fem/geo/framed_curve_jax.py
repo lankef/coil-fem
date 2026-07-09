@@ -272,7 +272,7 @@ class FramedCurveJAX:
     ----------
     curve : CurveXYZFourierJAX
         The underlying curve.
-    alpha : jax.Array, shape (nquad,)
+    alpha : jax.Array (nquad,)
         Rotation angles around the tangent at quadrature points
         (default: zeros).
 
