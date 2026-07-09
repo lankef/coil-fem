@@ -9,13 +9,12 @@ and a specified uniform integral thermal contraction. The governing equations
 are as follows:
 
 .. math::
-   :nowrap:
 
-   \begin{alignat}{3}
+   \begin{aligned}
        \nabla \cdot \boldsymbol{\sigma}(\mathbf{u}) + \mathbf{F}_\text{body} &= 0,
-           &&\quad \text{in } \Omega
-           &&\quad \text{(Linear elasticity)} \\
-       \boldsymbol{\sigma}(\mathbf{u})\,\mathbf{n} &= -k(\mathbf{x})\,\mathbf{u}.
-           &&\quad \text{on } \partial\Omega
-           &&\quad \text{(Robin/spring foundation BC)}
-   \end{alignat}
+           & &\text{in } \Omega,
+           & &\text{(Linear elasticity)} \\
+       \boldsymbol{\sigma}(\mathbf{u})\,\mathbf{n} &= -k(\mathbf{x})\,\mathbf{u},
+           & &\text{on } \partial\Omega,
+           & &\text{(Robin/spring foundation BC)}
+   \end{aligned}
