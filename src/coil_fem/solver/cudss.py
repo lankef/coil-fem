@@ -29,6 +29,7 @@ Requirements
 from __future__ import annotations
 
 import functools
+import importlib.util
 import time
 import warnings
 from typing import TYPE_CHECKING
@@ -45,15 +46,26 @@ from jax_fem.solver import (
     apply_bc,
 )
 
-try:
-    from spineax.cudss.solver import CuDSSSolver
-except ImportError as e:
-    raise ImportError(
-        "coil_fem.solver.cudss requires the optional GPU stack (spineax + "
-        "NVIDIA cuDSS), which is not installed. Install it with:\n"
-        "  conda install -c conda-forge cuda-nvcc=12.9.86\n"
-        '  pip install --no-build-isolation -e ".[cudss]"'
-    ) from e
+# spineax (+ NVIDIA cuDSS) is an optional GPU dependency. 
+# import lazily so that doc compile does not break on 
+# machines without the [cudss] extras installed.
+_HAS_SPINEAX = importlib.util.find_spec("spineax") is not None
+
+_SPINEAX_INSTALL_HINT = (
+    "coil_fem.solver.cudss requires the optional GPU stack (spineax + "
+    "NVIDIA cuDSS), which is not installed. Install it with:\n"
+    "  conda install -c conda-forge cuda-nvcc=<version>\n"
+    '  pip install --no-build-isolation -e ".[cudss]"'
+)
+
+
+def _import_cudss_solver():
+    """Import spineax's ``CuDSSSolver``, raising a helpful error if missing."""
+    try:
+        from spineax.cudss.solver import CuDSSSolver
+    except ImportError as e:
+        raise ImportError(_SPINEAX_INSTALL_HINT) from e
+    return CuDSSSolver
 
 if TYPE_CHECKING:
     from jax_fem.problem import Problem
@@ -338,6 +350,7 @@ class CuDSSNewtonSolver:
         self.bc_dof_mask, self.bc_vals_prescribed = _build_bc_metadata(problem, n)
 
         logger.info("CuDSSNewtonSolver: instantiating cuDSS solver …")
+        CuDSSSolver = _import_cudss_solver()
         # spineax's CuDSSSolver stores csr_offsets / csr_columns as static
         # equinox fields and intentionally puts the (immutable) sparsity-pattern
         # arrays there.  equinox.field(static=True) warns whenever *any* array
