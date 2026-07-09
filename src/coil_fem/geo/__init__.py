@@ -15,3 +15,17 @@ from .symmetries import (
     apply_symmetries_to_currents,
     n_coils_total,
 )
+
+__all__ = [
+    "CurveXYZFourierJAX",
+    "FramedCurveJAX",
+    "FramedCurveCentroidJAX",
+    "FramedCurveRMFJAX",
+    "make_centroid_frame",
+    "make_rmf_frame",
+    "make_framed_curve",
+    "apply_symmetries_to_gammas",
+    "apply_symmetries_to_gammadashs",
+    "apply_symmetries_to_currents",
+    "n_coils_total",
+]

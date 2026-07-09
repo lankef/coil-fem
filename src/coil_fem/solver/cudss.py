@@ -69,7 +69,7 @@ def build_csr_pattern(I: onp.ndarray, J: onp.ndarray, n: int):
 
     Parameters
     ----------
-    I, J : numpy.ndarray, shape (nnz_coo,)
+    I, J : numpy.ndarray (nnz_coo,)
         Row and column indices from ``problem.I`` and ``problem.J``.
         May contain duplicate (i, j) pairs whose Jacobian values are summed.
     n : int
@@ -343,9 +343,7 @@ class CuDSSNewtonSolver:
         # arrays there.  equinox.field(static=True) warns whenever *any* array
         # (JAX or NumPy) is assigned to a static field, so this benign,
         # by-design warning is suppressed here rather than leaked to callers.
-        # #region agent log
-        with warnings.catch_warnings(record=True) as _wlist:
-            warnings.simplefilter("always")
+        with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
                 message="A JAX array is being set as static!",
@@ -358,26 +356,6 @@ class CuDSSNewtonSolver:
                 mtype_id,
                 mview_id,
             )
-        try:
-            import json as _json, time as _time
-            _escaped = [str(w.message) for w in _wlist]
-            with open("/home/lf2869/Documents/Codes/coil-fem/.cursor/debug-a5fc55.log", "a") as _f:
-                _f.write(_json.dumps({
-                    "sessionId": "a5fc55", "runId": "post-fix-nb", "hypothesisId": "A",
-                    "location": "cudss_solver.py:352",
-                    "message": "post-fix CuDSSSolver construction (notebook)",
-                    "data": {
-                        "static_field_warning_escaped": any(
-                            "set as static" in m for m in _escaped
-                        ),
-                        "n_warnings_escaped": len(_escaped),
-                        "warnings": _escaped[:5],
-                    },
-                    "timestamp": int(_time.time() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
 
     # ------------------------------------------------------------------
     # Single linear solve (one Newton step)

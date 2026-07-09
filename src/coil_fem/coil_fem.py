@@ -46,6 +46,7 @@ Requires ``jax-fem`` and ``meshio`` (both are core package dependencies).
 
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 import numpy as np
@@ -322,27 +323,21 @@ class CoilFEM:
 
         A single dict is broadcast to all base coils.
     gravity_options : dict or None
-        If provided, must contain ``'density'`` [kg/m³] and optionally
-        ``'g_vec'`` (default ``(0, 0, -9.80665)``).
+        If provided, enables a uniform gravitational body force ``ρ·g``.  May
+        contain ``'g_vec'`` (default ``(0, 0, -9.80665)``).  The mass density
+        ``ρ`` is always taken from ``material_options['density']``.
     material_options : dict or None
         Elastic and thermal material parameters.  Keys:
 
         * ``'E'`` : float [Pa] — Young's modulus (default 200 GPa).
         * ``'nu'`` : float — Poisson ratio (default 0.3).
-        * ``'density'`` : float [kg/m³] — mass density (default 7800).
+        * ``'density'`` : float [kg/m³] — mass density (default 7800).  Used
+          both for inertial/gravity loads (when ``gravity_options`` is set)
+          and reported diagnostics.
         * ``'itc'`` : float — isotropic integral thermal contraction ``ΔL/L``
           on cooldown (positive, dimensionless).  When given, the eigenstrain
           ``ε_th = −itc · I`` is pre-computed once and baked into the
           constitutive law.  ``itc`` is not a differentiable DOF.
-
-    Notes on self-field
-    -------------------
-    Self-field (B_self) is always computed for every coil.  Rectangular
-    cross-sections use the full Landreman-Hurwitz-Antonsen (2025) formula
-    evaluated at every FEM quadrature point via
-    :func:`~coil_fem.magnetic.B_self_quadrature`.  Disk cross-sections
-    raise ``NotImplementedError`` (a closed-form circular analogue is known
-    but not yet implemented).
 
     problem_options : dict or None
         Numerical solver and Winkler BC parameters.  Keys:
@@ -351,8 +346,22 @@ class CoilFEM:
         * ``'solver'`` : ``'umfpack'`` (default).
         * ``'adjoint_solver'`` : ``'umfpack'`` (default).
 
+    verbose : int
+        Logging verbosity for JAX-FEM output (construction and solves):
+
+        * ``0`` (default) — no logging (suppresses all JAX-FEM solver output).
+        * ``1`` — INFO messages only (``[INFO]`` lines).
+        * ``2`` — DEBUG messages too (full solver verbosity).
+
     Notes
     -----
+    **Self-field.** Self-field (B_self) is always computed for every coil.
+    Rectangular cross-sections use the full Landreman-Hurwitz-Antonsen (2025)
+    formula evaluated at every FEM quadrature point via
+    :func:`~coil_fem.magnetic.B_self_quadrature`.  Disk cross-sections
+    raise ``NotImplementedError`` (a closed-form circular analogue is known
+    but not yet implemented).
+
     ``__init__`` builds ``LinearElasticity3D`` problems from the **initial**
     curve geometry.  Mesh topology is fixed at construction.  Subsequent calls
     pass updated ``points``, ``body_force``, and ``support_weights`` through
@@ -373,13 +382,6 @@ class CoilFEM:
     inter-device communication is required.
     """
 
-    """Logging verbosity level.
-
-    * ``0`` — no logging (suppresses all JAX-FEM solver output).
-    * ``1`` — INFO messages only.
-    * ``2`` — DEBUG messages too (full solver verbosity).
-    """
-
     def __init__(
         self,
         base_curves_jax: list[CurveXYZFourierJAX],
@@ -395,6 +397,7 @@ class CoilFEM:
         verbose: int = 0,
     ):
         self.verbose = verbose
+        self._set_jaxfem_log_level()
 
         # ── 1. Validate and normalise inputs ─────────────────────────────────
         self.base_curves_jax = list(base_curves_jax)
@@ -513,6 +516,33 @@ class CoilFEM:
 
             # Cache global surface node indices for this coil.
             self._surface_node_indices.append(prob.surface_node_global_indices)
+
+    # ============================================================================
+    # Logging verbosity
+    # ============================================================================
+
+    def _set_jaxfem_log_level(self):
+        """Set the ``jax_fem`` logger level once from :attr:`verbose`.
+
+        All JAX-FEM output (both jax_fem's own messages and coil-fem's cuDSS
+        solver messages) is routed through the single ``jax_fem`` logger, so a
+        single level change gates everything:
+
+        * ``verbose == 0`` — level ``WARNING`` (suppresses INFO + DEBUG).
+        * ``verbose == 1`` — level ``INFO`` (INFO lines only, no DEBUG).
+        * ``verbose >= 2`` — level ``DEBUG`` (full solver verbosity).
+
+        This is applied persistently at construction rather than through a
+        transient context manager.  The adjoint (VJP) solve triggered by
+        ``jax.grad`` executes its ``custom_vjp`` backward rule *after* the
+        forward trace returns, so a context scoped to the forward pass would
+        not cover it.  Setting the level once keeps forward and adjoint solves
+        equally quiet.
+        """
+        level = {0: logging.WARNING, 1: logging.INFO}.get(
+            self.verbose, logging.DEBUG
+        )
+        logging.getLogger('jax_fem').setLevel(level)
 
     # ============================================================================
     # Symmetry expansion
@@ -648,12 +678,11 @@ class CoilFEM:
         f_vol = lorentz_body_force(J_q, B_self_q + B_ext_q)
 
         if self.gravity_options is not None:
-            rho = float(self.gravity_options['density'])
-            g   = jnp.asarray(
+            g = jnp.asarray(
                 self.gravity_options.get('g_vec', (0.0, 0.0, -9.80665)),
                 dtype=float,
             )
-            f_vol = f_vol + (rho * g)[None, None, :]
+            f_vol = f_vol + (self._rho * g)[None, None, :]
 
         return f_vol, B_self_q, B_ext_q
 
@@ -749,23 +778,6 @@ class CoilFEM:
         * ``'B_ext'``         -- list of ``(n_cells, n_quads, 3)`` mutual
           (external) field arrays [T] at FEM quadrature points per coil.
         """
-        import contextlib
-        import logging
-
-        @contextlib.contextmanager
-        def _maybe_quiet():
-            jaxfem_log = logging.getLogger('jax_fem')
-            old_level = jaxfem_log.level
-            if self.verbose == 0:
-                jaxfem_log.setLevel(logging.WARNING)
-            elif self.verbose == 1:
-                jaxfem_log.setLevel(logging.INFO)
-            # verbose >= 2: leave level unchanged (full DEBUG output)
-            try:
-                yield
-            finally:
-                jaxfem_log.setLevel(old_level)
-
         n_base = len(self.base_curves_jax)
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
@@ -779,26 +791,25 @@ class CoilFEM:
 
         sol_list, vm_list, pts_list, wt_list = [], [], [], []
         fvol_list, Bself_list, Bext_list = [], [], []
-        with _maybe_quiet():
-            for i in range(n_base):
-                pts_i = self.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
-                bf_i, B_self_i, B_ext_i = self._body_force_at_quads(
-                    i, base_curves_dofs[i], pts_i,
-                    all_gammas, all_gammadashs, all_currents,
-                )
-                weights_i = self._compute_support_weights(
-                    i, pts_i, base_curves_dofs[i], sd[i]
-                )
-                sol = self._forward_solve(i, pts_i, bf_i, weights_i)
-                vm  = self._problems[i].von_mises_stress(sol)
+        for i in range(n_base):
+            pts_i = self.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
+            bf_i, B_self_i, B_ext_i = self._body_force_at_quads(
+                i, base_curves_dofs[i], pts_i,
+                all_gammas, all_gammadashs, all_currents,
+            )
+            weights_i = self._compute_support_weights(
+                i, pts_i, base_curves_dofs[i], sd[i]
+            )
+            sol = self._forward_solve(i, pts_i, bf_i, weights_i)
+            vm  = self._problems[i].von_mises_stress(sol)
 
-                sol_list.append(sol)
-                vm_list.append(vm)
-                pts_list.append(pts_i)
-                wt_list.append(weights_i)
-                fvol_list.append(bf_i)
-                Bself_list.append(B_self_i)
-                Bext_list.append(B_ext_i)
+            sol_list.append(sol)
+            vm_list.append(vm)
+            pts_list.append(pts_i)
+            wt_list.append(weights_i)
+            fvol_list.append(bf_i)
+            Bself_list.append(B_self_i)
+            Bext_list.append(B_ext_i)
 
         return {
             'solutions':       sol_list,                     # list[list[array(n_nodes, 3)]]
@@ -1060,6 +1071,21 @@ class CoilFEM:
         return self.base_support_fns[coil_idx](surf_pts, coil_curr, support_dofs_i)
 
     # ============================================================================
+    # Properties
+    # ============================================================================
+    
+    @property
+    def n_nodes(self) -> int:
+        """The mesh nodes count."""
+        return [m.points.shape[0] for m in self.meshes]
+
+    
+    @property
+    def n_cells(self) -> int:
+        """The mesh cells count."""
+        return [m.cells.shape[0] for m in self.meshes]
+        
+    # ============================================================================
     # Visualisation
     # ============================================================================
 
@@ -1145,6 +1171,8 @@ class CoilFEM:
         n_base = len(self.base_curves_jax)
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
+        if base_support_dofs is None:
+            base_support_dofs = self._base_support_dofs
         sd = _validate_support_dofs(base_support_dofs, n_base)
 
         winkler_k = float(self.problem_options['winkler_k'])
@@ -1185,6 +1213,9 @@ class CoilFEM:
         ax=None,
         s: float = 0.1,
         cmap: str = "viridis",
+        color="C0",
+        simple_mode: bool = False,
+        **kwargs,
     ):
         """Scatter-plot the mesh nodes of every base coil coloured by Winkler weight.
 
@@ -1203,15 +1234,28 @@ class CoilFEM:
             Marker size for the scatter (default ``0.1``).
         cmap : str
             Matplotlib colormap name for the support weights (default
-            ``"viridis"``).
+            ``"viridis"``).  Ignored when ``simple_mode`` is ``True``.
+        color : color-like
+            Single marker colour used only when ``simple_mode`` is ``True``
+            (default ``"C0"``).
+        simple_mode : bool
+            When ``True``, disable the colormap and colorbar: every point is
+            drawn in a single ``color`` and the support weight (guaranteed in
+            ``[0, 1]``) is used as each point's **alpha**, so fully supported
+            nodes are opaque and free nodes are invisible.
+        **kwargs
+            Extra keyword arguments forwarded to :meth:`ax.scatter`
+            (e.g. ``marker``, ``facecolors``, ``edgecolors``).
 
         Returns
         -------
-        (fig, ax) : tuple
-            The matplotlib figure and 3-D axes used for the plot.
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D
+            The 3-D axes used for the plot.  The parent figure is available as
+            ``ax.get_figure()``.
         """
         import numpy as onp
         import matplotlib.pyplot as plt
+        from matplotlib.colors import to_rgb
 
         n_base = len(self.base_curves_jax)
         if base_curves_dofs is None:
@@ -1221,9 +1265,8 @@ class CoilFEM:
         sd = _validate_support_dofs(base_support_dofs, n_base)
 
         if ax is None:
-            fig, ax = plt.subplots(subplot_kw={"projection": "3d"})
-        else:
-            fig = ax.figure
+            _, ax = plt.subplots(subplot_kw={"projection": "3d"})
+        fig = ax.get_figure()
 
         sc = None
         for i in range(n_base):
@@ -1239,17 +1282,178 @@ class CoilFEM:
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
             weight_full[surf_idx] = weights_surf
 
-            sc = ax.scatter(
-                pts_np[:, 0], pts_np[:, 1], pts_np[:, 2],
-                s=s, c=weight_full, cmap=cmap, vmin=0.0, vmax=1.0,
-            )
+            if simple_mode:
+                # No colormap/colorbar: encode weight as per-point alpha.
+                # Build an explicit (n_nodes, 4) RGBA array so per-point
+                # transparency survives even for hollow markers.
+                rgba = onp.empty((n_nodes, 4), dtype=onp.float64)
+                rgba[:, :3] = to_rgb(color)
+                rgba[:, 3] = onp.clip(weight_full, 0.0, 1.0)
+                # Route the per-point colour to the edges for hollow markers
+                # (``facecolors="none"``) and to the faces otherwise, avoiding
+                # the ``c``-vs-``facecolors`` precedence conflict.
+                scatter_kw = dict(kwargs)
+                if str(scatter_kw.get("facecolors")) == "none":
+                    scatter_kw.setdefault("edgecolors", rgba)
+                else:
+                    scatter_kw.setdefault("facecolors", rgba)
+                ax.scatter(
+                    pts_np[:, 0], pts_np[:, 1], pts_np[:, 2],
+                    s=s, **scatter_kw,
+                )
+            else:
+                sc = ax.scatter(
+                    pts_np[:, 0], pts_np[:, 1], pts_np[:, 2],
+                    s=s, c=weight_full, cmap=cmap, vmin=0.0, vmax=1.0,
+                    **kwargs,
+                )
 
-        if sc is not None:
+        if sc is not None and not simple_mode:
             fig.colorbar(sc, ax=ax, label="support weight")
         ax.set_xlabel("x [m]")
         ax.set_ylabel("y [m]")
         ax.set_zlabel("z [m]")
-        return fig, ax
+        return ax
+
+    def plot(
+        self,
+        *,
+        base_curves_dofs: list[jax.Array] | None = None,
+        base_currents_dofs: jax.Array | None = None,
+        base_support_dofs: list[dict | None] | None = None,
+        ax=None,
+        cmap: str = "viridis",
+        support_color="k",
+        support_s: float = 6.0,
+        axis_equal: bool = True,
+    ):
+        """Overlay a von Mises stress surface on the Winkler support scatter.
+
+        Renders the exterior faces of every tetrahedron as coloured
+        triangles whose colour is the owning cell's quad-averaged von Mises
+        stress (in Pa). 
+
+        Only ``TET4`` / ``TET10`` meshes are supported, since the surface
+        rendering relies on triangular element faces.
+
+        Parameters
+        ----------
+        base_curves_dofs : list[jax.Array] or None
+            DOF vectors per base coil.  ``None`` uses initial DOFs from
+            ``self.base_curves_jax``.
+        base_currents_dofs : jax.Array or None
+            Currents per base coil.  ``None`` uses ``self.base_currents_jax``.
+        base_support_dofs : list[dict | None] or None
+            Per-coil support parameters for the support functions.
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None
+            Existing 3-D axes to draw on.  ``None`` (default) creates a new
+            figure and 3-D axes.
+        cmap : str
+            Matplotlib colormap name for the von Mises surface (default
+            ``"viridis"``).
+        support_color : color-like
+            Colour of the support markers (default ``"k"``).
+        support_s : float
+            Marker size for the support scatter (default ``6.0``).
+        axis_equal : bool
+            If ``True`` (default) scale the three axes equally via
+            :func:`simsopt.geo.plotting.fix_matplotlib_3d`.
+
+        Returns
+        -------
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D
+            The 3-D axes used for the plot.  The parent figure is available as
+            ``ax.get_figure()``.
+        """
+        import numpy as onp
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize
+        from matplotlib.cm import ScalarMappable
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+        # ── Mesh-type check: surface rendering needs triangular tet faces ────
+        for m in self.meshes:
+            if m.ele_type not in ("TET4", "TET10"):
+                raise NotImplementedError(
+                    "CoilFEM.plot only supports TET4/TET10 meshes; "
+                    f"found ele_type={m.ele_type!r}."
+                )
+
+        # ── Support scatter (hollow circles, weight-as-alpha) ────────────────
+        if ax is None:
+            _, ax = plt.subplots(subplot_kw={"projection": "3d"})
+        fig = ax.get_figure()
+        # ax = self.plot_support(
+        #     base_curves_dofs=base_curves_dofs,
+        #     base_support_dofs=base_support_dofs,
+        #     ax=ax,
+        #     s=support_s,
+        #     simple_mode=True,
+        #     color=support_color,
+        # )
+        # fig = ax.get_figure()
+
+        # ── Forward FEM for von Mises + node geometry ────────────────────────
+        result = self.run(
+            base_curves_dofs=base_curves_dofs,
+            base_currents_dofs=base_currents_dofs,
+            base_support_dofs=base_support_dofs,
+        )
+
+        # Local tetrahedron faces (corner nodes only; TET10-safe).
+        tet_faces = onp.array(
+            [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]], dtype=onp.int64
+        )
+
+        coil_tris: list = []
+        coil_vals: list = []
+        for i, mesh in enumerate(self.meshes):
+            pts_np = onp.asarray(result["mesh_points"][i], dtype=onp.float64)
+            vm_cell = onp.asarray(
+                jnp.mean(result["von_mises"][i], axis=-1), dtype=onp.float64
+            )  # (n_cells,) [Pa]
+
+            corners = onp.asarray(mesh.cells, dtype=onp.int64)[:, :4]  # (n_cells, 4)
+            n_cells = corners.shape[0]
+
+            faces = corners[:, tet_faces].reshape(-1, 3)              # (n_cells*4, 3)
+            owner = onp.repeat(onp.arange(n_cells), tet_faces.shape[0])
+
+            # Boundary faces appear in exactly one tet (unique sorted key).
+            keys = onp.sort(faces, axis=1)
+            _, inv, counts = onp.unique(
+                keys, axis=0, return_inverse=True, return_counts=True
+            )
+            inv = onp.asarray(inv).ravel()  # numpy 2.0 may return (n, 1)
+            boundary = counts[inv] == 1
+
+            bfaces = faces[boundary]           # (n_bf, 3) node indices
+            bowner = owner[boundary]           # (n_bf,)
+            coil_tris.append(pts_np[bfaces])   # (n_bf, 3, 3)
+            coil_vals.append(vm_cell[bowner])  # (n_bf,)
+
+        all_vals = onp.concatenate(coil_vals) if coil_vals else onp.zeros(1)
+        norm = Normalize(vmin=float(all_vals.min()), vmax=float(all_vals.max()))
+        colormap = plt.get_cmap(cmap)
+
+        for tris, vals in zip(coil_tris, coil_vals):
+            coll = Poly3DCollection(tris)
+            coll.set_facecolor(colormap(norm(vals)))
+            coll.set_edgecolor("none")
+            ax.add_collection3d(coll)
+
+        sm = ScalarMappable(norm=norm, cmap=colormap)
+        sm.set_array([])
+        fig.colorbar(sm, ax=ax, label="von Mises [Pa]")
+
+        if axis_equal:
+            try:
+                from simsopt.geo.plotting import fix_matplotlib_3d
+                fix_matplotlib_3d(ax)
+            except ImportError:  # pragma: no cover
+                pass
+
+        return ax
 
     def save_run_vtu(
         self,
@@ -1305,6 +1509,8 @@ class CoilFEM:
 
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
+        if base_support_dofs is None:
+            base_support_dofs = self._base_support_dofs
 
         sd = _validate_support_dofs(base_support_dofs, len(self.base_curves_jax))
 

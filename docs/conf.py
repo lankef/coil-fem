@@ -26,11 +26,17 @@ extensions = [
     "sphinx.ext.mathjax",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
+    "myst_nb",
 ]
 
 # Regenerate ``docs/api/generated/*.rst`` on each build (those stubs are
 # gitignored). Required for Read the Docs and other clean checkouts.
 autosummary_generate = True
+
+# MyST-NB: render tutorial notebooks from their stored outputs.  Execution is
+# disabled so the docs build never needs the heavy runtime deps (simsopt,
+# jax-fem, data files); the committed cell outputs are shown as-is.
+nb_execution_mode = "off"
 
 nitpicky = False
 suppress_warnings = [
@@ -39,7 +45,12 @@ suppress_warnings = [
 ]
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "**/.ipynb_checkpoints",
+]
 
 html_theme = "alabaster"
 html_static_path = ["_static"]
