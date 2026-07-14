@@ -192,6 +192,17 @@ def recompute_fe_geometry(points, cells, shape_grads_ref, shape_vals, quad_weigh
 
 
 # ============================================================================
+# Internal-variable ordering contract
+# ============================================================================
+
+# Positional order of entries in ``LinearElasticity3D.internal_vars``.
+# JAX-FEM vmaps over these in the same order, so the kernel signatures
+# ``stress(u_grad, bf, lam, mu, eps_th)`` and
+# ``mass_map(u, x, bf, lam, mu, eps_th)`` must match exactly.
+_INTERNAL_VAR_NAMES = ('body_force', 'lam_q', 'mu_q', 'eps_th_q')
+
+
+# ============================================================================
 # JAX-FEM Problem Class
 # ============================================================================
 
@@ -419,7 +430,21 @@ class LinearElasticity3D(DeviceProblem):
         # internal_vars for forward-only solves; overwritten by set_params.
         pqp = jnp.asarray(self.physical_quad_points)  # (num_cells, num_quads, dim)
         bf_at_quads = jax.vmap(jax.vmap(bf_fn))(pqp)  # (num_cells, num_quads, 3)
-        self.internal_vars = [bf_at_quads]
+
+        # Build initial per-quad material arrays for internal_vars.
+        # set_params overwrites these on every differentiable forward pass.
+        n_cells = fe.num_cells
+        n_quads = int(self._qw.shape[0])
+        lam_q_init = jnp.full((n_cells, n_quads), self.lam)
+        mu_q_init  = jnp.full((n_cells, n_quads), self.mu)
+        if self.epsilon_th is not None:
+            eps_th_q_init = jnp.broadcast_to(
+                self.epsilon_th[None, None], (n_cells, n_quads, 3, 3)
+            )
+        else:
+            eps_th_q_init = jnp.zeros((n_cells, n_quads, 3, 3), dtype=jnp.float64)
+
+        self.internal_vars = [bf_at_quads, lam_q_init, mu_q_init, eps_th_q_init]
 
     def _build_winkler_surface_maps(self):
         """Build static face-to-surface-node index map for differentiable k.
@@ -507,42 +532,28 @@ class LinearElasticity3D(DeviceProblem):
     def get_tensor_map(self):
         """JAX-FEM hook: return the constitutive (stress) closure for volume assembly.
 
-        JAX-FEM's ``laplace_kernel`` calls ``vmap(tensor_map)(u_grad, *internal_vars)``
-        at every quadrature point to build the stiffness residual.  The returned
-        closure must have the signature ``stress(u_grad, *args) -> (vec, vec)``
-        where ``u_grad`` is the displacement gradient ``(3, 3)`` at a single point.
+        JAX-FEM's ``laplace_kernel`` calls
+        ``vmap(tensor_map)(u_grad, *internal_vars_per_quad)`` at every
+        quadrature point, where ``internal_vars_per_quad`` are the per-point
+        slices of ``self.internal_vars`` in the order defined by
+        :data:`_INTERNAL_VAR_NAMES`:
+        ``(body_force, lam, mu, eps_th)``.
 
         Returns
         -------
         stress : callable
-            ``stress(u_grad, *args) -> jnp.ndarray (3, 3)``
+            ``stress(u_grad, bf, lam, mu, eps_th) -> jnp.ndarray (3, 3)``
 
-            Cauchy stress tensor at a quadrature point:
-
-            * **Isothermal:**  σ = λ tr(ε) I + 2μ ε,  where ε = ½(∇u + ∇uᵀ).
-            * **Thermoelastic:** σ = λ tr(ε − ε_th) I + 2μ (ε − ε_th),
-              with the pre-computed constant eigenstrain ε_th.
-
-            The ``*args`` catch-all absorbs body-force or other internal
-            variables passed by the assembler; the stress closure ignores them.
+            Cauchy stress σ = λ tr(ε_m) I + 2μ ε_m, where
+            ε_m = ½(∇u + ∇uᵀ) − ε_th.  Pass a zero ``(3, 3)`` ``eps_th``
+            for the isothermal case.  The ``bf`` argument is ignored here
+            (consumed by :meth:`get_mass_map`).
         """
-        lam, mu = self.lam, self.mu
-        epsilon_th = self.epsilon_th  # None or constant (3, 3) array
-
-        # JAX-FEM's laplace_kernel calls vmap(tensor_map)(u_grad, *cell_internal_vars).
-        # Body force lives in internal_vars for get_mass_map only; σ(u) ignores it.
-        if epsilon_th is None:
-            def stress(u_grad, *args):
-                eps = 0.5 * (u_grad + u_grad.T)
-                tr = jnp.trace(eps)
-                return lam * tr * jnp.eye(3, dtype=u_grad.dtype) + 2.0 * mu * eps
-        else:
-            def stress(u_grad, *args):
-                eps = 0.5 * (u_grad + jnp.swapaxes(u_grad, -1, -2))
-                eps_m = eps - epsilon_th
-                tr = jnp.trace(eps_m, axis1=-2, axis2=-1)
-                eye = jnp.eye(3, dtype=u_grad.dtype)
-                return lam * tr[..., None, None] * eye + 2.0 * mu * eps_m
+        def stress(u_grad, bf, lam, mu, eps_th):
+            eps = 0.5 * (u_grad + u_grad.T)
+            eps_m = eps - eps_th
+            tr = jnp.trace(eps_m)
+            return lam * tr * jnp.eye(3, dtype=u_grad.dtype) + 2.0 * mu * eps_m
 
         return stress
 
@@ -572,13 +583,15 @@ class LinearElasticity3D(DeviceProblem):
         Returns
         -------
         mass_map : callable
-            ``mass_map(u, x, bf) -> jnp.ndarray (3,)``
+            ``mass_map(u, x, bf, lam, mu, eps_th) -> jnp.ndarray (3,)``
 
             Returns ``-bf``.  JAX-FEM integrates this against the test
             function to form ``−∫ b · v dV``, matching the load term on the
-            right-hand side of the weak form.
+            right-hand side of the weak form.  The ``lam``, ``mu``, and
+            ``eps_th`` arguments mirror :meth:`get_tensor_map`'s signature
+            (same ``internal_vars`` positional order) and are ignored here.
         """
-        def mass_map(u, x, bf):
+        def mass_map(u, x, bf, lam, mu, eps_th):
             """bf: (3,) physical body-force [N/m³]; negate for JAX-FEM residual convention."""
             return -bf
 
@@ -689,8 +702,32 @@ class LinearElasticity3D(DeviceProblem):
             else:
                 self.nanson_scale[i] = ns_geom[:, None, :]
 
-        # Body force enters the residual via internal_vars (standard path).
-        self.internal_vars = [params['body_force']]
+        # Build per-quad constitutive arrays.  Fall back to uniform scalar
+        # values (broadcast) when not supplied in params — this keeps the
+        # differentiable path lean for the common uniform-material case while
+        # allowing spatially varying fields to be injected via params later.
+        n_cells = self._cells_jnp.shape[0]
+        n_quads = int(self._qw.shape[0])
+
+        lam_q = params.get('lam_q', None)
+        if lam_q is None:
+            lam_q = jnp.full((n_cells, n_quads), self.lam)
+
+        mu_q = params.get('mu_q', None)
+        if mu_q is None:
+            mu_q = jnp.full((n_cells, n_quads), self.mu)
+
+        eps_th_q = params.get('eps_th_q', None)
+        if eps_th_q is None:
+            if self.epsilon_th is not None:
+                eps_th_q = jnp.broadcast_to(
+                    self.epsilon_th[None, None], (n_cells, n_quads, 3, 3)
+                )
+            else:
+                eps_th_q = jnp.zeros((n_cells, n_quads, 3, 3), dtype=jnp.float64)
+
+        # internal_vars order matches _INTERNAL_VAR_NAMES exactly.
+        self.internal_vars = [params['body_force'], lam_q, mu_q, eps_th_q]
 
     # ------------------------------------------------------------------
     # Post-processing

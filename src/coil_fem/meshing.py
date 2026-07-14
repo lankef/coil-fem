@@ -1,4 +1,4 @@
-"""Structured volume meshes for coil cross-sections.
+"""Structured volume meshes and meshing routines for finite-build coils.
 
 Sweeps a rectangular (:class:`CoilMeshRectangle`) or disk
 (:class:`CoilMeshDisk`) cross-section grid along a framed centerline curve
