@@ -338,6 +338,7 @@ class CoilFEM:
 
     def __init__(
         self,
+        support: Support,
         base_curves_jax: list[CurveXYZFourierJAX],
         base_currents_jax: jax.Array,
         base_support_fns: Callable | list[Callable],
@@ -348,9 +349,8 @@ class CoilFEM:
         gravity_options: dict | None = None,
         material_options: dict | None = None,
         problem_options: dict | None = None,
-        verbose: int = 0,
-        support: Support | None = None,
         physics_options: dict | None = None,
+        verbose: int = 0,
     ):
         self.verbose = verbose
         self._set_jaxfem_log_level()

@@ -27,10 +27,6 @@ class Support(abc.ABC):
     :class:`FixedSupport`
         Grounded Winkler / Robin BC — attachment points are fixed (zero
         displacement).  Default for uncoupled solves.
-    ``BeamNetworkSupport`` *(future)*
-        Beam-network model; solves a small linear beam problem.
-    ``DensityFieldSupport`` *(future)*
-        Density-parameterised FEM support.
     """
 
     @property
