@@ -1,9 +1,9 @@
-"""FEM ``Problem`` subpackage for coil-fem.
+"""Physical systems implemented as ``jax_fem.Problem`` classes.
 
 Exposes :class:`LinearElasticity3D` (differentiable linear-elasticity with
-Winkler BCs and thermal eigenstrain) and :class:`DeviceProblem` (JAX
-device-assembly base class for the cuDSS solver backend) from a single
-namespace::
+Winkler BCs and thermal eigenstrain), :class:`DeviceProblem` (JAX
+device-assembly base class for the cuDSS solver backend), and the stub
+:class:`HeatConduction3D` from a single namespace::
 
     from coil_fem.problem import LinearElasticity3D, DeviceProblem
 """
@@ -16,6 +16,7 @@ from .linear_elasticity import (
     dirichlet_bc,
     recompute_fe_geometry,
 )
+from .heat_conduction import HeatConduction3D
 
 __all__ = [
     "DeviceProblem",
@@ -24,4 +25,5 @@ __all__ = [
     "itc_strain",
     "dirichlet_bc",
     "recompute_fe_geometry",
+    "HeatConduction3D",
 ]

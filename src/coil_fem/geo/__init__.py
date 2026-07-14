@@ -1,4 +1,4 @@
-"""Curve geometry, framed curves, and symmetry helpers for stellarator coils."""
+"""JAX implementations of geometry objects, such as curves, moving frame and symmetry/field-period helpers."""
 
 from .curve_jax import CurveXYZFourierJAX
 from .framed_curve_jax import (

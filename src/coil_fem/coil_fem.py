@@ -27,12 +27,12 @@ from .geo import (
 from .meshing import CoilMesh
 from .magnetic import biot_savart, B_self_quadrature, lorentz_body_force
 
-from jax_fem.solver import ad_wrapper
 from .problem import (
-    LinearElasticity3D,
     lame_parameters,
     recompute_fe_geometry,
 )
+from .pipelines import ElasticPipeline, ThermoElasticPipeline
+from .coupling import Support, FixedSupport
 from .metrics import (
     max_von_mises_hard,
     max_von_mises_lse,
@@ -349,9 +349,12 @@ class CoilFEM:
         material_options: dict | None = None,
         problem_options: dict | None = None,
         verbose: int = 0,
+        support: Support | None = None,
+        physics_options: dict | None = None,
     ):
         self.verbose = verbose
         self._set_jaxfem_log_level()
+        self.support = support if support is not None else FixedSupport()
 
         # ── 1. Validate and normalise inputs ─────────────────────────────────
         self.base_curves_jax = list(base_curves_jax)
@@ -378,20 +381,10 @@ class CoilFEM:
         # as ε_th = −itc · I.
         self._itc = float(mat['itc']) if 'itc' in mat else None
 
-        # ── 3. Build initial meshes; each CoilMesh owns its grid metadata ─────
-        # ``CoilMesh.from_options`` dispatches on ``opt['shape']`` to the right
-        # concrete subclass, which absorbs the sweep + metadata logic.  Any
-        # auto-resolution of the grid happens once, here at construction time;
-        # the topology is then fixed for the rest of the optimization.
-        self.meshes: list[CoilMesh] = []
-        for curve, opt in zip(self.base_curves_jax, self.mesh_opts):
-            frame_type = opt.get('frame', 'rmf')
-            mesh_type = opt.get('mesh_type', 'TET4')
-            fc = make_framed_curve(curve, frame_type)
-            self.meshes.append(CoilMesh.from_options(fc, opt, mesh_type))
-
-        # ── 4. Build FEM problems and ad_wrappers (one per coil) ──────────────
-        # Body force is a zero placeholder; set_params overwrites it each call.
+        # ── 3+4. Build per-coil pipelines (mesh + problem + fwd_pred) ───────────
+        # Pipelines replace the separate self.meshes / self._problems /
+        # self._fwd_preds / self._surface_node_indices lists.  The mesh is
+        # built inside ElasticPipeline so topology and problem stay co-located.
         grav_vec = np.array(
             self.gravity_options.get('g_vec', (0.0, 0.0, -9.80665))
             if self.gravity_options else (0.0, 0.0, 0.0)
@@ -399,77 +392,33 @@ class CoilFEM:
         gravity_bf = (
             self._rho * grav_vec if self.gravity_options else (0.0, 0.0, 0.0)
         )
-
-        solver_name     = self.problem_options.get('solver', 'umfpack')
-        adj_solver_name = self.problem_options.get('adjoint_solver', 'umfpack')
-
-        # cuDSS path uses its own wrapper; CPU paths use the standard ad_wrapper.
-        _use_cudss = (solver_name == 'cudss')
-        if not _use_cudss:
-            solver_opts     = {f"{solver_name}_solver": {}}
-            adj_solver_opts = {f"{adj_solver_name}_solver": {}}
-
         winkler_k = float(self.problem_options['winkler_k'])
 
-        self._problems: list[LinearElasticity3D] = []
-        self._fwd_preds: list = []
-        # Global surface-node indices per coil — used to extract surface_pts
-        # from the current mesh-points array in the forward pass.
-        self._surface_node_indices: list[jnp.ndarray] = []
-
-        thermal_info = (self._itc,)
-
-        # Lazy import to avoid hard dependency on spineax for CPU paths.
-        # cudss_solver raises an actionable ImportError if the optional GPU
-        # stack (spineax + cuDSS) is missing.  The on-device assembly itself
-        # lives in DeviceProblem (spineax-free) and is toggled per problem via
-        # the gpu_assembly flag; only the solver wrapper needs spineax.
-        if _use_cudss:
-            from .solver.cudss import cudss_ad_wrapper
-
-        for i, mesh in enumerate(self.meshes):
-            # Build the FEM problem. No location_fns needed — custom_init
-            # detects exterior faces topologically and builds the Winkler
-            # surface structures from scratch.  gpu_assembly=True keeps the
-            # Jacobian on the JAX device for the cuDSS backend.
-            prob = LinearElasticity3D(
-                mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-                additional_info=(
-                    self._E, self._nu, tuple(gravity_bf), winkler_k
-                ) + thermal_info,
-                gpu_assembly=_use_cudss,
+        _physics_type = (physics_options or {}).get('type', 'elastic')
+        _valid_physics = {'elastic', 'thermoelastic'}
+        if _physics_type not in _valid_physics:
+            raise ValueError(
+                f"physics_options['type'] = {_physics_type!r} is not recognised. "
+                f"Valid choices: {sorted(_valid_physics)}"
             )
 
-            # ── Pre-compute static reference coordinates phi_quad / uv_quad ──
-            # These are coordinates (not interpolated functions), built once
-            # from the mesh topology and stored on the CoilMesh.  phi_quad
-            # values at the periodic seam may exceed 1.0; interpax handles this
-            # via period=1.0.  This also fills mesh.n_quads.
-            mesh.attach_ref_coords(prob)
+        self.pipelines: list[ElasticPipeline] = []
+        for curve, opt in zip(self.base_curves_jax, self.mesh_opts):
+            frame_type = opt.get('frame', 'rmf')
+            mesh_type  = opt.get('mesh_type', 'TET4')
+            fc   = make_framed_curve(curve, frame_type)
+            mesh = CoilMesh.from_options(fc, opt, mesh_type)
 
-            self._problems.append(prob)
-            if _use_cudss:
-                self._fwd_preds.append(
-                    cudss_ad_wrapper(
-                        prob,
-                        device_id=int(self.problem_options.get('cudss_device_id', 0)),
-                        mtype_id=int(self.problem_options.get('cudss_mtype_id', 1)),
-                        tol=float(self.problem_options.get('cudss_tol', 1e-6)),
-                        rel_tol=float(self.problem_options.get('cudss_rel_tol', 1e-8)),
-                        max_iter=int(self.problem_options.get('cudss_max_iter', 50)),
-                    )
+            pipeline_cls = (
+                ThermoElasticPipeline if _physics_type == 'thermoelastic'
+                else ElasticPipeline
+            )
+            self.pipelines.append(
+                pipeline_cls(
+                    mesh, self._E, self._nu, self._itc,
+                    tuple(gravity_bf), winkler_k, self.problem_options,
                 )
-            else:
-                self._fwd_preds.append(
-                    ad_wrapper(
-                        prob,
-                        solver_options=solver_opts,
-                        adjoint_solver_options=adj_solver_opts,
-                    )
-                )
-
-            # Cache global surface node indices for this coil.
-            self._surface_node_indices.append(prob.surface_node_global_indices)
+            )
 
     # ============================================================================
     # Logging verbosity
@@ -606,7 +555,7 @@ class CoilFEM:
         )   # (n_cells, n_quads, 3)
 
         # ── 4. B_ext at FEM quad points via Biot-Savart on physical mesh ──────
-        prob_i = self._problems[coil_idx]
+        prob_i = self.pipelines[coil_idx].problem
         _, _, _, pqp = recompute_fe_geometry(
             pts_i, prob_i._cells_jnp, prob_i._sg_ref, prob_i._sv, prob_i._qw,
         )
@@ -662,10 +611,9 @@ class CoilFEM:
             ``(n_nodes, 3)``.  For this single-physics problem the list
             always has exactly one element.
         """
-        params: dict = {'points': mesh_points, 'body_force': body_force}
-        if support_weights is not None:
-            params['support_weights'] = support_weights
-        return self._fwd_preds[coil_idx](params)
+        return self.pipelines[coil_idx].solve(
+            mesh_points, body_force, support_weights
+        )['sol_list']
 
     # ============================================================================
     # Public API
@@ -744,7 +692,7 @@ class CoilFEM:
                 i, pts_i, base_curves_dofs[i], sd[i]
             )
             sol = self._forward_solve(i, pts_i, bf_i, weights_i)
-            vm  = self._problems[i].von_mises_stress(sol)
+            vm  = self.pipelines[i].problem.von_mises_stress(sol)
 
             sol_list.append(sol)
             vm_list.append(vm)
@@ -815,7 +763,7 @@ class CoilFEM:
 
         eps_total_list, eps_thermal_list = [], []
         for i in range(len(self.base_curves_jax)):
-            prob = self._problems[i]
+            prob = self.pipelines[i].problem
             # Recompute shape_grads from the returned geometry rather than
             # relying on the mutated prob.shape_grads state.
             sg, _, _, _ = recompute_fe_geometry(
@@ -964,7 +912,7 @@ class CoilFEM:
                 i, pts_i, base_curves_dofs[i], sd[i]
             )
             sol    = self._forward_solve(i, pts_i, bf_i, weights_i)
-            prob_i = self._problems[i]
+            prob_i = self.pipelines[i].problem
 
             # Recompute FE geometry OUTSIDE the ad_wrapper custom_vjp scope
             # so that JAX can differentiate through shape_grads and JxW via
@@ -1007,8 +955,8 @@ class CoilFEM:
         dofs_i : (n_dofs,) traced
         support_dofs_i : dict or None
         """
-        surf_idx  = self._surface_node_indices[coil_idx]   # (n_surf_nodes,) static
-        surf_pts  = pts_i[surf_idx]                         # (n_surf_nodes, 3) traced
+        surf_idx  = self.pipelines[coil_idx].surface_node_indices  # (n_surf_nodes,) static
+        surf_pts  = pts_i[surf_idx]                               # (n_surf_nodes, 3) traced
         base      = self.base_curves_jax[coil_idx]
         coil_curr = CurveXYZFourierJAX(base.quadpoints, dofs_i, base.order)
         return self.base_support_fns[coil_idx](surf_pts, coil_curr, support_dofs_i)
@@ -1016,13 +964,22 @@ class CoilFEM:
     # ============================================================================
     # Properties
     # ============================================================================
-    
+
+    @property
+    def meshes(self) -> list[CoilMesh]:
+        """Per-coil mesh objects (one per base coil).
+
+        Backward-compatibility shim: delegates to ``pipeline.mesh`` so that
+        all existing code using ``self.meshes[i]`` continues to work after
+        the internal migration to :class:`~coil_fem.pipelines.ElasticPipeline`.
+        """
+        return [p.mesh for p in self.pipelines]
+
     @property
     def n_nodes(self) -> int:
         """The mesh nodes count."""
         return [m.points.shape[0] for m in self.meshes]
 
-    
     @property
     def n_cells(self) -> int:
         """The mesh cells count."""
@@ -1128,7 +1085,7 @@ class CoilFEM:
             pts_np = onp.asarray(pts_i, dtype=onp.float64)
             n_nodes = pts_np.shape[0]
 
-            surf_idx = onp.asarray(self._surface_node_indices[i], dtype=onp.int32)
+            surf_idx = onp.asarray(self.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
                 self._compute_support_weights(i, pts_i, base_curves_dofs[i], sd[i]),
                 dtype=onp.float64,
@@ -1217,7 +1174,7 @@ class CoilFEM:
             pts_np = onp.asarray(pts_i, dtype=onp.float64)
             n_nodes = pts_np.shape[0]
 
-            surf_idx = onp.asarray(self._surface_node_indices[i], dtype=onp.int32)
+            surf_idx = onp.asarray(self.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
                 self._compute_support_weights(i, pts_i, base_curves_dofs[i], sd[i]),
                 dtype=onp.float64,
@@ -1497,7 +1454,7 @@ class CoilFEM:
 
             pts_i    = jnp.asarray(pts_np)
             surf_idx = onp.asarray(
-                self._surface_node_indices[i], dtype=onp.int32
+                self.pipelines[i].surface_node_indices, dtype=onp.int32
             )
             weights_surf = onp.asarray(
                 self._compute_support_weights(

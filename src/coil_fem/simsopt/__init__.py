@@ -1,4 +1,4 @@
-"""simsopt interop: Optimizable wrappers for coil-fem."""
+"""Simsopt integration."""
 
 from .objective import CoilFEMObjective
 from .support import CoilSupport, CoilSupportDiscrete, CoilSupportTopBottom

@@ -27,6 +27,7 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
     "myst_nb",
+    "sphinxcontrib.mermaid",
 ]
 
 # Regenerate ``docs/api/generated/*.rst`` on each build (those stubs are
