@@ -1,14 +1,17 @@
 """Simsopt-optimizable coil support models.
 
-A *support* describes where a coil is structurally clamped.  In
-:class:`~coil_fem.CoilFEM` this enters as a ``support_fn`` returning
-per-surface-node Winkler spring weights in ``[0, 1]``::
+A *support* describes where a coil is structurally clamped.  Each concrete
+subclass of :class:`CoilSupport` implements
+:meth:`~coil_fem.coupling.Support.compute_weights`, which returns per-surface-node
+Winkler spring weights in ``[0, 1]`` for a given base coil::
 
-    support_fn(surface_points, curve_jax, dofs) -> weights
+    weights = coil_support.compute_weights(
+        coil_idx, surface_pts, curve_jax, support_dofs
+    )
 
-This module wraps that function in a :class:`simsopt.Optimizable` so the
-support parameters (``dofs``) can be co-optimised with coil geometry and
-currents through a single :class:`~coil_fem.simsopt.objective.CoilFEMObjective`.
+:class:`CoilSupport` holds the base coils (curves + currents), ``nfp``, and
+``stellsym`` so that :class:`~coil_fem.simsopt.CoilFEMObjective` needs only a
+single ``coil_support`` argument to construct the full FEM pipeline.
 
 The optimisable parameters live **only** in the simsopt DOF store: the dofs
 dict is flattened to the Optimizable's ``x`` at construction, and
@@ -25,6 +28,8 @@ from jax.nn import sigmoid
 
 from jax.flatten_util import ravel_pytree
 
+from ..coupling import SupportFixed
+
 try:
     from simsopt._core.optimizable import Optimizable
     _HAS_SIMSOPT = True
@@ -33,22 +38,29 @@ except ImportError:  # pragma: no cover
     _HAS_SIMSOPT = False
 
 
-class CoilSupport(Optimizable):
-    """Simsopt container for a single coil's support ``dofs`` + constants.
+class CoilSupport(SupportFixed, Optimizable):
+    """Simsopt container for a coilset's support DOFs, constants, and coil refs.
 
-    The flattened ``dofs`` pytree *is* this Optimizable's degrees of freedom;
-    there is no separate value attribute.  Subclasses implement the static
-    :meth:`support_fn` (the core weight logic) and pass the optimisable
-    ``dofs`` dict plus any fixed ``constants`` to ``__init__``.
+    Holds the base coils (curves + currents), the symmetry parameters ``nfp``
+    and ``stellsym``, and any optimisable support parameters (the ``dofs``
+    pytree).  Subclasses implement :meth:`compute_weights` (the core weight
+    logic) and pass the optimisable ``dofs`` dict plus any fixed ``constants``
+    to ``__init__``.
 
     Parameters
     ----------
+    base_coils : list
+        Simsopt ``Coil`` objects (each exposing ``.curve`` and ``.current``).
+        These are the *base* coils — before symmetry expansion.
+    nfp : int
+        Number of field periods.
+    stellsym : bool
+        Whether to apply stellarator symmetry during the symmetry expansion.
     support_dofs_jax : dict
-        Optimisable support parameters (the ``dofs`` argument of
-        :meth:`support_fn`).  Flattened into the simsopt DOF vector.
+        Optimisable support parameters.  Flattened into the simsopt DOF vector.
     constants : dict or None
-        Fixed (non-optimised) scalars forwarded to :meth:`support_fn` as
-        keyword arguments.
+        Fixed (non-optimised) scalars forwarded to :meth:`compute_weights` via
+        :attr:`constants`.
     names : list[str] or None
         Optional DOF names, length equal to the flattened ``support_dofs_jax``
         size.
@@ -60,6 +72,9 @@ class CoilSupport(Optimizable):
 
     def __init__(
         self,
+        base_coils: list,
+        nfp: int,
+        stellsym: bool,
         support_dofs_jax: dict,
         constants: dict | None = None,
         names=None,
@@ -67,47 +82,61 @@ class CoilSupport(Optimizable):
     ):
         if not _HAS_SIMSOPT:
             raise ImportError("simsopt is required for CoilSupport.")
+
+        SupportFixed.__init__(self, support_fns=None)
+
+        self._base_coils = list(base_coils)
+        self.nfp = int(nfp)
+        self.stellsym = bool(stellsym)
+
         flat, self._unravel = ravel_pytree(support_dofs_jax)
         self.constants = dict(constants or {})
         # np.array (not asarray) so the DOF buffer is writable: converting a
         # JAX array via np.asarray yields a read-only view.
         if dofs is not None:
-            Optimizable.__init__(self, dofs=dofs)
+            Optimizable.__init__(self, dofs=dofs, depends_on=self._base_coils)
         else:
-            Optimizable.__init__(self, x0=np.array(flat, dtype=float), names=names)
+            Optimizable.__init__(
+                self,
+                x0=np.array(flat, dtype=float),
+                names=names,
+                depends_on=self._base_coils,
+            )
 
-    @staticmethod
-    def support_fn(surface_points, curve_jax, dofs, **constants):
-        """Per-surface-node Winkler weights in ``[0, 1]`` (abstract).
+    # ============================================================================
+    # Coil accessors
+    # ============================================================================
 
-        Parameters
-        ----------
-        surface_points : jax.Array, shape ``(n_surface_nodes, 3)``
-        curve_jax : CurveXYZFourierJAX
-        dofs : dict
-            Optimisable support parameters (see :attr:`support_dofs`).
-        **constants
-            Fixed scalars from :attr:`constants`.
-        """
-        raise NotImplementedError
+    @property
+    def base_curves(self) -> list:
+        """Simsopt curve objects for the base coils (before symmetry expansion)."""
+        return [c.curve for c in self._base_coils]
+
+    @property
+    def base_currents(self) -> list:
+        """Simsopt current objects for the base coils."""
+        return [c.current for c in self._base_coils]
+
+    @property
+    def n_coils(self) -> int:
+        """Number of base coils."""
+        return len(self._base_coils)
+
+    # ============================================================================
+    # DOF accessors
+    # ============================================================================
 
     @property
     def support_dofs(self) -> dict:
         """Current dofs as a differentiable JAX pytree, read from the DOFs."""
         return self._unravel(jnp.asarray(self.local_full_x))
 
-    def support_callable(self):
-        """Return a CoilFEM-compatible ``support_fn(sp, curve, dofs)``."""
-        constants = self.constants
-        fn = type(self).support_fn
-        return lambda sp, curve, dofs: fn(sp, curve, dofs, **constants)
-
     def flatten_grad(self, grad_dofs: dict) -> np.ndarray:
         """Flatten a JAX gradient pytree into a simsopt DOF-aligned array."""
         return np.asarray(ravel_pytree(grad_dofs)[0], dtype=float)
 
 
-class CoilSupportDiscrete(CoilSupport):
+class CoilSupportFixed(CoilSupport):
     """Support modelled as ``clamp_num`` clamps at optimisable arclengths.
 
     Each clamp is a sphere of radius ``clamp_radius`` centred on the coil at
@@ -115,28 +144,40 @@ class CoilSupportDiscrete(CoilSupport):
     clamp indicator spheres.  Only the clamp locations ``phis`` are DOFs;
     ``clamp_radius``, ``sigmoid_eps`` and ``clamp_num`` are fixed.
 
+    Holds a merged ``phis`` array of shape ``(n_coils, clamp_num)`` covering
+    all base coils; a single flat DOF vector of length
+    ``n_coils * clamp_num`` is registered with simsopt.
+
     Parameters
     ----------
+    base_coils : list
+        Simsopt ``Coil`` objects (before symmetry expansion).
+    nfp : int
+        Number of field periods.
+    stellsym : bool
+        Whether to apply stellarator symmetry.
     clamp_radius : float
         Sphere radius [m] of each clamp (region of non-zero spring weight).
     clamp_num : int
-        Number of clamps (length of ``phis``).
-    sigmoid_eps : float or None
-        Edge sharpness of the clamp.  ``None`` (default) uses
-        ``20.0 / clamp_radius``.
+        Number of clamps per coil (default 2).
+    sigmoid_eps : float
+        Edge sharpness of the clamp (default 0.1).
     phis : array-like or None
-        Initial clamp locations in ``[0, 1)``.  ``None`` (default) spreads
+        Initial clamp locations, shape ``(n_coils, clamp_num)`` or
+        ``(clamp_num,)`` (broadcast to all coils).  ``None`` (default) spreads
         ``clamp_num`` clamps uniformly via ``linspace(0, 1, clamp_num,
-        endpoint=False)``.
+        endpoint=False)`` for every coil.
     names : list[str] or None
         Optional DOF names.
     dofs : DOFs or None
-        Simsopt ``DOFs`` object for restoring serialised state
-        (injected by :meth:`from_dict` / :meth:`from_file`).
+        Simsopt ``DOFs`` object for restoring serialised state.
     """
 
     def __init__(
         self,
+        base_coils: list,
+        nfp: int,
+        stellsym: bool,
         clamp_radius: float,
         clamp_num: int = 2,
         sigmoid_eps: float = 0.1,
@@ -144,22 +185,27 @@ class CoilSupportDiscrete(CoilSupport):
         names=None,
         dofs=None,
     ):
-
+        n_coils = len(base_coils)
         clamp_radius = float(clamp_radius)
         clamp_num = int(clamp_num)
-        if phis is None:
-            phis = jnp.linspace(0.0, 1.0, clamp_num, endpoint=False)
 
-        # Store all constructor args as instance attributes so that
-        # GSONable.as_dict can introspect them for JSON serialisation.
+        if phis is None:
+            row = jnp.linspace(0.0, 1.0, clamp_num, endpoint=False)
+            phis_arr = jnp.broadcast_to(row, (n_coils, clamp_num))
+        else:
+            phis_arr = jnp.asarray(phis, dtype=float)
+            if phis_arr.ndim == 1:
+                phis_arr = jnp.broadcast_to(phis_arr, (n_coils, clamp_num))
+
         self.clamp_radius = clamp_radius
         self.clamp_num    = clamp_num
-        self.sigmoid_eps = float(sigmoid_eps)
-        self.phis         = phis
+        self.sigmoid_eps  = float(sigmoid_eps)
+        self.phis         = phis_arr
         self.names        = names
 
         super().__init__(
-            support_dofs_jax={'phis': jnp.asarray(phis, dtype=float)},
+            base_coils, nfp, stellsym,
+            support_dofs_jax={'phis': phis_arr},
             constants={
                 'clamp_radius': clamp_radius,
                 'sigmoid_eps': float(sigmoid_eps),
@@ -169,15 +215,15 @@ class CoilSupportDiscrete(CoilSupport):
         )
 
     @staticmethod
-    def support_fn(surface_points, curve_jax, dofs, *, clamp_radius, sigmoid_eps):
-        """Per-surface-node Winkler weights: smooth union of ``clamp_num`` spheres.
+    def support_fn(surface_points, curve_jax, phis_i, *, clamp_radius, sigmoid_eps):
+        """Per-surface-node Winkler weights for one coil: smooth union of clamp spheres.
 
         Parameters
         ----------
         surface_points : jax.Array, shape (n_surface_nodes, 3)
         curve_jax : CurveXYZFourierJAX
-        dofs : dict
-            ``{'phis': jax.Array, shape (clamp_num,)}`` — clamp arc-length locations.
+        phis_i : jax.Array, shape (clamp_num,)
+            Clamp arc-length locations for this coil.
         clamp_radius : float
         sigmoid_eps : float
 
@@ -185,20 +231,42 @@ class CoilSupportDiscrete(CoilSupport):
         -------
         jax.Array, shape (n_surface_nodes,)
         """
-        phis = dofs['phis']
-        gamma_support = curve_jax.gamma_eval(phis)            # (n_support, 3)
-        # distances = jnp.sqrt(jnp.sum(
-        #     (surface_points[:, None, :] - gamma_support[None, :, :]) ** 2,
-        #     axis=-1,
-        # ) + 1e-10)                                            # (n_nodes, n_support)
-        # w = sigmoid(sigmoid_eps * (clamp_radius - distances))
+        gamma_support = curve_jax.gamma_eval(phis_i)            # (clamp_num, 3)
         distances = jnp.sum(
             (surface_points[:, None, :] - gamma_support[None, :, :]) ** 2,
             axis=-1,
-        )                                           # (n_nodes, n_support)
+        )                                           # (n_nodes, clamp_num)
         sigmoid_width = sigmoid_eps * clamp_radius
-        w = sigmoid((clamp_radius**2 - distances)/(sigmoid_width**2))
-        return jnp.sum(w, axis=-1)                            # union of clamps
+        w = sigmoid((clamp_radius**2 - distances) / (sigmoid_width**2))
+        return jnp.sum(w, axis=-1)                 # union of clamps
+
+    def compute_weights(self, coil_idx, surface_pts, curve_jax, dofs):
+        """Winkler weights for base coil ``coil_idx``.
+
+        Parameters
+        ----------
+        coil_idx : int
+        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
+        curve_jax : CurveXYZFourierJAX
+        dofs : dict or None
+            Merged support dofs dict with key ``'phis'``, shape
+            ``(n_coils, clamp_num)``.  ``None`` falls back to the initial
+            ``phis`` stored at construction.
+
+        Returns
+        -------
+        jax.Array, shape ``(n_surface_nodes,)``
+        """
+        if dofs is None:
+            phis_i = self.phis[coil_idx]
+        else:
+            phis_i = dofs['phis'][coil_idx]
+        return self.support_fn(
+            surface_pts, curve_jax, phis_i,
+            clamp_radius=self.constants['clamp_radius'],
+            sigmoid_eps=self.constants['sigmoid_eps'],
+        )
+
 
 class CoilSupportTopBottom(CoilSupport):
     """Static soft-sphere support at the top and bottom of the coil centreline.
@@ -208,6 +276,12 @@ class CoilSupportTopBottom(CoilSupport):
 
     Parameters
     ----------
+    base_coils : list
+        Simsopt ``Coil`` objects (before symmetry expansion).
+    nfp : int
+        Number of field periods.
+    stellsym : bool
+        Whether to apply stellarator symmetry.
     clamp_radius : float
         Sphere radius [m] around the top and bottom curve points.
     sigmoid_eps : float
@@ -216,27 +290,36 @@ class CoilSupportTopBottom(CoilSupport):
         Simsopt ``DOFs`` object for restoring serialised state.
     """
 
-    def __init__(self, clamp_radius, sigmoid_eps=0.1, dofs=None):
+    def __init__(
+        self,
+        base_coils: list,
+        nfp: int,
+        stellsym: bool,
+        clamp_radius: float,
+        sigmoid_eps: float = 0.1,
+        dofs=None,
+    ):
         self.clamp_radius = float(clamp_radius)
-        self.sigmoid_eps = float(sigmoid_eps)
+        self.sigmoid_eps  = float(sigmoid_eps)
 
         super().__init__(
+            base_coils, nfp, stellsym,
             support_dofs_jax={},
-            constants={'clamp_radius': float(clamp_radius),
-                       'sigmoid_eps': float(sigmoid_eps)},
+            constants={
+                'clamp_radius': float(clamp_radius),
+                'sigmoid_eps': float(sigmoid_eps),
+            },
             dofs=dofs,
         )
 
     @staticmethod
-    def support_fn(surface_points, curve_jax, dofs, *, clamp_radius, sigmoid_eps):
-        """Per-surface-node Winkler weights: soft union of top and bottom spheres.
+    def support_fn(surface_points, curve_jax, *, clamp_radius, sigmoid_eps):
+        """Per-surface-node weights: soft union of top and bottom spheres.
 
         Parameters
         ----------
         surface_points : jax.Array, shape (n_surface_nodes, 3)
         curve_jax : CurveXYZFourierJAX
-        dofs : dict
-            Empty (no optimisable parameters).
         clamp_radius : float
         sigmoid_eps : float
 
@@ -248,13 +331,32 @@ class CoilSupportTopBottom(CoilSupport):
         top    = gamma[jnp.argmax(gamma[:, 2])]            # (3,) highest point
         bottom = gamma[jnp.argmin(gamma[:, 2])]            # (3,) lowest point
 
-        # Safe norm: jnp.linalg.norm gradient is NaN at zero distance;
-        # adding eps inside sqrt keeps the backward pass finite.
         d_top    = jnp.sum((surface_points - top)**2,    axis=-1)
         d_bottom = jnp.sum((surface_points - bottom)**2, axis=-1)
 
-        # sigmoid(beta*(R-d)): ~1 inside sphere of radius clamp_radius, ~0 outside
         sigmoid_width = sigmoid_eps * clamp_radius
-        w_top    = sigmoid((clamp_radius**2 - d_top)/(sigmoid_width**2))
-        w_bottom = sigmoid((clamp_radius**2 - d_bottom)/(sigmoid_width**2))
-        return w_top+w_bottom   # union of the two spheres
+        w_top    = sigmoid((clamp_radius**2 - d_top)   / (sigmoid_width**2))
+        w_bottom = sigmoid((clamp_radius**2 - d_bottom) / (sigmoid_width**2))
+        return w_top + w_bottom
+
+    def compute_weights(self, coil_idx, surface_pts, curve_jax, dofs):
+        """Winkler weights for base coil ``coil_idx``.
+
+        Parameters
+        ----------
+        coil_idx : int
+            Ignored (same top/bottom logic applied to every coil).
+        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
+        curve_jax : CurveXYZFourierJAX
+        dofs : dict or None
+            Ignored (no optimisable DOFs).
+
+        Returns
+        -------
+        jax.Array, shape ``(n_surface_nodes,)``
+        """
+        return self.support_fn(
+            surface_pts, curve_jax,
+            clamp_radius=self.constants['clamp_radius'],
+            sigmoid_eps=self.constants['sigmoid_eps'],
+        )

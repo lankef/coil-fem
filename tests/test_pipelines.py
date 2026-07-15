@@ -1,4 +1,4 @@
-"""Smoke tests for ElasticPipeline, FixedSupport, and the CoilFEM refactor.
+"""Smoke tests for ElasticPipeline, SupportFixed, and the CoilFEM refactor.
 
 Keeps the suite fast by using tiny meshes (4 phi × 1×1 cross-section).
 """
@@ -15,7 +15,7 @@ jax.config.update("jax_enable_x64", True)
 from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
 from coil_fem.meshing import CoilMesh
 from coil_fem.pipelines import ElasticPipeline, ThermoElasticPipeline
-from coil_fem.coupling import Support, FixedSupport
+from coil_fem.coupling import Support, SupportFixed
 from coil_fem.coil_fem import CoilFEM
 
 
@@ -82,32 +82,53 @@ def test_elastic_pipeline_uniform_material():
 
 
 # ---------------------------------------------------------------------------
-# 2. FixedSupport — always returns zero displacement
+# 2. SupportFixed — always returns zero displacement
 # ---------------------------------------------------------------------------
 
-def test_fixed_support_is_not_coupled():
-    """FixedSupport.is_coupled is False."""
-    assert FixedSupport().is_coupled is False
+def test_support_fixed_is_not_coupled():
+    """SupportFixed.is_coupled is False."""
+    assert SupportFixed().is_coupled is False
 
 
-def test_fixed_support_solve_returns_empty_dict():
-    """FixedSupport.solve returns empty dict (no-op)."""
-    state = FixedSupport().solve({'anything': 1})
+def test_support_fixed_solve_returns_empty_dict():
+    """SupportFixed.solve returns empty dict (no-op)."""
+    state = SupportFixed().solve({'anything': 1})
     assert state == {}
 
 
-def test_fixed_support_displacement_at_zeros():
-    """FixedSupport.displacement_at returns zero array of the correct shape."""
+def test_support_fixed_displacement_at_zeros():
+    """SupportFixed.displacement_at returns zero array of the correct shape."""
     pts = jnp.ones((5, 3))
-    u   = FixedSupport().displacement_at({}, pts)
+    u   = SupportFixed().displacement_at({}, pts)
     assert u.shape == (5, 3)
     assert jnp.all(u == 0.0)
 
 
-def test_fixed_support_coo_raises():
-    """FixedSupport.coo() raises NotImplementedError."""
+def test_support_fixed_coo_raises():
+    """SupportFixed.coo() raises NotImplementedError."""
     with pytest.raises(NotImplementedError):
-        FixedSupport().coo()
+        SupportFixed().coo()
+
+
+def test_support_fixed_compute_weights_uniform():
+    """SupportFixed with no support_fns returns all-ones weights."""
+    support = SupportFixed()
+    pts = jnp.ones((7, 3))
+    w = support.compute_weights(0, pts, None, None)
+    assert w.shape == (7,)
+    assert jnp.all(w == 1.0)
+
+
+def test_support_fixed_compute_weights_custom_fn():
+    """SupportFixed with a custom support_fn calls it correctly."""
+    def half_fn(surf_pts, curve_jax, dofs):
+        return jnp.full(surf_pts.shape[0], 0.5)
+
+    support = SupportFixed(support_fns=half_fn)
+    pts = jnp.ones((6, 3))
+    w = support.compute_weights(0, pts, None, None)
+    assert w.shape == (6,)
+    assert jnp.allclose(w, 0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -122,59 +143,53 @@ def _constant_support_fn(surf_pts, curve_jax, dofs):
 def test_coil_fem_has_pipelines_and_support():
     """CoilFEM.__init__ populates self.pipelines and self.support."""
     curve = _make_circle(N=4, R=1.0)
+    support = SupportFixed(_constant_support_fn)
     fem = CoilFEM(
         base_curves_jax=[curve],
         base_currents_jax=jnp.array([1e4]),
-        base_support_fns=_constant_support_fn,
-        base_support_dofs=None,
         nfp=1,
         stellsym=False,
         mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                       'n_grid_1': 1, 'n_grid_2': 1},
+        support=support,
         problem_options={'winkler_k': 1e9},
         verbose=0,
     )
 
     assert len(fem.pipelines) == 1
-    assert isinstance(fem.support, FixedSupport)
+    assert isinstance(fem.support, SupportFixed)
     # meshes property shim works
     assert len(fem.meshes) == 1
     assert fem.meshes[0] is fem.pipelines[0].mesh
 
 
-def test_coil_fem_explicit_fixed_support():
-    """Passing support=FixedSupport() explicitly is identical to the default."""
+def test_coil_fem_default_support():
+    """CoilFEM with support=None installs a SupportFixed with uniform weights."""
     curve = _make_circle(N=4, R=1.0)
-    kwargs = dict(
+    fem = CoilFEM(
         base_curves_jax=[curve],
         base_currents_jax=jnp.array([1e4]),
-        base_support_fns=_constant_support_fn,
-        base_support_dofs=None,
         nfp=1, stellsym=False,
         mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                       'n_grid_1': 1, 'n_grid_2': 1},
         problem_options={'winkler_k': 1e9},
         verbose=0,
     )
-    fem_default  = CoilFEM(**kwargs)
-    fem_explicit = CoilFEM(**kwargs, support=FixedSupport())
-    # Both hold a FixedSupport
-    assert isinstance(fem_default.support,  FixedSupport)
-    assert isinstance(fem_explicit.support, FixedSupport)
+    assert isinstance(fem.support, SupportFixed)
 
 
 def test_coil_fem_objective_finite():
     """CoilFEM.objective returns a finite max_von_mises after refactor."""
     curve = _make_circle(N=4, R=1.0)
+    support = SupportFixed(_constant_support_fn)
     fem = CoilFEM(
         base_curves_jax=[curve],
         base_currents_jax=jnp.array([1e4]),
-        base_support_fns=_constant_support_fn,
-        base_support_dofs=None,
         nfp=1,
         stellsym=False,
         mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                       'n_grid_1': 1, 'n_grid_2': 1},
+        support=support,
         problem_options={'winkler_k': 1e9},
         verbose=0,
     )
@@ -194,10 +209,6 @@ def test_coil_fem_objective_finite():
 
 def test_thermo_elastic_pipeline_solve_raises():
     """ThermoElasticPipeline.solve raises NotImplementedError (stub)."""
-    pipeline = _make_tiny_pipeline.__wrapped__() if hasattr(
-        _make_tiny_pipeline, '__wrapped__'
-    ) else None
-
     curve = _make_circle(N=4, R=1.0)
     fc    = make_framed_curve(curve, 'rmf')
     mesh  = CoilMesh.from_options(

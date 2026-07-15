@@ -1,13 +1,15 @@
 """Abstract support interface and the built-in fixed (grounded) support.
 
 Defines :class:`Support`, the ABC that all support structure models must
-implement, and :class:`FixedSupport`, the default uncoupled support that
-returns zero displacement at all attachment points.
+implement, and :class:`SupportFixed`, the default uncoupled support whose
+attachment points are held at zero displacement by a Winkler spring field
+whose spatial distribution is governed by a user-supplied weight function.
 """
 
 from __future__ import annotations
 
 import abc
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -24,9 +26,13 @@ class Support(abc.ABC):
 
     Concrete subclasses
     -------------------
-    :class:`FixedSupport`
+    :class:`SupportFixed`
         Grounded Winkler / Robin BC — attachment points are fixed (zero
         displacement).  Default for uncoupled solves.
+    ``BeamNetworkSupport`` *(future)*
+        Beam-network model; solves a small linear beam problem.
+    ``DensityFieldSupport`` *(future)*
+        Density-parameterised FEM support.
     """
 
     @property
@@ -48,7 +54,7 @@ class Support(abc.ABC):
         -------
         dict
             Support state that can be passed back to :meth:`displacement_at`.
-            ``FixedSupport`` returns ``{}``.
+            ``SupportFixed`` returns ``{}``.
         """
 
     @abc.abstractmethod
@@ -68,8 +74,44 @@ class Support(abc.ABC):
             Support displacement at each query point.
         """
 
+    def compute_weights(
+        self,
+        coil_idx: int,
+        surface_pts: jax.Array,
+        curve_jax,
+        dofs,
+    ) -> jax.Array:
+        """Per-surface-node Winkler weights for coil ``coil_idx``.
+
+        Weights are values in ``[0, 1]`` used to scale the Winkler spring
+        stiffness at each surface node.  The default implementation returns
+        a uniform weight of one (fully supported everywhere).  Override in
+        subclasses that parameterise the spatial distribution of support.
+
+        Parameters
+        ----------
+        coil_idx : int
+            Index of the base coil (0-based).
+        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
+            Current positions of the coil surface nodes.
+        curve_jax : CurveXYZFourierJAX
+            Differentiable representation of the coil centreline at the
+            current DOFs.
+        dofs : dict or None
+            Optimisable support parameters for the full coil set (as
+            returned by :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).
+            Subclasses are responsible for slicing out the per-coil entries.
+            ``None`` is equivalent to an empty dict.
+
+        Returns
+        -------
+        jax.Array, shape ``(n_surface_nodes,)``
+            Winkler weight in ``[0, 1]`` for each surface node.
+        """
+        return jnp.ones(surface_pts.shape[0])
+
     def coo(self):
-        """Return the support stiffness matrix in COO (coordinate) format. For 
+        """Return the support stiffness matrix in COO (coordinate) format. For
         monolithic mode.
 
         In the monolithic coupling strategy, the global FEM system is
@@ -115,11 +157,10 @@ class Support(abc.ABC):
         Raises
         ------
         NotImplementedError
-            Raised by default; override in subclasses that support Plan B
-            monolithic assembly (e.g. ``BeamNetworkSupport``,
-            ``DensityFieldSupport``).  ``FixedSupport`` has no DOFs and never
-            contributes a stiffness block, so it intentionally keeps the
-            default behaviour.
+            Raised by default; override in subclasses that support monolithic
+            assembly (e.g. ``BeamNetworkSupport``, ``DensityFieldSupport``).
+            ``SupportFixed`` has no DOFs and never contributes a stiffness
+            block, so it intentionally keeps the default behaviour.
         """
         raise NotImplementedError(
             f"{type(self).__name__}.coo() is not implemented. "
@@ -127,18 +168,44 @@ class Support(abc.ABC):
         )
 
 
-class FixedSupport(Support):
-    """Grounded (fixed) support — attachment points have zero displacement.
+class SupportFixed(Support):
+    """Grounded (fixed) support with a configurable Winkler weight function.
+
+    Attachment points are spring-connected to a fixed ground; the effective
+    support displacement seen by the coupling driver is always zero.  The
+    spatial distribution of the Winkler spring stiffness is controlled by
+    the optional ``support_fns`` argument.
 
     This is the default support used when no coupling to an external
-    structural model is needed.  It corresponds to the existing Winkler /
-    Robin BC already built into :class:`~coil_fem.problem.LinearElasticity3D`:
-    the coil's exterior nodes are spring-connected to a fixed ground, so the
-    effective support displacement seen by the coupling driver is zero.
+    structural model is needed.  It corresponds to the Winkler / Robin BC
+    built into :class:`~coil_fem.problem.LinearElasticity3D`.
 
-    ``FixedSupport`` stores no state; :meth:`solve` is a no-op and
-    :meth:`displacement_at` always returns a zero array.
+    Parameters
+    ----------
+    support_fns : callable or list[callable] or None
+        Function(s) returning per-surface-node weights in ``[0, 1]``::
+
+            support_fn(
+                surface_pts: jax.Array,   # (n_surface_nodes, 3)
+                curve_jax: CurveXYZFourierJAX,
+                dofs: dict | None,
+            ) -> jax.Array                # (n_surface_nodes,)
+
+        A single callable is broadcast to every coil.  A list provides one
+        callable per base coil (heterogeneous support geometry).  ``None``
+        (default) returns uniform unit weights for all coils.
     """
+
+    def __init__(
+        self,
+        support_fns: Callable | list[Callable] | None = None,
+    ):
+        if callable(support_fns):
+            self._support_fns: Callable | list[Callable] | None = support_fns
+        elif isinstance(support_fns, (list, tuple)):
+            self._support_fns = list(support_fns)
+        else:
+            self._support_fns = None
 
     @property
     def is_coupled(self) -> bool:
@@ -165,3 +232,34 @@ class FixedSupport(Support):
             Zero array.
         """
         return jnp.zeros((points.shape[0], 3), dtype=points.dtype)
+
+    def compute_weights(
+        self,
+        coil_idx: int,
+        surface_pts: jax.Array,
+        curve_jax,
+        dofs,
+    ) -> jax.Array:
+        """Per-surface-node Winkler weights for coil ``coil_idx``.
+
+        Parameters
+        ----------
+        coil_idx : int
+            Index of the base coil (0-based).
+        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
+        curve_jax : CurveXYZFourierJAX
+        dofs : dict or None
+            Full merged support-dofs dict for the coil set; subclasses
+            slice out the per-coil portion as needed.
+
+        Returns
+        -------
+        jax.Array, shape ``(n_surface_nodes,)``
+        """
+        if self._support_fns is None:
+            return jnp.ones(surface_pts.shape[0])
+        if isinstance(self._support_fns, list):
+            fn = self._support_fns[coil_idx]
+        else:
+            fn = self._support_fns
+        return fn(surface_pts, curve_jax, dofs)

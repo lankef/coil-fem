@@ -10,7 +10,6 @@ solve per base coil regardless of metric count.
 from __future__ import annotations
 
 import logging
-from typing import Callable
 
 import numpy as np
 import jax
@@ -32,7 +31,7 @@ from .problem import (
     recompute_fe_geometry,
 )
 from .pipelines import ElasticPipeline, ThermoElasticPipeline
-from .coupling import Support, FixedSupport
+from .coupling import Support, SupportFixed
 from .metrics import (
     max_von_mises_hard,
     max_von_mises_lse,
@@ -105,77 +104,6 @@ def _broadcast_mesh_opts(mesh_options, n_base: int) -> list[dict]:
     return opts
 
 
-def _broadcast_support_fns(base_support_fns, n_base: int) -> list[Callable]:
-    """Return a list of ``n_base`` support callables.
-
-    Parameters
-    ----------
-    base_support_fns : callable or list[callable]
-        A single ``support_fn`` (broadcast to every coil) or a list of length
-        ``n_base`` with one callable per base coil.  Each callable has the
-        signature ``support_fn(surface_points, curve_jax, dofs) -> weights``.
-
-    Returns
-    -------
-    list[Callable] of length ``n_base``.
-    """
-    if callable(base_support_fns):
-        return [base_support_fns] * n_base
-    if isinstance(base_support_fns, (list, tuple)):
-        fns = list(base_support_fns)
-        if len(fns) != n_base:
-            raise ValueError(
-                f"base_support_fns length ({len(fns)}) must equal "
-                f"n_base ({n_base})."
-            )
-        for i, fn in enumerate(fns):
-            if not callable(fn):
-                raise TypeError(
-                    f"base_support_fns[{i}] must be callable, got {type(fn)}."
-                )
-        return fns
-    raise TypeError(
-        "base_support_fns must be a callable or a list of callables, "
-        f"got {type(base_support_fns)}."
-    )
-
-
-def _validate_support_dofs(base_support_dofs, n_base: int) -> list[dict | None]:
-    """Validate the shape of ``base_support_dofs``.
-
-    Parameters
-    ----------
-    base_support_dofs : None or list[dict | None]
-        * ``None`` — no per-coil support parameters; every coil's
-          ``support_fn`` will be called with ``dofs=None``.
-        * List of length ``n_base`` — element ``i`` is passed as ``dofs``
-          to ``support_fn`` for coil ``i``.  Elements must be ``dict`` or
-          ``None``.
-
-    Returns
-    -------
-    list[dict | None] of length ``n_base``, or an empty list when
-    ``base_support_dofs is None``.
-    """
-    if base_support_dofs is None:
-        return [None] * n_base
-    if not isinstance(base_support_dofs, (list, tuple)):
-        raise TypeError(
-            f"base_support_dofs must be None or a list, got {type(base_support_dofs)}."
-        )
-    if len(base_support_dofs) != n_base:
-        raise ValueError(
-            f"base_support_dofs length ({len(base_support_dofs)}) must equal "
-            f"n_base ({n_base})."
-        )
-    for i, sd in enumerate(base_support_dofs):
-        if sd is not None and not isinstance(sd, dict):
-            raise TypeError(
-                f"base_support_dofs[{i}] must be a dict or None, got {type(sd)}."
-            )
-    return list(base_support_dofs)
-
-
 _VALID_SOLVERS = {'umfpack', 'petsc', 'jax', 'amgx', 'cudss'}
 
 
@@ -230,9 +158,9 @@ class CoilFEM:
 
     Builds the full pipeline from base-coil geometry (DOFs + currents + support
     parameters) to per-metric structural objectives.  :meth:`objective` is
-    differentiable via ``jax.grad`` w.r.t. all three argument groups. Uses Winkler's 
-    BC with spring constants weighted by a callable ``support_fn`` that parameterizes
-    the location of support structures on each coil.
+    differentiable via ``jax.grad`` w.r.t. all three argument groups.  Winkler
+    spring BC weights are computed by the :class:`~coil_fem.coupling.SupportFixed`
+    object passed as ``support``.
 
     Parameters
     ----------
@@ -240,27 +168,6 @@ class CoilFEM:
         Base coils before symmetry expansion.
     base_currents_jax : jax.Array, shape ``(n_base,)``
         Currents for the base coils [A].
-    base_support_fns : callable or list[callable]
-        Function(s) describing each coil's structural support via Winkler
-        spring weights.  Either a single callable (broadcast to every base
-        coil) or a list of length ``n_base`` with one callable per coil.
-        Signature::
-
-            support_fn(
-                surface_points: jax.Array,   # (n_surface_nodes, 3)
-                curve_jax: CurveXYZFourierJAX,
-                dofs: dict | None,
-            ) -> jax.Array                   # (n_surface_nodes,) in [0, 1]
-
-        ``surface_points`` are the current surface-node positions (traced
-        through coil DOFs).  ``dofs`` are the optimisable support parameters
-        from ``base_support_dofs[i]`` for coil ``i``.  The returned weights are
-        absorbed into the Winkler BC surface integral.
-    base_support_dofs : list[dict | None] or None
-        Per-coil initial support parameters, length ``n_base``.  Each element
-        is passed as ``dofs`` to the matching ``support_fn``.  ``None`` (or a
-        list of ``None`` values) means each ``support_fn`` is called with
-        ``dofs=None``.
     nfp : int
         Number of field periods.
     stellsym : bool
@@ -280,11 +187,15 @@ class CoilFEM:
 
         If ``'n_grid_1'`` and ``'n_grid_2'`` are not provided, the mesh resolution
         is automatically computed based on the aspect ratio and the total length
-        of the initial coil. Notably, this will only be done *once* during the 
-        initialization of the CoilFEM object. After that, the mesh resolution
-        will be fixed for the rest of the optimization run.
+        of the initial coil.  This is done once at construction; the topology is
+        then fixed for the rest of the optimisation run.
 
         A single dict is broadcast to all base coils.
+    support : SupportFixed or None
+        Support model providing per-surface-node Winkler weights via
+        :meth:`~coil_fem.coupling.Support.compute_weights`.  ``None`` (default)
+        installs a :class:`~coil_fem.coupling.SupportFixed` with uniform unit
+        weights (fully supported everywhere).
     gravity_options : dict or None
         If provided, enables a uniform gravitational body force ``ρ·g``.  May
         contain ``'g_vec'`` (default ``(0, 0, -9.80665)``).  The mass density
@@ -294,13 +205,10 @@ class CoilFEM:
 
         * ``'E'`` : float [Pa] — Young's modulus (default 200 GPa).
         * ``'nu'`` : float — Poisson ratio (default 0.3).
-        * ``'density'`` : float [kg/m³] — mass density (default 7800).  Used
-          both for inertial/gravity loads (when ``gravity_options`` is set)
-          and reported diagnostics.
+        * ``'density'`` : float [kg/m³] — mass density (default 7800).
         * ``'itc'`` : float — isotropic integral thermal contraction ``ΔL/L``
-          on cooldown (positive, dimensionless).  When given, the eigenstrain
-          ``ε_th = −itc · I`` is pre-computed once and baked into the
-          constitutive law.  ``itc`` is not a differentiable DOF.
+          on cooldown (positive, dimensionless).  Applied as the eigenstrain
+          ``ε_th = −itc · I``.  Not a differentiable DOF.
 
     problem_options : dict or None
         Numerical solver and Winkler BC parameters.  Keys:
@@ -310,26 +218,12 @@ class CoilFEM:
         * ``'adjoint_solver'`` : ``'umfpack'`` (default).
 
     verbose : int
-        Logging verbosity for JAX-FEM output (construction and solves):
-
-        * ``0`` (default) — no logging (suppresses all JAX-FEM solver output).
-        * ``1`` — INFO messages only (``[INFO]`` lines).
-        * ``2`` — DEBUG messages too (full solver verbosity).
+        Logging verbosity (0 = silent, 1 = INFO, 2 = DEBUG).
 
     Notes
     -----
-    **Self-field.** Self-field (B_self) is always computed for every coil.
-    Rectangular cross-sections use the full Landreman-Hurwitz-Antonsen (2025)
-    formula evaluated at every FEM quadrature point via
-    :func:`~coil_fem.magnetic.B_self_quadrature`.  Disk cross-sections
-    raise ``NotImplementedError`` (a closed-form circular analogue is known
-    but not yet implemented).
-
     ``__init__`` builds ``LinearElasticity3D`` problems from the **initial**
-    curve geometry.  Mesh topology is fixed at construction.  Subsequent calls
-    pass updated ``points``, ``body_force``, and ``support_weights`` through
-    ``ad_wrapper.set_params``, so the adjoint sees geometry, load, and BC
-    changes without rebuilding the problem.
+    curve geometry.  Mesh topology is fixed at construction.
 
     ``CoilFEM`` is intentionally **not** a registered JAX pytree; it is a
     stateful container captured by closure.  Only the DOF arrays passed to
@@ -338,23 +232,21 @@ class CoilFEM:
 
     def __init__(
         self,
-        support: Support,
         base_curves_jax: list[CurveXYZFourierJAX],
         base_currents_jax: jax.Array,
-        base_support_fns: Callable | list[Callable],
-        base_support_dofs: list[dict | None] | None,
         nfp: int,
         stellsym: bool,
         mesh_options: dict | list[dict],
+        support: Support | None = None,
         gravity_options: dict | None = None,
         material_options: dict | None = None,
         problem_options: dict | None = None,
-        physics_options: dict | None = None,
         verbose: int = 0,
+        physics_options: dict | None = None,
     ):
         self.verbose = verbose
         self._set_jaxfem_log_level()
-        self.support = support if support is not None else FixedSupport()
+        self.support = support if support is not None else SupportFixed()
 
         # ── 1. Validate and normalise inputs ─────────────────────────────────
         self.base_curves_jax = list(base_curves_jax)
@@ -365,8 +257,6 @@ class CoilFEM:
 
         n_base = len(self.base_curves_jax)
         self.mesh_opts = _broadcast_mesh_opts(mesh_options, n_base)
-        self.base_support_fns = _broadcast_support_fns(base_support_fns, n_base)
-        self._base_support_dofs = _validate_support_dofs(base_support_dofs, n_base)
         self.problem_options = _broadcast_problem_options(problem_options)
         self.n_total = n_coils_total(n_base, self.nfp, self.stellsym)
 
@@ -623,7 +513,7 @@ class CoilFEM:
         self,
         base_curves_dofs: list[jax.Array] | None = None,
         base_currents_dofs: jax.Array | None = None,
-        base_support_dofs: list[dict | None] | None = None,
+        base_support_dofs: dict | None = None,
     ) -> dict:
         """Forward FEM for all base coils; returns full solution dict.
 
@@ -639,9 +529,10 @@ class CoilFEM:
             ``self.base_curves_jax``.
         base_currents_dofs : jax.Array or None
             Currents per base coil.  ``None`` uses ``self.base_currents_jax``.
-        base_support_dofs : list[dict | None] or None
-            Per-coil support parameters for the support functions.
-            ``None`` passes ``dofs=None`` to each coil.
+        base_support_dofs : dict or None
+            Merged support-dofs dict for the whole coil set (as returned by
+            :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).  ``None``
+            lets the support object use its own default parameters.
 
         Returns
         -------
@@ -649,32 +540,25 @@ class CoilFEM:
 
         * ``'solutions'``     -- list of raw ``ad_wrapper`` outputs, one per base
           coil.  Each element is a ``list[jnp.ndarray]`` in JAX-FEM's multi-physics
-          convention; ``solutions[i][0]`` has shape ``(n_nodes, 3)``.  Pass this
-          directly to post-processing helpers (e.g.
-          ``LinearElasticity3D.von_mises_stress``) that expect the full solution
-          list.
+          convention; ``solutions[i][0]`` has shape ``(n_nodes, 3)``.
         * ``'displacements'`` -- list of displacement arrays, one per base coil,
-          shape ``(n_nodes, 3)``.  Equivalent to ``solutions[i][0]`` for each ``i``
-          but exposed as a plain array for convenient post-processing.  Shares the
-          same device buffer as the corresponding ``solutions`` entry (no copy).
-        * ``'von_mises'``     -- list of ``(n_cells, n_quads)`` von Mises arrays
-          from the combined (thermal + Lorentz + gravity) solution.
+          shape ``(n_nodes, 3)``.
+        * ``'von_mises'``     -- list of ``(n_cells, n_quads)`` von Mises arrays.
         * ``'mesh_points'``   -- list of updated ``(n_nodes, 3)`` node arrays.
         * ``'support_weights'`` -- list of ``(n_surface_nodes,)`` Winkler weight
           arrays per coil.
         * ``'f_vol'``         -- list of ``(n_cells, n_quads, 3)`` body force
           density arrays [N/m^3] per coil.
         * ``'B_self'``        -- list of ``(n_cells, n_quads, 3)`` self-field
-          arrays [T] at FEM quadrature points per coil.
-        * ``'B_ext'``         -- list of ``(n_cells, n_quads, 3)`` mutual
-          (external) field arrays [T] at FEM quadrature points per coil.
+          arrays [T] per coil.
+        * ``'B_ext'``         -- list of ``(n_cells, n_quads, 3)`` mutual field
+          arrays [T] per coil.
         """
         n_base = len(self.base_curves_jax)
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
         if base_currents_dofs is None:
             base_currents_dofs = self.base_currents_jax
-        sd = _validate_support_dofs(base_support_dofs, n_base)
 
         all_gammas, all_gammadashs, all_currents = self._expand_geometry(
             base_curves_dofs, base_currents_dofs
@@ -689,7 +573,7 @@ class CoilFEM:
                 all_gammas, all_gammadashs, all_currents,
             )
             weights_i = self._compute_support_weights(
-                i, pts_i, base_curves_dofs[i], sd[i]
+                i, pts_i, base_curves_dofs[i], base_support_dofs
             )
             sol = self._forward_solve(i, pts_i, bf_i, weights_i)
             vm  = self.pipelines[i].problem.von_mises_stress(sol)
@@ -717,7 +601,7 @@ class CoilFEM:
         self,
         base_curves_dofs: list[jax.Array] | None = None,
         base_currents_dofs: jax.Array | None = None,
-        base_support_dofs: list[dict | None] | None = None,
+        base_support_dofs: dict | None = None,
     ) -> dict:
         """Total and thermal strain tensors per base coil.
 
@@ -739,7 +623,7 @@ class CoilFEM:
             ``self.base_curves_jax``.
         base_currents_dofs : jax.Array or None
             Currents per base coil.  ``None`` uses ``self.base_currents_jax``.
-        base_support_dofs : list[dict | None] or None
+        base_support_dofs : dict or None
             Per-coil support parameters for the support functions.
             ``None`` passes ``dofs=None`` to each coil.
 
@@ -814,7 +698,7 @@ class CoilFEM:
         self,
         base_curves_dofs: list[jax.Array],
         base_currents_dofs: jax.Array,
-        base_support_dofs: list[dict | None] | None = None,
+        base_support_dofs: dict | None = None,
         *,
         metrics: tuple[str, ...] = ('max_von_mises',),
     ) -> dict[str, jax.Array]:
@@ -833,34 +717,29 @@ class CoilFEM:
         Parameters
         ----------
         base_curves_dofs : list[jax.Array]
-            DOF vectors, length ``n_base``.  Each element shape
-            ``(n_dofs_i,)``.
+            DOF vectors, length ``n_base``.
         base_currents_dofs : jax.Array, shape ``(n_base,)``
             Coil currents [A].
-        base_support_dofs : list[dict | None] or None
-            Per-coil support parameters passed to the support functions as
-            ``dofs``.  ``None`` (default) passes ``dofs=None`` to each coil.
+        base_support_dofs : dict or None
+            Merged support-dofs dict for the whole coil set (as returned by
+            :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).  ``None``
+            lets the support object use its own default parameters.
         metrics : tuple[str, ...]
-            Metric names (static — not traced by JAX).  Available options:
-            ``'max_von_mises'``, ``'max_von_mises_lse'``,
-            ``'mean_von_mises'``, ``'l2_von_mises'``, ``'strain_energy'``.
+            Metric names (static).  Available: ``'max_von_mises'``,
+            ``'max_von_mises_lse'``, ``'mean_von_mises'``,
+            ``'l2_von_mises'``, ``'strain_energy'``.
 
         Returns
         -------
         dict[str, jax.Array]
-            ``{metric_name: scalar}`` — one entry per requested metric,
-            reduced over all base coils.  Max-type metrics
-            (``'max_von_mises'``, ``'max_von_mises_lse'``) are reduced with
-            ``max`` (worst-coil peak); all other metrics are summed.  Callers
-            may weight and combine entries freely (supports augmented
-            Lagrangian, Pareto, etc.).
+            ``{metric_name: scalar}`` reduced over all base coils.
 
         Examples
         --------
         Scalar objective for L-BFGS-B::
 
-            def J(dofs, currents, support):
-                objs = fem.objective(dofs, currents, support,
+            def J(dofs, currents, support_dofs):
+                objs = fem.objective(dofs, currents, support_dofs,
                                      metrics=('max_von_mises_lse',))
                 return objs['max_von_mises_lse']
 
@@ -885,7 +764,6 @@ class CoilFEM:
                 f"base_currents_dofs.shape = {base_currents_dofs.shape}, "
                 f"expected ({n_base},)."
             )
-        sd = _validate_support_dofs(base_support_dofs, n_base)
 
         metric_fns = [_build_metric_fn(m) for m in metrics]
 
@@ -909,7 +787,7 @@ class CoilFEM:
                 all_gammas, all_gammadashs, all_currents,
             )
             weights_i = self._compute_support_weights(
-                i, pts_i, base_curves_dofs[i], sd[i]
+                i, pts_i, base_curves_dofs[i], base_support_dofs
             )
             sol    = self._forward_solve(i, pts_i, bf_i, weights_i)
             prob_i = self.pipelines[i].problem
@@ -945,7 +823,7 @@ class CoilFEM:
         coil_idx: int,
         pts_i: jax.Array,
         dofs_i: jax.Array,
-        support_dofs_i: dict | None,
+        support_dofs: dict | None,
     ) -> jax.Array:
         """Compute per-surface-node Winkler weights for coil ``coil_idx``.
 
@@ -953,13 +831,17 @@ class CoilFEM:
         ----------
         pts_i : (n_nodes, 3) traced
         dofs_i : (n_dofs,) traced
-        support_dofs_i : dict or None
+        support_dofs : dict or None
+            Full merged support-dofs dict for the coil set (as returned by
+            :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).  Passed
+            directly to :meth:`~coil_fem.coupling.Support.compute_weights`;
+            the support object is responsible for slicing out per-coil data.
         """
         surf_idx  = self.pipelines[coil_idx].surface_node_indices  # (n_surf_nodes,) static
         surf_pts  = pts_i[surf_idx]                               # (n_surf_nodes, 3) traced
         base      = self.base_curves_jax[coil_idx]
         coil_curr = CurveXYZFourierJAX(base.quadpoints, dofs_i, base.order)
-        return self.base_support_fns[coil_idx](surf_pts, coil_curr, support_dofs_i)
+        return self.support.compute_weights(coil_idx, surf_pts, coil_curr, support_dofs)
 
     # ============================================================================
     # Properties
@@ -1032,7 +914,7 @@ class CoilFEM:
         *,
         prefix: str = "coil",
         base_curves_dofs: list[jax.Array] | None = None,
-        base_support_dofs: list[dict | None] | None = None,
+        base_support_dofs: dict | None = None,
     ) -> list[str]:
         """Export Winkler support weights and full mesh as VTU files.
 
@@ -1057,7 +939,7 @@ class CoilFEM:
         base_curves_dofs : list[jax.Array] or None
             DOF vectors used to evaluate current surface positions.  ``None``
             uses the initial DOFs from ``self.base_curves_jax``.
-        base_support_dofs : list[dict | None] or None
+        base_support_dofs : dict or None
             Per-coil support parameters for the support functions.
 
         Returns
@@ -1071,9 +953,6 @@ class CoilFEM:
         n_base = len(self.base_curves_jax)
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
-        if base_support_dofs is None:
-            base_support_dofs = self._base_support_dofs
-        sd = _validate_support_dofs(base_support_dofs, n_base)
 
         winkler_k = float(self.problem_options['winkler_k'])
 
@@ -1087,7 +966,7 @@ class CoilFEM:
 
             surf_idx = onp.asarray(self.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
-                self._compute_support_weights(i, pts_i, base_curves_dofs[i], sd[i]),
+                self._compute_support_weights(i, pts_i, base_curves_dofs[i], base_support_dofs),
                 dtype=onp.float64,
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
@@ -1109,7 +988,7 @@ class CoilFEM:
         self,
         *,
         base_curves_dofs: list[jax.Array] | None = None,
-        base_support_dofs: list[dict | None] | None = None,
+        base_support_dofs: dict | None = None,
         ax=None,
         s: float = 0.1,
         cmap: str = "viridis",
@@ -1124,7 +1003,7 @@ class CoilFEM:
         base_curves_dofs : list[jax.Array] or None
             DOF vectors used to evaluate current surface positions.  ``None``
             uses the initial DOFs from ``self.base_curves_jax``.
-        base_support_dofs : list[dict | None] or None
+        base_support_dofs : dict or None
             Per-coil support parameters for the support functions.  ``None``
             (default) uses the support parameters supplied at construction.
         ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None
@@ -1160,9 +1039,6 @@ class CoilFEM:
         n_base = len(self.base_curves_jax)
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
-        if base_support_dofs is None:
-            base_support_dofs = self._base_support_dofs
-        sd = _validate_support_dofs(base_support_dofs, n_base)
 
         if ax is None:
             _, ax = plt.subplots(subplot_kw={"projection": "3d"})
@@ -1176,7 +1052,7 @@ class CoilFEM:
 
             surf_idx = onp.asarray(self.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
-                self._compute_support_weights(i, pts_i, base_curves_dofs[i], sd[i]),
+                self._compute_support_weights(i, pts_i, base_curves_dofs[i], base_support_dofs),
                 dtype=onp.float64,
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
@@ -1220,7 +1096,7 @@ class CoilFEM:
         *,
         base_curves_dofs: list[jax.Array] | None = None,
         base_currents_dofs: jax.Array | None = None,
-        base_support_dofs: list[dict | None] | None = None,
+        base_support_dofs: dict | None = None,
         ax=None,
         cmap: str = "viridis",
         support_color="k",
@@ -1243,7 +1119,7 @@ class CoilFEM:
             ``self.base_curves_jax``.
         base_currents_dofs : jax.Array or None
             Currents per base coil.  ``None`` uses ``self.base_currents_jax``.
-        base_support_dofs : list[dict | None] or None
+        base_support_dofs : dict or None
             Per-coil support parameters for the support functions.
         ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None
             Existing 3-D axes to draw on.  ``None`` (default) creates a new
@@ -1362,7 +1238,7 @@ class CoilFEM:
         prefix: str = "coil",
         base_curves_dofs: list[jax.Array] | None = None,
         base_currents_dofs: jax.Array | None = None,
-        base_support_dofs: list[dict | None] | None = None,
+        base_support_dofs: dict | None = None,
     ) -> list[str]:
         """Run the forward FEM solve and export results for each coil as a VTU file.
 
@@ -1395,7 +1271,7 @@ class CoilFEM:
             ``self.base_curves_jax``.
         base_currents_dofs : jax.Array or None
             Currents per base coil.  ``None`` uses ``self.base_currents_jax``.
-        base_support_dofs : list[dict | None] or None
+        base_support_dofs : dict or None
             Per-coil support parameters for the support functions.
 
         Returns
@@ -1409,10 +1285,6 @@ class CoilFEM:
 
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
-        if base_support_dofs is None:
-            base_support_dofs = self._base_support_dofs
-
-        sd = _validate_support_dofs(base_support_dofs, len(self.base_curves_jax))
 
         result = self.run(
             base_curves_dofs=base_curves_dofs,
@@ -1458,7 +1330,7 @@ class CoilFEM:
             )
             weights_surf = onp.asarray(
                 self._compute_support_weights(
-                    i, pts_i, base_curves_dofs[i], sd[i]
+                    i, pts_i, base_curves_dofs[i], base_support_dofs
                 ),
                 dtype=onp.float64,
             )
