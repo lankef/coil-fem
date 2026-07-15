@@ -1,11 +1,11 @@
 """Simsopt integration."""
 
 from .objectives import CoilFEMObjective
-from .optimizables import CoilSupport, CoilSupportDiscrete, CoilSupportTopBottom
+from .optimizables import CoilSupport, CoilSupportFixed, CoilSupportTopBottom
 
 __all__ = [
     "CoilFEMObjective",
     "CoilSupport",
-    "CoilSupportDiscrete",
+    "CoilSupportFixed",
     "CoilSupportTopBottom",
 ]

@@ -3,8 +3,9 @@
 Connects coil geometry DOFs to the structural FEM pipeline via
 :class:`CoilFEMObjective`, exposing :meth:`~CoilFEMObjective.J` and
 :meth:`~CoilFEMObjective.dJ` for use in simsopt optimisation loops.
-Magnetic field / equilibrium data stay outside the optimisable graph as
-numpy constants.
+A single :class:`~coil_fem.simsopt.CoilSupport` object is the one entry
+point: it holds the base coils (curves + currents), ``nfp``, ``stellsym``,
+and any optimisable support DOFs (e.g. clamp locations).
 """
 
 from __future__ import annotations
@@ -33,88 +34,63 @@ except ImportError:  # pragma: no cover
 class CoilFEMObjective(Optimizable):
     """Simsopt ``Optimizable`` wrapping :class:`~coil_fem.CoilFEM`.
 
-    Computes a weighted sum of FEM structural metrics over base coils and
-    exposes :meth:`J` / :meth:`dJ` for use in simsopt optimisation loops.
+    Computes a weighted sum of FEM structural metrics and exposes :meth:`J`
+    / :meth:`dJ` for use in simsopt optimisation loops.  All coil and
+    support data come from a single ``coil_support`` object.
 
     Parameters
     ----------
-    base_coils : list
-        Simsopt ``Coil`` objects (each exposing ``.curve`` and ``.current``).
-        These are the *base* coils — before symmetry expansion.
+    coil_support : CoilSupport
+        Holds the base coils (curves + currents), ``nfp``, ``stellsym``, and
+        any optimisable support DOFs.  It is the only ``depends_on`` entry
+        registered with simsopt; curves and currents are reached through it.
     metrics : sequence of str
         Names of FEM metrics to include.  Available: ``'max_von_mises'``,
         ``'max_von_mises_lse'``, ``'mean_von_mises'``, ``'l2_von_mises'``,
         ``'strain_energy'``.
     metric_weights : sequence of float
-        Weight applied to each metric entry.  Must be the same length as
+        Weight applied to each metric.  Must have the same length as
         ``metrics``.
-    nfp : int
-        Number of field periods.
-    stellsym : bool
-        Whether to apply stellarator symmetry during the symmetry expansion.
     mesh_options : dict or list[dict]
-        Mesh construction options forwarded to
-        :class:`~coil_fem.CoilFEM`.  See that class for details.
+        Mesh construction options forwarded to :class:`~coil_fem.CoilFEM`.
     material_options : dict or None
-        Material properties forwarded to :class:`~coil_fem.CoilFEM`:
-        ``'E'`` [Pa], ``'nu'``, ``'density'`` [kg/m³], and the optional thermal
-        ``'itc'`` (positive integral thermal contraction ``ΔL/L`` applied
-        as the eigenstrain ``ε_th = −itc · I``).
-    base_supports : list[CoilSupport]
-        Per-coil support models, same length as ``base_curves`` /
-        ``base_currents`` (a single :class:`~coil_fem.simsopt.CoilSupport`
-        is broadcast to every coil).  Each support contributes its own DOFs
-        (e.g. clamp locations) to the optimisation graph, so support
-        parameters are co-optimised with coil geometry and currents.
+        Material properties (``'E'``, ``'nu'``, ``'density'``, ``'itc'``).
     problem_options : dict or None
-        Options forwarded to the JAX-FEM problem constructor inside
-        :class:`~coil_fem.CoilFEM`.
+        Solver options forwarded to :class:`~coil_fem.CoilFEM`.
     gravity_options : dict or None
-        Gravity body-force options forwarded to
-        :class:`~coil_fem.CoilFEM`.  When ``None`` (default) no
-        gravity load is applied.  When provided, may contain ``'g_vec'``
-        (default ``(0, 0, -9.80665)``); the mass density is always taken
-        from ``material_options['density']``.
+        Gravity body-force options forwarded to :class:`~coil_fem.CoilFEM`.
     verbose : int
-        JAX-FEM logging verbosity forwarded to :class:`~coil_fem.CoilFEM`,
-        controlling output during construction, forward solves, and gradient
-        evaluations:
-
-        * ``0`` (default) — no logging (suppresses all JAX-FEM output).
-        * ``1`` — INFO messages only (``[INFO]`` lines).
-        * ``2`` — DEBUG messages too (full solver verbosity).
+        JAX-FEM logging verbosity (0 = silent, 1 = INFO, 2 = DEBUG).
 
     Examples
     --------
     Drop-in addition to an existing simsopt optimisation loop::
 
-        Jstress = CoilFEMObjective(
+        coil_support = CoilSupportFixed(
             base_coils,
-            metrics=['max_von_mises_lse'],
-            metric_weights=[1.0],
             nfp=plasma_surface.nfp,
             stellsym=plasma_surface.stellsym,
+            clamp_radius=0.05,
+        )
+        Jstress = CoilFEMObjective(
+            coil_support,
+            metrics=['max_von_mises_lse'],
+            metric_weights=[1.0],
             mesh_options={'shape': 'rect', 'w1': 0.02, 'w2': 0.02},
+            problem_options={'winkler_k': 1e9},
         )
         JTotal = JF + STRESS_WEIGHT * Jstress
-        dofs = JTotal.x          # deduplicated; shared curves appear once
 
         def fun(dofs):
             JTotal.x = dofs
             return JTotal.J(), JTotal.dJ()
-
-        res = minimize(fun, dofs, jac=True, method='L-BFGS-B', ...)
     """
 
     def __init__(
         self,
-        base_curves:list,
-        base_currents: list,
-        base_supports,
+        coil_support,
         metrics: Sequence[str],
         metric_weights: Sequence[float],
-        nfp: int,
-        stellsym: bool,
         mesh_options,
         material_options=None,
         problem_options=None,
@@ -126,7 +102,6 @@ class CoilFEMObjective(Optimizable):
 
         from ..geo import CurveXYZFourierJAX
         from ..coil_fem import CoilFEM
-        from .support import CoilSupport
 
         if isinstance(metrics, str):
             metrics = [metrics]
@@ -139,17 +114,9 @@ class CoilFEMObjective(Optimizable):
                 f"len(metric_weights)={len(metric_weights)}."
             )
 
-        # ============================================================================
-        # Extract simsopt curve / current objects from the supplied coils
-        # ============================================================================
-        assert len(base_curves) == len(base_currents)
-        self._base_curves = base_curves
-        self._base_currents = base_currents
+        self._coil_support = coil_support
 
-        # Store scalar/dict constructor args as instance attributes so that
-        # GSONable.as_dict can introspect them for JSON serialisation.
-        self._nfp              = nfp
-        self._stellsym         = stellsym
+        # Store constructor args for serialisation introspection.
         self._mesh_options     = mesh_options
         self._material_options = material_options
         self._problem_options  = problem_options
@@ -157,38 +124,25 @@ class CoilFEMObjective(Optimizable):
         self._verbose          = verbose
 
         # ============================================================================
-        # Per-coil support models (broadcast a single one if given)
-        # ============================================================================
-        if isinstance(base_supports, CoilSupport):
-            base_supports = [base_supports] * len(base_curves)
-        if len(base_supports) != len(base_curves):
-            raise ValueError(
-                f"len(base_supports)={len(base_supports)} != "
-                f"len(base_curves)={len(base_curves)}."
-            )
-        self._base_supports = list(base_supports)
-
-        # ============================================================================
-        # Convert to JAX objects for CoilFEM construction
+        # Build JAX coil objects from coil_support
         # ============================================================================
         base_curves_jax = [
-            CurveXYZFourierJAX.from_simsopt(c) for c in self._base_curves
+            CurveXYZFourierJAX.from_simsopt(c) for c in coil_support.base_curves
         ]
         base_currents_jax = jnp.array(
-            [c.get_value() for c in self._base_currents]
+            [c.get_value() for c in coil_support.base_currents]
         )
 
         # ============================================================================
-        # Build the internal CoilFEM object (mesh topology fixed here)
+        # Build CoilFEM (mesh topology fixed here)
         # ============================================================================
         self.fem = CoilFEM(
             base_curves_jax,
             base_currents_jax,
-            [s.support_callable() for s in self._base_supports],
-            [s.support_dofs for s in self._base_supports],
-            nfp,
-            stellsym,
+            coil_support.nfp,
+            coil_support.stellsym,
             mesh_options,
+            support=coil_support,
             gravity_options=gravity_options,
             material_options=material_options,
             problem_options=problem_options,
@@ -198,28 +152,15 @@ class CoilFEMObjective(Optimizable):
         self._metrics = tuple(metrics)
         self._metric_weights = list(metric_weights)
 
-        # Caches: invalidated via recompute_bell() whenever DOFs change.
-        # J and dJ are cached separately because the gradient (dJ) is far more
-        # expensive than the forward value (J); calling J() must not trigger an
-        # adjoint solve.
+        # Caches invalidated via recompute_bell() when any DOFs change.
         self._needs_J: bool = True
         self._needs_dJ: bool = True
         self._J_cache: float | None = None
-        self._grad_curves: list | None = None    # list[np.ndarray], one per base coil
-        self._grad_currents: np.ndarray | None = None  # shape (n_base,)
-        self._grad_supports: list | None = None  # list[dict], one per base coil
+        self._grad_curves: list | None = None
+        self._grad_currents: np.ndarray | None = None
+        self._grad_support: dict | None = None
 
-        # Register curve, current, and support Optimizables as parents so that
-        # simsopt propagates DOF changes and de-duplicates x when combined with
-        # other objectives (e.g. JF) that share the same parent objects.
-        Optimizable.__init__(
-            self,
-            depends_on=(
-                self._base_curves
-                + self._base_currents
-                + self._base_supports
-            ),
-        )
+        Optimizable.__init__(self, depends_on=[coil_support])
 
     # ============================================================================
     # Cache invalidation
@@ -237,62 +178,48 @@ class CoilFEMObjective(Optimizable):
     def _read_dofs(self):
         """Read coil / current / support DOFs live from the simsopt graph."""
         base_curves_dofs = [
-            jnp.asarray(c.get_dofs()) for c in self._base_curves
+            jnp.asarray(c.get_dofs())
+            for c in self._coil_support.base_curves
         ]
         base_currents_dofs = jnp.array(
-            [c.get_value() for c in self._base_currents]
+            [c.get_value() for c in self._coil_support.base_currents]
         )
-        # Support dofs are read live from each support's simsopt DOFs.
-        base_support_dofs = [s.support_dofs for s in self._base_supports]
-        return base_curves_dofs, base_currents_dofs, base_support_dofs
+        support_dofs = self._coil_support.support_dofs
+        return base_curves_dofs, base_currents_dofs, support_dofs
 
     def _weighted_J(self, cdofs, idofs, sdofs):
         """Weighted sum of requested FEM metrics (traced scalar)."""
-        weights = self._metric_weights
-        metrics = self._metrics
-        result = self.fem.objective(cdofs, idofs, sdofs, metrics=metrics)
-        return sum(w * result[m] for w, m in zip(weights, metrics))
+        result = self.fem.objective(cdofs, idofs, sdofs, metrics=self._metrics)
+        return sum(w * result[m] for w, m in zip(self._metric_weights, self._metrics))
 
     def _compute_J(self):
-        """Evaluate only the (cheap) forward objective value.
-
-        Does not trigger an adjoint solve, so calling :meth:`J` stays cheap.
-        """
+        """Evaluate the forward objective value without an adjoint solve."""
         if not self._needs_J:
             return
-        base_curves_dofs, base_currents_dofs, base_support_dofs = self._read_dofs()
-        self._J_cache = float(
-            self._weighted_J(
-                base_curves_dofs, base_currents_dofs, base_support_dofs
-            )
-        )
+        cdofs, idofs, sdofs = self._read_dofs()
+        self._J_cache = float(self._weighted_J(cdofs, idofs, sdofs))
         self._needs_J = False
 
     def _compute_dJ(self):
-        """Evaluate the (expensive) gradients, refreshing the J cache too.
-
-        Uses :func:`jax.value_and_grad` so the objective value comes for free
-        from the same AD pass; this also clears the J cache flag.
-        """
+        """Evaluate gradients (and refresh J cache) via value_and_grad."""
         if not self._needs_dJ:
             return
-        base_curves_dofs, base_currents_dofs, base_support_dofs = self._read_dofs()
+        cdofs, idofs, sdofs = self._read_dofs()
 
         J_val, (grad_cdofs, grad_idofs, grad_sdofs) = value_and_grad(
             self._weighted_J, argnums=(0, 1, 2)
-        )(base_curves_dofs, base_currents_dofs, base_support_dofs)
+        )(cdofs, idofs, sdofs)
 
         self._J_cache = float(J_val)
         self._needs_J = False
 
-        # Convert to numpy once so that simsopt Derivative assembly is cheap.
-        self._grad_curves = [np.asarray(g) for g in grad_cdofs]
-        self._grad_currents = np.asarray(grad_idofs)   # shape (n_base,)
-        self._grad_supports = list(grad_sdofs)         # list[dict]
+        self._grad_curves   = [np.asarray(g) for g in grad_cdofs]
+        self._grad_currents = np.asarray(grad_idofs)
+        self._grad_support  = grad_sdofs   # single dict
         self._needs_dJ = False
 
     # ============================================================================
-    # simsopt interface
+    # Simsopt interface
     # ============================================================================
 
     def J(self):
@@ -310,144 +237,98 @@ class CoilFEMObjective(Optimizable):
         """
         self._compute_dJ()
 
-        # Assemble Derivative by mapping each JAX gradient array back to its
-        # simsopt Optimizable.  Derivative.__add__ accumulates contributions for
-        # any shared keys, so this is safe even when curves appear in multiple
-        # objectives.
         d = Derivative({})
-        for curve, g in zip(self._base_curves, self._grad_curves):
-            # g has shape (curve.local_full_dof_size,) — same layout as
-            # curve.get_dofs() since CurveXYZFourierJAX.from_simsopt uses
-            # curve.get_dofs() directly.
+        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
             d = d + Derivative({curve: g})
-        for current, g in zip(self._base_currents, self._grad_currents):
-            # current.vjp handles ScaledCurrent / CurrentSum chain rules.
+        for current, g in zip(self._coil_support.base_currents, self._grad_currents):
             d = d + current.vjp(np.array([float(g)]))
-        for support, g in zip(self._base_supports, self._grad_supports):
-            # g is a JAX dict; flatten_grad maps it to the support's flat DOFs.
-            d = d + Derivative({support: support.flatten_grad(g)})
+        d = d + Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
         return d
 
     return_fn_map = {'J': J, 'dJ': dJ}
 
     # ============================================================================
-    # Forward FEM
+    # Forward FEM helpers
     # ============================================================================
 
     def run(self):
         """Forward FEM for all base coils at the *current* simsopt DOFs.
 
-        Reads coil geometry, currents, and support parameters live from the
-        simsopt DOF graph and forwards them to
-        :meth:`coil_fem.CoilFEM.run`, returning its full solution
-        dict.  Intended for diagnostics, post-processing, and visualisation;
-        no gradients are computed (use :meth:`J` / :meth:`dJ` for those).
-
         Returns
         -------
         dict
-            See :meth:`coil_fem.CoilFEM.run` for the full set of keys
-            (``'solutions'``, ``'displacements'``, ``'von_mises'``,
-            ``'mesh_points'``, ``'support_weights'``, ``'f_vol'``,
-            ``'B_self'``, ``'B_ext'``).
+            See :meth:`coil_fem.CoilFEM.run`.
         """
-        base_curves_dofs = [
-            jnp.asarray(c.get_dofs()) for c in self._base_curves
-        ]
-        base_currents_dofs = jnp.array(
-            [c.get_value() for c in self._base_currents]
-        )
-        base_support_dofs = [s.support_dofs for s in self._base_supports]
+        cdofs, idofs, sdofs = self._read_dofs()
         return self.fem.run(
-            base_curves_dofs=base_curves_dofs,
-            base_currents_dofs=base_currents_dofs,
-            base_support_dofs=base_support_dofs,
+            base_curves_dofs=cdofs,
+            base_currents_dofs=idofs,
+            base_support_dofs=sdofs,
         )
 
     def save_run_vtu(self, out_dir: str = ".", *, prefix: str = "coil"):
-        """Export per-coil forward-FEM results as VTU files at the *current* DOFs.
-
-        Reads coil geometry, currents, and support parameters live from the
-        simsopt DOF graph and forwards them to
-        :meth:`coil_fem.CoilFEM.save_run_vtu`.  Because the support
-        ``dofs`` are read from each support's :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`,
-        this works uniformly across support types (e.g. an empty ``{}`` for
-        DOF-free supports such as
-        :class:`~coil_fem.simsopt.CoilSupportTopBottom`, or ``{'phis': ...}``
-        for :class:`~coil_fem.simsopt.CoilSupportDiscrete`).
+        """Export per-coil FEM results as VTU files at the *current* DOFs.
 
         Parameters
         ----------
         out_dir : str
-            Output directory.  Created if it does not exist.
+            Output directory.
         prefix : str
-            File-name prefix (default ``"coil"``).
+            File-name prefix.
 
         Returns
         -------
         list[str]
-            Paths of all files written, in order.
+            Paths of all files written.
         """
-        base_curves_dofs, base_currents_dofs, base_support_dofs = self._read_dofs()
+        cdofs, idofs, sdofs = self._read_dofs()
         return self.fem.save_run_vtu(
             out_dir,
             prefix=prefix,
-            base_curves_dofs=base_curves_dofs,
-            base_currents_dofs=base_currents_dofs,
-            base_support_dofs=base_support_dofs,
+            base_curves_dofs=cdofs,
+            base_currents_dofs=idofs,
+            base_support_dofs=sdofs,
         )
 
     def save_support_vtu(self, out_dir: str = ".", *, prefix: str = "coil"):
         """Export per-coil Winkler support weights as VTU files at the *current* DOFs.
 
-        Reads coil geometry and support parameters live from the simsopt DOF
-        graph and forwards them to
-        :meth:`coil_fem.CoilFEM.save_support_vtu`.  Because the support
-        ``dofs`` are read from each support's
-        :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`, this works
-        uniformly across support types (e.g. an empty ``{}`` for DOF-free
-        supports such as :class:`~coil_fem.simsopt.CoilSupportTopBottom`, or
-        ``{'phis': ...}`` for :class:`~coil_fem.simsopt.CoilSupportDiscrete`).
-
         Parameters
         ----------
         out_dir : str
-            Output directory.  Created if it does not exist.
+            Output directory.
         prefix : str
-            File-name prefix (default ``"coil"``).
+            File-name prefix.
 
         Returns
         -------
         list[str]
-            Paths of all files written, in order.
+            Paths of all files written.
         """
-        base_curves_dofs, _, base_support_dofs = self._read_dofs()
+        cdofs, _, sdofs = self._read_dofs()
         return self.fem.save_support_vtu(
             out_dir,
             prefix=prefix,
-            base_curves_dofs=base_curves_dofs,
-            base_support_dofs=base_support_dofs,
+            base_curves_dofs=cdofs,
+            base_support_dofs=sdofs,
         )
 
     def compute_strain_tensors(self):
         """Total and thermal strain tensors at the *current* simsopt DOFs.
 
-        Reads coil geometry, currents, and support parameters live from the
-        simsopt DOF graph and forwards them to
-        :meth:`coil_fem.CoilFEM.compute_strain_tensors`.  Intended
-        for diagnostics and post-processing; no gradients are computed.
-
         Returns
         -------
         dict
-            See :meth:`coil_fem.CoilFEM.compute_strain_tensors` for
-            the full set of keys (``'eps_total'``, ``'eps_thermal'``).
+            See :meth:`coil_fem.CoilFEM.compute_strain_tensors`.
         """
-        base_curves_dofs, base_currents_dofs, base_support_dofs = self._read_dofs()
+        cdofs, idofs, sdofs = self._read_dofs()
         return self.fem.compute_strain_tensors(
-            base_curves_dofs=base_curves_dofs,
-            base_currents_dofs=base_currents_dofs,
-            base_support_dofs=base_support_dofs,
+            base_curves_dofs=cdofs,
+            base_currents_dofs=idofs,
+            base_support_dofs=sdofs,
         )
 
     # ============================================================================
@@ -456,15 +337,14 @@ class CoilFEMObjective(Optimizable):
 
     @property
     def n_nodes(self) -> int:
-        """The mesh nodes count."""
+        """The mesh node count."""
         return self.fem.n_nodes
 
-    
     @property
     def n_cells(self) -> int:
-        """The mesh cells count."""
+        """The mesh cell count."""
         return self.fem.n_cells
-    
+
     # ============================================================================
     # Visualisation
     # ============================================================================
@@ -472,76 +352,48 @@ class CoilFEMObjective(Optimizable):
     def plot_support(self, **kwargs):
         """Plot Winkler support weights at the *current* DOFs.
 
-        Thin wrapper around :meth:`coil_fem.CoilFEM.plot_support`
-        that feeds it the current coil geometry and support parameters read
-        live from the simsopt DOF graph.  All keyword arguments are forwarded,
-        including ``ax``, ``s``, ``cmap``, ``color``, ``simple_mode``, and any
-        extra ``**kwargs`` passed through to :meth:`ax.scatter` (e.g.
-        ``marker``, ``facecolors``, ``edgecolors``).  See
-        :meth:`coil_fem.CoilFEM.plot_support` for the ``simple_mode`` semantics
-        (support weight encoded as per-point alpha, no colorbar).
+        Thin wrapper around :meth:`coil_fem.CoilFEM.plot_support`.  All
+        keyword arguments are forwarded.
 
         Returns
         -------
         ax : mpl_toolkits.mplot3d.axes3d.Axes3D
-            The 3-D axes used for the plot.  The parent figure is available as
-            ``ax.get_figure()``.
         """
-
-        base_curves_dofs = [
-            jnp.asarray(c.get_dofs()) for c in self._base_curves
-        ]
-        base_support_dofs = [s.support_dofs for s in self._base_supports]
+        cdofs, _, sdofs = self._read_dofs()
         return self.fem.plot_support(
-            base_curves_dofs=base_curves_dofs,
-            base_support_dofs=base_support_dofs,
+            base_curves_dofs=cdofs,
+            base_support_dofs=sdofs,
             **kwargs,
         )
 
     def plot(self, engine: str = "matplotlib", ax=None, show: bool = True,
              axis_equal: bool = True, **kwargs):
-        """Plot the von Mises stress surface over the support scatter.
-
-        simsopt-compatible visualisation so this objective can be passed to
-        :func:`simsopt.geo.plot` alongside coils and surfaces: that helper
-        calls ``item.plot(ax=ax, show=..., **kwargs)`` on each item and expects
-        the shared axes back.  This method reads coil geometry, currents, and
-        support parameters live from the simsopt DOF graph and delegates to
-        :meth:`coil_fem.CoilFEM.plot`.
+        """Plot von Mises stress surface over the support scatter.
 
         Parameters
         ----------
         engine : str
-            Graphics engine.  Only ``"matplotlib"`` is supported.
-        ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None
-            Existing 3-D axes to draw on (e.g. created by a previous item in
-            :func:`simsopt.geo.plot`).  ``None`` creates a new figure/axes.
+            Graphics engine (only ``"matplotlib"`` supported).
+        ax : Axes3D or None
         show : bool
-            Whether to call ``matplotlib.pyplot.show`` after plotting.  Set to
-            ``False`` when more objects will be drawn on the same axes.
         axis_equal : bool
-            Whether to scale the three axes equally.
         **kwargs
-            Extra keyword arguments forwarded to
-            :meth:`coil_fem.CoilFEM.plot` (e.g. ``cmap``, ``support_color``,
-            ``support_s``).
+            Forwarded to :meth:`coil_fem.CoilFEM.plot`.
 
         Returns
         -------
-        ax : mpl_toolkits.mplot3d.axes3d.Axes3D
-            The 3-D axes used for the plot, so it can be forwarded to the next
-            item in :func:`simsopt.geo.plot`.
+        ax : Axes3D
         """
         if engine != "matplotlib":
             raise NotImplementedError(
                 "CoilFEMObjective.plot supports the matplotlib engine only."
             )
 
-        base_curves_dofs, base_currents_dofs, base_support_dofs = self._read_dofs()
+        cdofs, idofs, sdofs = self._read_dofs()
         ax = self.fem.plot(
-            base_curves_dofs=base_curves_dofs,
-            base_currents_dofs=base_currents_dofs,
-            base_support_dofs=base_support_dofs,
+            base_curves_dofs=cdofs,
+            base_currents_dofs=idofs,
+            base_support_dofs=sdofs,
             ax=ax,
             axis_equal=axis_equal,
             **kwargs,
