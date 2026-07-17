@@ -598,12 +598,16 @@ class LinearElasticity3D(DeviceProblem):
         return mass_map
 
     def get_surface_maps(self):
-        """Winkler spring: identity traction ``t = u``; stiffness lives in nanson_scale.
+        """Winkler spring with optional attachment shift: ``t = u − u_attach``.
 
         When ``winkler_k_scalar`` is set, :meth:`set_params` absorbs the
         per-quad stiffness into ``nanson_scale`` so that the surface integral
-        ``∫ k(x) u · v dS`` is computed correctly without modifying JAX-FEM's
-        assembly machinery.  The surface map therefore returns ``u`` unchanged.
+        ``∫ k(x) (u − u_attach) · v dS`` is computed correctly.  The surface
+        map returns ``u − u_attach`` where ``u_attach`` is the interpolated
+        attachment displacement stored in ``self.internal_vars_surfaces[0]``
+        by :meth:`set_params`.  When ``support_attach`` is absent from
+        ``params``, ``u_attach`` defaults to zero and the traction reduces to
+        the grounded identity ``u``.
 
         If no Winkler BC is configured (``winkler_k_scalar=None``), returns an
         empty list.
@@ -611,10 +615,12 @@ class LinearElasticity3D(DeviceProblem):
         if self._winkler_k_scalar is None:
             return []
 
-        def identity_spring(u, x):
-            return u
+        def shifted_spring(u, x, u_attach):
+            # u_attach is the attachment displacement at this surface quad point,
+            # interpolated from params['support_attach'] in set_params.
+            return u - u_attach
 
-        return [identity_spring]
+        return [shifted_spring]
 
     def set_params(self, params):
         """Update geometry, body force, and Winkler BC from differentiable params.
@@ -636,6 +642,14 @@ class LinearElasticity3D(DeviceProblem):
                 ``winkler_k_scalar * interp(support_weights)``
                 where the interpolation uses face shape functions.
                 Gradients flow through this array via the adjoint.
+            ``'support_attach'`` : jnp.ndarray (n_surface_nodes, 3), optional
+                Per-surface-node attachment displacement ``u_attach``.  When
+                present, the Winkler surface traction becomes
+                ``k(x) (u − u_attach)`` instead of ``k(x) u``, implementing a
+                shifted spring that couples the coil displacement to the
+                displacement of an attached support structure.  Gradients flow
+                through this array via the adjoint.  Defaults to zeros when
+                absent (equivalent to the original grounded-spring behaviour).
         """
         points = params['points']
 
@@ -684,21 +698,44 @@ class LinearElasticity3D(DeviceProblem):
 
             if (i == 0
                     and self._winkler_k_scalar is not None
-                    and 'support_weights' in params
                     and self._surf_face_to_surf_node is not None):
+                # ── Winkler stiffness ──────────────────────────────────────────
                 # Interpolate per-node weights to per-quad stiffness using face
                 # shape functions, then absorb into nanson_scale so that the
-                # identity surface map (t = u) yields ∫ k(x) u·v dS correctly.
+                # shifted surface map (t = u - u_attach) yields
+                # ∫ k(x) (u − u_attach) · v dS correctly.
                 #
                 # sel_face_sv : (num_sel, num_fq, npf)
                 # w_face      : (num_sel, npf)   — weights at face corner nodes
                 # k_at_quad   : (num_sel, num_fq) — scalar stiffness per quad pt
-                w = params['support_weights']          # (n_surface_nodes,) traced
-                w_face = w[self._surf_face_to_surf_node]   # (num_sel, npf) traced
-                k_at_quad = self._winkler_k_scalar * jnp.einsum(
-                    'sqn,sn->sq', self._sel_face_sv, w_face
-                )  # (num_sel, num_fq) traced
-                self.nanson_scale[i] = (k_at_quad * ns_geom)[:, None, :]
+                if 'support_weights' in params:
+                    w = params['support_weights']              # (n_surf_nodes,) traced
+                    w_face = w[self._surf_face_to_surf_node]   # (num_sel, npf) traced
+                    k_at_quad = self._winkler_k_scalar * jnp.einsum(
+                        'sqn,sn->sq', self._sel_face_sv, w_face
+                    )  # (num_sel, num_fq) traced
+                    self.nanson_scale[i] = (k_at_quad * ns_geom)[:, None, :]
+                else:
+                    self.nanson_scale[i] = ns_geom[:, None, :]
+
+                # ── Attachment displacement for shifted Winkler spring ─────────
+                # Interpolate params['support_attach'] (n_surf_nodes, 3) to
+                # face-quad points and store as the first surface internal var so
+                # that shifted_spring(u, x, u_attach) returns u − u_attach.
+                # When support_attach is absent, default to zeros (grounded spring).
+                num_sel = self._surf_face_to_surf_node.shape[0]
+                num_fq  = self._sel_face_sv.shape[1]
+                if 'support_attach' in params:
+                    ua = params['support_attach']              # (n_surf_nodes, 3) traced
+                    ua_face = ua[self._surf_face_to_surf_node] # (num_sel, npf, 3)
+                    ua_at_quad = jnp.einsum(
+                        'sqn,snd->sqd', self._sel_face_sv, ua_face
+                    )  # (num_sel, num_fq, 3) traced
+                else:
+                    ua_at_quad = jnp.zeros(
+                        (num_sel, num_fq, 3), dtype=params['points'].dtype
+                    )
+                self.internal_vars_surfaces[0] = (ua_at_quad,)
             else:
                 self.nanson_scale[i] = ns_geom[:, None, :]
 

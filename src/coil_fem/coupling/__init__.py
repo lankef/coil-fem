@@ -1,10 +1,20 @@
 """Coupling interfaces between coil FEM problems and support structures.
 
-Re-exports :class:`~coil_fem.coupling.supports.Support` and
-:class:`~coil_fem.coupling.supports.SupportFixed` for convenient import from
-``coil_fem.coupling``.
+Re-exports :class:`~coil_fem.coupling.supports.Support`,
+:class:`~coil_fem.coupling.supports.SupportFixed`,
+:class:`~coil_fem.coupling.beam_networks.SupportBeams`, and the driver
+functions :func:`~coil_fem.coupling.drivers.solve_staggered` and
+:func:`~coil_fem.coupling.drivers.solve_monolithic`.
 """
 
 from .supports import Support, SupportFixed
+from .beam_networks import SupportBeams
+from .drivers import solve_staggered, solve_monolithic
 
-__all__ = ['Support', 'SupportFixed']
+__all__ = [
+    'Support',
+    'SupportFixed',
+    'SupportBeams',
+    'solve_staggered',
+    'solve_monolithic',
+]

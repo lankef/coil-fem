@@ -167,6 +167,103 @@ class Support(abc.ABC):
             "Only supports that participate in monolithic assembly need this."
         )
 
+    def compute_attach(
+        self,
+        coil_idx: int,
+        surface_pts: jax.Array,
+        curve_jax,
+        dofs,
+        state: dict,
+    ) -> jax.Array:
+        """Per-surface-node target displacement for the shifted Winkler spring.
+
+        In the staggered coupling scheme, the coil-side Winkler spring is shifted
+        so that the spring force on coil surface node ``k`` is
+
+        .. math::
+
+            f_k = k_{\\text{lin}} \\cdot w_k \\cdot (u_{\\text{attach},k} - u_k)
+
+        where :math:`u_{\\text{attach},k}` is the attachment displacement returned
+        here.  For an uncoupled (grounded) support this is always zero, which
+        recovers the standard Winkler spring.
+
+        Parameters
+        ----------
+        coil_idx : int
+            Index of the base coil (0-based).
+        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
+            Current positions of the coil surface nodes.
+        curve_jax : CurveXYZFourierJAX
+            Differentiable coil centreline at current DOFs.
+        dofs : dict or None
+            Full merged support-dofs dict for the coil set.
+        state : dict
+            Current support state, including ``'u_s'`` (the support
+            displacement vector) when the support is coupled.
+
+        Returns
+        -------
+        jax.Array, shape ``(n_surface_nodes, 3)``
+            Attachment displacement at each surface node.  Default: zeros.
+        """
+        return jnp.zeros((surface_pts.shape[0], 3), dtype=surface_pts.dtype)
+
+    def coupling_terms(
+        self,
+        base_curves_dofs,
+        support_dofs,
+        surface_pts_by_coil: list,
+        coil_dof_offsets: list[int],
+        support_dof_offset: int,
+        surface_node_indices_by_coil: list,
+    ) -> dict:
+        """COO triplets for the off-diagonal coupling blocks :math:`K_{cs}` and :math:`K_{sc}`.
+
+        In the monolithic assembly the full system is
+
+        .. math::
+
+            \\begin{bmatrix} K_{cc} & K_{cs} \\\\ K_{sc} & K_{ss} \\end{bmatrix}
+            \\begin{bmatrix} u_c \\\\ u_s \\end{bmatrix}
+            =
+            \\begin{bmatrix} f_c \\\\ f_s \\end{bmatrix}
+
+        This method returns the non-zero entries of the off-diagonal blocks as
+        three-tuple COO arrays (row index, column index, value).  Row/column
+        indices are given in the *global* merged-system DOF numbering.
+
+        Parameters
+        ----------
+        base_curves_dofs : list[jax.Array]
+            Per-base-coil DOF vectors.
+        support_dofs : dict
+            Merged support-dofs dict for the whole coil set.
+        surface_pts_by_coil : list[jax.Array]
+            Per-coil surface node positions, shape ``(n_surf_i, 3)`` each.
+        coil_dof_offsets : list[int]
+            DOF offset of each coil in the merged system.
+            ``coil_dof_offsets[i]`` = where coil ``i``'s DOFs start.
+        support_dof_offset : int
+            DOF offset of the support block in the merged system.
+        surface_node_indices_by_coil : list[np.ndarray]
+            Per-coil integer arrays ``[n_surf_i]`` mapping surface-node compact
+            index ``k`` → global mesh node index (used to locate DOFs in the
+            merged system).
+
+        Returns
+        -------
+        dict with keys ``'I_cs'``, ``'J_cs'``, ``'V_cs'``,
+        ``'I_sc'``, ``'J_sc'``, ``'V_sc'``.
+            Empty arrays for uncoupled supports.
+        """
+        empty_i = jnp.zeros(0, dtype=jnp.int32)
+        empty_v = jnp.zeros(0, dtype=jnp.float64)
+        return {
+            'I_cs': empty_i, 'J_cs': empty_i, 'V_cs': empty_v,
+            'I_sc': empty_i, 'J_sc': empty_i, 'V_sc': empty_v,
+        }
+
 
 class SupportFixed(Support):
     """Grounded (fixed) support with a configurable Winkler weight function.
@@ -199,7 +296,9 @@ class SupportFixed(Support):
     def __init__(
         self,
         support_fns: Callable | list[Callable] | None = None,
+        **kwargs,
     ):
+        super().__init__(**kwargs)
         if callable(support_fns):
             self._support_fns: Callable | list[Callable] | None = support_fns
         elif isinstance(support_fns, (list, tuple)):
