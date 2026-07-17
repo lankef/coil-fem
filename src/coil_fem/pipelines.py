@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import jax
+import jax.flatten_util
 import jax.numpy as jnp
 
 from .problem import LinearElasticity3D, lame_parameters, itc_strain
@@ -72,12 +74,14 @@ class ElasticPipeline:
 
         self.fwd_pred = build_fwd_pred(self.problem, problem_options)
         self.surface_node_indices = self.problem.surface_node_global_indices
+        self.problem_options = problem_options
 
     def solve(
         self,
         points: jnp.ndarray,
         body_force: jnp.ndarray,
         support_weights: jnp.ndarray | None = None,
+        support_attach: jnp.ndarray | None = None,
     ) -> dict:
         """Run one differentiable forward FEM solve.
 
@@ -92,6 +96,11 @@ class ElasticPipeline:
             Body force at every quadrature point.
         support_weights : jnp.ndarray or None, shape ``(n_surface_nodes,)``
             Per-surface-node Winkler weights in ``[0, 1]``.
+        support_attach : jnp.ndarray or None, shape ``(n_surface_nodes, 3)``
+            Per-surface-node attachment displacement ``u_attach`` for the
+            shifted Winkler spring.  When provided, the spring traction becomes
+            ``k(x) (u − u_attach)`` rather than ``k(x) u``, implementing
+            staggered coupling to a support structure.  Defaults to zeros.
 
         Returns
         -------
@@ -106,6 +115,8 @@ class ElasticPipeline:
         }
         if support_weights is not None:
             params['support_weights'] = support_weights
+        if support_attach is not None:
+            params['support_attach'] = support_attach
 
         sol_list = self.fwd_pred(params)
         return {
@@ -113,6 +124,71 @@ class ElasticPipeline:
             'u':        sol_list[0],
             'problem':  self.problem,
         }
+
+    def solve_residual(self, params: dict) -> jnp.ndarray:
+        """Compute the flat FEM residual vector at the zero-displacement solution.
+
+        Calls :meth:`~coil_fem.problem.LinearElasticity3D.set_params` then
+        evaluates the residual ``R(0)`` (the negation of the load vector for
+        a linear problem).  Used by the monolithic driver to assemble the
+        merged right-hand side without re-running a full Newton solve.
+
+        Parameters
+        ----------
+        params : dict
+            Same format as accepted by :meth:`solve`.
+
+        Returns
+        -------
+        jnp.ndarray, shape ``(n_dofs,)``
+            Flat residual at zero displacement, equal to ``-f`` where ``f`` is
+            the body-force + surface-traction load vector.
+        """
+        self.problem.set_params(params)
+        zero_sol = [jnp.zeros((self.problem.num_total_nodes, 3))]
+        res = self.problem.compute_residual_vars(
+            zero_sol, self.problem.internal_vars, self.problem.internal_vars_surfaces
+        )
+        return jax.flatten_util.ravel_pytree(res)[0]
+
+    def assemble_coo(self, params: dict) -> tuple:
+        """Assemble the stiffness matrix in COO format (cuDSS path only).
+
+        Calls :meth:`~coil_fem.problem.LinearElasticity3D.set_params` then
+        triggers a device-side Jacobian assembly via
+        :meth:`~coil_fem.problem.DeviceProblem.compute_newton_vars`, populating
+        ``problem.V_jax``.  Returns the static ``I_jax``, ``J_jax`` index
+        arrays together with the freshly assembled ``V_jax`` and the total DOF
+        count.
+
+        Parameters
+        ----------
+        params : dict
+            Same format as accepted by :meth:`solve`.
+
+        Returns
+        -------
+        tuple
+            ``(I, J, V, n_dofs)``
+
+        Raises
+        ------
+        NotImplementedError
+            When the pipeline was not built with ``gpu_assembly=True``
+            (i.e. ``problem_options={'solver': 'cudss'}`` was not set).
+        """
+        if not hasattr(self.problem, 'I_jax'):
+            raise NotImplementedError(
+                "ElasticPipeline.assemble_coo() requires gpu_assembly=True "
+                "(problem_options={'solver': 'cudss'})."
+            )
+        self.problem.set_params(params)
+        zero_sol = [jnp.zeros((self.problem.num_total_nodes, 3))]
+        self.problem.compute_newton_vars(
+            zero_sol, self.problem.internal_vars, self.problem.internal_vars_surfaces
+        )
+        n_dofs = self.problem.num_total_dofs_all_vars
+        return self.problem.I_jax, self.problem.J_jax, self.problem.V_jax, n_dofs
 
     def attachment_displacement(self, sol_list: list) -> jnp.ndarray:
         """Extract displacement at coil surface (attachment) nodes.
