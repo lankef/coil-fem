@@ -48,6 +48,7 @@ def bool_to_sign(a):
 # ============================================================================
 
 solid_circle_keys = ('r_beam',)
+solid_circle_option_keys = ('sigmoid_eps',)
 
 def solid_circle(support_dofs: dict):
     """Cross-section function for a solid circular section.
@@ -86,7 +87,6 @@ def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, constants):
     pts_x = surface_pts_beam_frame[:, 0]
     pts_y = surface_pts_beam_frame[:, 1]
     pts_z = surface_pts_beam_frame[:, 2]
-    r = dofs['r_beam']
     
     in_correct_direction = jnp.where(
         bool_to_sign(sign_x) * pts_x >= 0,
@@ -95,7 +95,7 @@ def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, constants):
     distance_sq = pts_y**2 + pts_z**2
     return in_correct_direction * clamp_sigmoid(
         distance_sq=distance_sq,
-        r_attachment=constants['r_attachment'], 
+        r_attachment=dofs['r_beam'], 
         sigmoid_eps=constants['sigmoid_eps'],
     )
     
@@ -106,6 +106,7 @@ def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, constants):
 
 
 solid_rectangle_keys = ('w1_beam', 'w2_beam',)
+solid_rectangle_option_keys = ('sigmoid_eps',)
     
 def solid_rectangle(support_dofs : dict):
     """Cross-section function for a solid rectangular section.
@@ -164,6 +165,7 @@ def solid_rectangle(support_dofs : dict):
 # ============================================================================
 
 hollow_circle_keys = ('r_1_beam', 'r_1_beam',)
+hollow_circle_option_keys = ('sigmoid_eps',)
     
 def hollow_circle(support_dofs: dict) -> Callable:
     """Cross-section function for a hollow circular section.

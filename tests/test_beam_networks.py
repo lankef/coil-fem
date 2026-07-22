@@ -76,9 +76,7 @@ def _make_support_beams(
 ) -> SupportBeams:
     """Build a minimal SupportBeams instance for testing."""
     curves = [_make_circle(N=8, R=1.0 + 0.1 * i) for i in range(n_base)]
-    constants = {
-        'nfp': nfp,
-        'stellsym': stellsym,
+    beam_options = {
         'n_beam_cc': n_beam_cc,
         'n_beam_cf': n_beam_cf,
         'E': 200e9,
@@ -87,7 +85,9 @@ def _make_support_beams(
         'k_tor': 1e4,
     }
     return SupportBeams(
-        constants=constants,
+        nfp=nfp,
+        stellsym=stellsym,
+        beam_options=beam_options,
         base_curves_jax=curves,
         cross_section_fn=_constant_section_fn(),
         attachment_fn=_uniform_clamp_fn,
@@ -393,9 +393,9 @@ def test_support_beams_end_side_gradient():
 
     base_curves = [_make_circle(N=8, R=1.0 + 0.1 * i) for i in range(n_base)]
     sb = SupportBeams(
-        constants={
-            'nfp': nfp,
-            'stellsym': False,
+        nfp=nfp,
+        stellsym=False,
+        beam_options={
             'n_beam_cc': n_cc,
             'n_beam_cf': n_cf,
             'E': 200e9,

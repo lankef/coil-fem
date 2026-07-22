@@ -1,14 +1,21 @@
 """Concrete grounded support and the base class for all support models.
 
-Defines :class:`Support`, the default uncoupled (grounded) support whose
-attachment points are held at zero displacement by a Winkler spring field
-whose spatial distribution is governed by a user-supplied
-``fixed_clamp_fn`` callable.  Coupled subclasses (e.g.
-:class:`~coil_fem.coupling.SupportBeams`) override :meth:`is_coupled`,
-:meth:`solve`, :meth:`displacement_at`, and :meth:`compute_weights`.
+Defines :class:`Support`, the simplest type of support structures. 
+The coils are fixed to stationary points in space via a number of 
+suspended clamps modelled using Robin/Winkler boundary conditions. 
+There is no inter-coil coupling in the linear elasticity problem.
+(:meth:`is_coupled` outputs ``False``) Which exterior node to fix 
+via the BC is decided by the ``fixed_clamp_fn`` callable. 
 
-Module-level factories :func:`make_clamp_fn` and :func:`make_topbottom_fn`
-return per-coil callable closures that can be passed directly as
+Subclasses of :class:`Support` (e.g. :class:`~coil_fem.coupling.SupportBeams`)
+always preserves the support for Robin/Winkler BC, but introduces 
+more complex support structures that may introduce inter-coil coupling. 
+For example, if two coils are linked with a beam, then displacement both 
+coils are no-longer independent linear systems. 
+
+The moule also supply some factories for commonly used ``fixed_clamp_fn``.
+:func:`make_clamp_fn` and :func:`make_topbottom_fn` return 
+per-coil callable closures that can be passed directly as
 ``fixed_clamp_fns`` to :class:`Support`.
 """
 
