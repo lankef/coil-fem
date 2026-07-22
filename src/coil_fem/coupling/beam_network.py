@@ -138,10 +138,13 @@ class SupportBeams(SupportFixed):
         returned array has shape ``(n_base, n_beam_cc + n_beam_cf)``.
         Section-property validation is delegated to this callable.
     clamp_fn : callable
-        ``clamp_fn(surface_pts, curve_jax, dofs, direction) -> weights``
-        where ``surface_pts`` is ``(n_surface_nodes, 3)``, ``direction`` is
-        the signed beam tangent ``(3,)``, and ``weights`` is
-        ``(n_surface_nodes,)`` in ``[0, 1]``.
+        ``clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights``
+        where ``surface_pts_beam_frame`` is ``(n_surface_nodes, 3)`` — surface
+        points expressed in the beam's local frame with origin at the endpoint
+        (computed as ``(pts − x_endpoint) @ Gamma_3``), ``dofs`` is the merged
+        support-dofs dict, ``sign_x`` is ``True`` at the node-1 end (beam
+        extends toward ``+x_local``) and ``False`` at node-2.
+        ``weights`` is ``(n_surface_nodes,)`` in ``[0, 1]``.
     k_lin : float
         Translational spring stiffness [N/m²] (applied as ``k_lin * w``
         per surface node).
@@ -336,15 +339,19 @@ class SupportBeams(SupportFixed):
         ]
 
     def _apply_end_transform(
-        self, pts: jax.Array, transform: str
+        self, pts: jax.Array, transform: str, inverse: bool = False
     ) -> jax.Array:
-        """Apply the symmetry transform to the endpoint position/tangent.
+        """Apply (or invert) the wraparound symmetry transform.
 
         Parameters
         ----------
         pts : jax.Array, shape ``(..., 3)``
         transform : str
             One of ``'none'``, ``'flip'``, ``'rotate'``.
+        inverse : bool
+            When ``True``, apply the *inverse* of the named transform.
+            ``'none'`` and ``'flip'`` are self-inverse; ``'rotate'`` uses
+            ``−2π/nfp`` instead of ``+2π/nfp``.
 
         Returns
         -------
@@ -353,9 +360,12 @@ class SupportBeams(SupportFixed):
         if transform == 'none':
             return pts
         elif transform == 'flip':
-            return _flip_points(pts)
+            return _flip_points(pts)   # self-inverse
         else:  # 'rotate'
-            return _rotate_points_z(pts, 2.0 * math.pi / self.nfp)
+            angle = 2.0 * math.pi / self.nfp
+            if inverse:
+                angle = -angle
+            return _rotate_points_z(pts, angle)
 
     def _beam_geometry(
         self,
@@ -366,7 +376,7 @@ class SupportBeams(SupportFixed):
 
         All outputs are traced through ``curves`` and ``support_dofs`` and
         are therefore differentiable w.r.t. coil DOFs,
-        ``phi_start_cc``, ``phi_end_cc``, ``phi_start_cf``,
+        ``phis_start_cc``, ``phis_end_cc``, ``phis_start_cf``,
         ``x_foundation``, etc.
 
         Parameters
@@ -374,7 +384,7 @@ class SupportBeams(SupportFixed):
         curves : list[CurveXYZFourierJAX]
             Traced base-coil curve objects.
         support_dofs : dict
-            Must contain ``phi_start_cc``, ``phi_end_cc``, ``phi_start_cf``,
+            Must contain ``phis_start_cc``, ``phis_end_cc``, ``phis_start_cf``,
             ``x_foundation`` (as specified in the class docstring).
 
         Returns
@@ -389,9 +399,9 @@ class SupportBeams(SupportFixed):
         * ``'t_coil_end'``  : (N_beams, 3) — coil tangent at node-2 for CC beams;
           zero vector for CF beams (foundation side has no coil tangent).
         """
-        phi_start_cc = support_dofs['phi_start_cc']       # (n_base, n_beam_cc)
-        phi_end_cc   = support_dofs['phi_end_cc']         # (n_base, n_beam_cc)
-        phi_start_cf = support_dofs['phi_start_cf']       # (n_base, n_beam_cf)
+        phis_start_cc = support_dofs['phis_start_cc']       # (n_base, n_beam_cc)
+        phis_end_cc   = support_dofs['phis_end_cc']         # (n_base, n_beam_cc)
+        phis_start_cf = support_dofs['phis_start_cf']       # (n_base, n_beam_cf)
         x_foundation = support_dofs['x_foundation']       # (n_base, n_beam_cf, 3)
 
         x_start_list, x_end_list = [], []
@@ -404,8 +414,8 @@ class SupportBeams(SupportFixed):
 
             # ── CC beams for coil i ──────────────────────────────────────────
             for j in range(self.n_beam_cc):
-                phi_s = phi_start_cc[i, j]
-                phi_e = phi_end_cc[i, j]
+                phi_s = phis_start_cc[i, j]
+                phi_e = phis_end_cc[i, j]
 
                 x_s = curve_i.gamma_eval(phi_s)        # (3,)
                 x_e_raw = curve_end.gamma_eval(phi_e)  # (3,) — may need transform
@@ -425,7 +435,7 @@ class SupportBeams(SupportFixed):
 
             # ── CF beams for coil i ──────────────────────────────────────────
             for j in range(self.n_beam_cf):
-                phi_s = phi_start_cf[i, j]
+                phi_s = phis_start_cf[i, j]
                 x_s = curve_i.gamma_eval(phi_s)        # (3,)
                 x_e = x_foundation[i, j]               # (3,) — traced support DOF
 
@@ -468,8 +478,8 @@ class SupportBeams(SupportFixed):
         * ``x_local = t_beam``  (unit vector node1→node2).
         * reference direction ``ref = cross(t_beam, t_coil_start)``
           (normal to the beam in the plane of beam + coil-start tangent).
-        * ``z_local = normalize(Rodrigues(t_beam, theta_orientation) @ ref)``
-          — ``theta_orientation`` rolls the cross-section about the beam axis.
+        * ``z_local = normalize(Rodrigues(t_beam, thetas_orientation) @ ref)``
+          — ``thetas_orientation`` rolls the cross-section about the beam axis.
         * ``y_local = cross(z_local, x_local)``
 
         Parameters
@@ -477,15 +487,15 @@ class SupportBeams(SupportFixed):
         geom : dict
             Output of :meth:`_beam_geometry`.
         support_dofs : dict
-            Must contain ``theta_orientation_cc`` and ``theta_orientation_cf``.
+            Must contain ``thetas_orientation_cc`` and ``thetas_orientation_cf``.
 
         Returns
         -------
         jax.Array, shape ``(N_beams, 3, 3)``
             Column-major: ``Gamma[b] = [x_local | y_local | z_local]``.
         """
-        theta_cc = support_dofs['theta_orientation_cc']  # (n_base, n_beam_cc)
-        theta_cf = support_dofs['theta_orientation_cf']  # (n_base, n_beam_cf)
+        theta_cc = support_dofs['thetas_orientation_cc']  # (n_base, n_beam_cc)
+        theta_cf = support_dofs['thetas_orientation_cf']  # (n_base, n_beam_cf)
 
         t_beam = geom['t_beam']           # (N, 3)
         t_coil = geom['t_coil_start']     # (N, 3)
@@ -524,6 +534,105 @@ class SupportBeams(SupportFixed):
             return jnp.stack([x_local, y_local, z_local], axis=1)  # (3, 3)
 
         return jax.vmap(single_dcm)(t_beam, t_coil, thetas)  # (N, 3, 3)
+
+    def _endpoint_specs(
+        self,
+        geom: dict,
+        gamma3: jax.Array,
+    ) -> list[dict]:
+        """Enumerate every coil-coupled beam endpoint.
+
+        Returns one spec dict per coil-touching beam endpoint (CC beams yield
+        two specs; CF beams yield one — the foundation side is handled
+        separately in the spring assembly helpers).
+
+        Each spec contains:
+
+        * ``'b'``         : flat beam index.
+        * ``'node_side'`` : ``0`` (node-1) or ``1`` (node-2).
+        * ``'coil'``      : index of the base coil this endpoint couples to.
+        * ``'x_ep'``      : ``(3,)`` endpoint position in the frame where
+          ``coil`` surface points live (after symmetry transform when required).
+        * ``'gamma3'``    : ``(3, 3)`` DCM for this beam
+          (columns: ``x_local``, ``y_local``, ``z_local``).
+        * ``'sign_x'``    : ``True`` at node-1 (beam extends toward
+          ``+x_local``); ``False`` at node-2.
+        * ``'tfm'``       : symmetry transform tag ``'none'`` / ``'flip'`` /
+          ``'rotate'`` — applied to surface points before computing moment
+          arms.  Always ``'none'`` for node-1.
+
+        Parameters
+        ----------
+        geom : dict
+            Output of :meth:`_beam_geometry`.
+        gamma3 : jax.Array, shape ``(N_beams, 3, 3)``
+            Output of :meth:`_direction_cosine_matrices`.
+
+        Returns
+        -------
+        list of dicts, one per coil-touching endpoint.
+        """
+        specs = []
+        b = 0
+        for i in range(self.n_base):
+            end_idx = self._end_coil_local_idx[i]
+            end_tfm = self._end_coil_transform[i]
+
+            for j in range(self.n_beam_cc):
+                g3 = gamma3[b]
+                specs.append({
+                    'b': b, 'node_side': 0, 'coil': i,
+                    'x_ep': geom['x_start'][b], 'gamma3': g3,
+                    'sign_x': True, 'tfm': 'none',
+                })
+                specs.append({
+                    'b': b, 'node_side': 1, 'coil': end_idx,
+                    'x_ep': geom['x_end'][b], 'gamma3': g3,
+                    'sign_x': False, 'tfm': end_tfm,
+                })
+                b += 1
+
+            for j in range(self.n_beam_cf):
+                specs.append({
+                    'b': b, 'node_side': 0, 'coil': i,
+                    'x_ep': geom['x_start'][b], 'gamma3': gamma3[b],
+                    'sign_x': True, 'tfm': 'none',
+                })
+                b += 1
+
+        return specs
+
+    def _clamp_weights_for_spec(
+        self,
+        spec: dict,
+        surf_pts: jax.Array,
+        support_dofs,
+    ):
+        """Compute clamp weights and moment arms for one beam endpoint.
+
+        Applies the endpoint's symmetry transform to ``surf_pts``, projects
+        the shifted surface points into the beam's local frame, and calls
+        :attr:`clamp_fn`.
+
+        Parameters
+        ----------
+        spec : dict
+            One element from :meth:`_endpoint_specs`.
+        surf_pts : jax.Array, shape ``(n_surf, 3)``
+            Surface points of the *coupled* coil (``surface_pts_by_coil[spec['coil']]``).
+        support_dofs : dict
+
+        Returns
+        -------
+        w_k : jax.Array, shape ``(n_surf,)``
+        r_k : jax.Array, shape ``(n_surf, 3)``
+            Moment arms in the endpoint's local frame.
+        """
+        surf_tfm = self._apply_end_transform(surf_pts, spec['tfm'])
+        r_k      = surf_tfm - spec['x_ep'][None, :]
+        pts_beam = r_k @ spec['gamma3']
+        w_k      = self.clamp_fn(pts_beam, support_dofs, spec['sign_x'])
+        return w_k, r_k
 
     # ============================================================================
     # Stiffness helpers
@@ -657,113 +766,65 @@ class SupportBeams(SupportFixed):
     # Support-ABC hook implementations
     # ============================================================================
 
-    def _endpoint_weights_by_coil(
-        self,
-        coil_idx: int,
-        surface_pts: jax.Array,
-        curve_jax: CurveXYZFourierJAX,
-        support_dofs: dict,
-    ) -> jax.Array:
-        """Aggregate spring weights for beam endpoints attached to coil ``coil_idx``.
-
-        Calls ``clamp_fn`` for every beam endpoint that couples to coil
-        ``coil_idx`` (CC node-1, CC node-2 incoming, CF node-1) and returns
-        their summed weight array.  The beam tangent direction fed to
-        ``clamp_fn`` is approximated by the coil tangent at the attachment phi
-        (positive for node-1 / CF, negative for incoming node-2 sides).
-
-        Parameters
-        ----------
-        coil_idx : int
-        surface_pts : jax.Array, shape ``(n_surf, 3)``
-        curve_jax : CurveXYZFourierJAX
-        support_dofs : dict
-
-        Returns
-        -------
-        jax.Array, shape ``(n_surf,)``
-        """
-        i = coil_idx
-        phi_start_cc = support_dofs['phi_start_cc']
-        phi_end_cc   = support_dofs['phi_end_cc']
-        phi_start_cf = support_dofs['phi_start_cf']
-
-        w_total = jnp.zeros(surface_pts.shape[0])
-
-        # CC beams: node-1 side (beams originating from coil i)
-        for j in range(self.n_beam_cc):
-            phi_s = phi_start_cc[i, j]
-            t_raw = curve_jax.gamma_eval(phi_s, diff_order=1)
-            t_dir = t_raw / (jnp.linalg.norm(t_raw) + 1e-300)
-            w_total = w_total + self.clamp_fn(surface_pts, curve_jax, support_dofs, t_dir)
-
-        # CC beams: node-2 side (beams whose end-coil is coil i)
-        for src_i in range(self.n_base):
-            if self._end_coil_local_idx[src_i] == i:
-                for j in range(self.n_beam_cc):
-                    phi_e = phi_end_cc[src_i, j]
-                    t_raw = curve_jax.gamma_eval(phi_e, diff_order=1)
-                    # End-side direction is opposite to start-side beam tangent
-                    t_dir = -t_raw / (jnp.linalg.norm(t_raw) + 1e-300)
-                    w_total = w_total + self.clamp_fn(
-                        surface_pts, curve_jax, support_dofs, t_dir
-                    )
-
-        # CF beams: node-1 side (CF beams of coil i)
-        for j in range(self.n_beam_cf):
-            phi_s = phi_start_cf[i, j]
-            t_raw = curve_jax.gamma_eval(phi_s, diff_order=1)
-            t_dir = t_raw / (jnp.linalg.norm(t_raw) + 1e-300)
-            w_total = w_total + self.clamp_fn(surface_pts, curve_jax, support_dofs, t_dir)
-
-        return w_total
-
     def compute_weights(
         self,
         coil_idx: int,
         surface_pts: jax.Array,
-        curve_jax: CurveXYZFourierJAX,
+        curves_jax: list,
         dofs,
     ) -> jax.Array:
         """Winkler weights for coil ``coil_idx``.
 
-        When ``support_fns`` was supplied at construction, delegates to
-        :class:`SupportFixed` (direct user-supplied distribution).  Otherwise
-        returns the aggregate beam spring weight ``Σ_b w_k^{b,i}`` over all
-        beam endpoints attached to coil ``coil_idx``, computed via
-        :meth:`_endpoint_weights_by_coil`.
+        When ``dofs`` is ``None`` (e.g. during weight visualisation before a
+        solve), delegates entirely to :class:`SupportFixed` (uniform ones when
+        no ``support_fns`` were provided).  Otherwise sums the beam spring
+        weights from all endpoints attached to ``coil_idx`` using the exact
+        beam-frame geometry, then optionally adds the ``SupportFixed`` term.
 
         Parameters
         ----------
         coil_idx : int
         surface_pts : jax.Array, shape ``(n_surf, 3)``
-        curve_jax : CurveXYZFourierJAX
+        curves_jax : list[CurveXYZFourierJAX]
+            All base-coil centreline curves (traced).
         dofs : dict or None
 
         Returns
         -------
         jax.Array, shape ``(n_surf,)``
         """
-        weights = self._endpoint_weights_by_coil(
-            coil_idx, surface_pts, curve_jax, dofs
-        )
-        if self._support_fns is not None:
-            return weights + SupportFixed.compute_weights(
-                self, coil_idx, surface_pts, curve_jax, dofs
+        if dofs is None:
+            return SupportFixed.compute_weights(
+                self, coil_idx, surface_pts, curves_jax, dofs
             )
-        return weights
+
+        geom   = self._beam_geometry(curves_jax, dofs)
+        gamma3 = self._direction_cosine_matrices(geom, dofs)
+        specs  = self._endpoint_specs(geom, gamma3)
+
+        w_total = jnp.zeros(surface_pts.shape[0])
+        for spec in specs:
+            if spec['coil'] == coil_idx:
+                w_k, _ = self._clamp_weights_for_spec(spec, surface_pts, dofs)
+                w_total = w_total + w_k
+
+        if self._support_fns is not None:
+            w_total = w_total + SupportFixed.compute_weights(
+                self, coil_idx, surface_pts, curves_jax, dofs
+            )
+        return w_total
 
     def compute_attach(
         self,
         coil_idx: int,
         surface_pts: jax.Array,
-        curve_jax: CurveXYZFourierJAX,
+        curves_jax: list,
         dofs,
         state: dict,
     ) -> jax.Array:
         """Weighted-average beam endpoint displacement at coil surface nodes.
 
-        For each beam endpoint ``b`` attached to coil ``coil_idx``, computes
+        For each beam endpoint spec attached to coil ``coil_idx``, computes
         the beam displacement at each surface node ``k`` as
 
         .. math::
@@ -771,15 +832,16 @@ class SupportBeams(SupportFixed):
             u_{\\text{beam},k}^b = u_{\\text{endpoint}}^b
                 + \\theta_{\\text{endpoint}}^b \\times r_k^b
 
-        where :math:`r_k^b = x_k - x_{\\text{endpoint,rest}}^b` and
-        :math:`x_{\\text{endpoint,rest}}^b` is obtained via ``gamma_eval``.
-        Returns the weight-averaged value across all endpoints.
+        where :math:`r_k^b` is the moment arm in the endpoint's frame
+        (surface points shifted by the symmetry transform and projected
+        relative to the endpoint).  The result is mapped back to the coil
+        frame using the inverse symmetry transform.
 
         Parameters
         ----------
         coil_idx : int
         surface_pts : jax.Array, shape ``(n_surf, 3)``
-        curve_jax : CurveXYZFourierJAX
+        curves_jax : list[CurveXYZFourierJAX]
         dofs : dict
         state : dict
             Must contain ``'u_s'`` : jax.Array, shape ``(n_support_dofs,)``.
@@ -788,79 +850,40 @@ class SupportBeams(SupportFixed):
         -------
         jax.Array, shape ``(n_surf, 3)``
         """
-        u_s = state['u_s']                               # (12 * N_beams,)
-        u_beams = u_s.reshape(self.n_beams_total, 12)    # (N_beams, 12)
+        u_s    = state['u_s']                            # (12 * N_beams,)
+        u_beams = u_s.reshape(self.n_beams_total, 12)   # (N_beams, 12)
+        n_surf  = surface_pts.shape[0]
 
-        i = coil_idx
-        n_surf = surface_pts.shape[0]
-        phi_start_cc = dofs['phi_start_cc']
-        phi_end_cc   = dofs['phi_end_cc']
-        phi_start_cf = dofs['phi_start_cf']
+        geom   = self._beam_geometry(curves_jax, dofs)
+        gamma3 = self._direction_cosine_matrices(geom, dofs)
+        specs  = self._endpoint_specs(geom, gamma3)
 
         w_total      = jnp.zeros(n_surf)
         u_attach_num = jnp.zeros((n_surf, 3))
 
-        # --- CC beams: node-1 side ---
-        for j in range(self.n_beam_cc):
-            b = i * self.n_beams_per_coil + j
-            phi_s    = phi_start_cc[i, j]
-            x_node1  = curve_jax.gamma_eval(phi_s)
-            u_ep     = u_beams[b, 0:3]
-            theta_ep = u_beams[b, 3:6]
-            r_k = surface_pts - x_node1[None, :]
+        for spec in specs:
+            if spec['coil'] != coil_idx:
+                continue
+
+            b          = spec['b']
+            node_side  = spec['node_side']
+            t_off      = 6 * node_side
+
+            w_k, r_k   = self._clamp_weights_for_spec(spec, surface_pts, dofs)
+            u_ep       = u_beams[b, t_off     : t_off + 3]
+            theta_ep   = u_beams[b, t_off + 3 : t_off + 6]
+
+            # Rigid-body displacement in the endpoint frame
             u_beam_k = u_ep[None, :] + jax.vmap(
                 lambda r: jnp.cross(theta_ep, r))(r_k)
-            t_raw = curve_jax.gamma_eval(phi_s, diff_order=1)
-            t_dir = t_raw / (jnp.linalg.norm(t_raw) + 1e-300)
-            w_k = self.clamp_fn(surface_pts, curve_jax, dofs, t_dir)
+
+            # Map back to coil frame
+            u_beam_k = self._apply_end_transform(u_beam_k, spec['tfm'], inverse=True)
+
             w_total      = w_total + w_k
             u_attach_num = u_attach_num + w_k[:, None] * u_beam_k
 
-        # --- CC beams: node-2 side (incoming from other coils) ---
-        for src_i in range(self.n_base):
-            if self._end_coil_local_idx[src_i] == i:
-                end_tfm = self._end_coil_transform[src_i]
-                for j in range(self.n_beam_cc):
-                    b = src_i * self.n_beams_per_coil + j
-                    phi_e    = phi_end_cc[src_i, j]
-                    # x_node2 in global frame: transform the raw curve point
-                    x_node2_raw = curve_jax.gamma_eval(phi_e)
-                    x_node2     = self._apply_end_transform(x_node2_raw, end_tfm)
-                    u_ep        = u_beams[b, 6:9]
-                    theta_ep    = u_beams[b, 9:12]
-                    # r_k uses possibly-transformed surface positions for the moment arm.
-                    # For end_tfm='none' this is exact; for wrap-around it is approximate.
-                    surf_tfm = self._apply_end_transform(surface_pts, end_tfm)
-                    r_k = surf_tfm - x_node2[None, :]
-                    u_beam_k = u_ep[None, :] + jax.vmap(
-                        lambda r: jnp.cross(theta_ep, r))(r_k)
-                    # Return beam displacement to original frame for coil coupling
-                    # (For 'none', no-op; for 'flip'/'rotate', invert transform)
-                    u_beam_k = self._apply_end_transform(u_beam_k, end_tfm)
-                    t_raw = curve_jax.gamma_eval(phi_e, diff_order=1)
-                    t_dir = -t_raw / (jnp.linalg.norm(t_raw) + 1e-300)
-                    w_k = self.clamp_fn(surface_pts, curve_jax, dofs, t_dir)
-                    w_total      = w_total + w_k
-                    u_attach_num = u_attach_num + w_k[:, None] * u_beam_k
-
-        # --- CF beams: node-1 side ---
-        for j in range(self.n_beam_cf):
-            b = i * self.n_beams_per_coil + self.n_beam_cc + j
-            phi_s    = phi_start_cf[i, j]
-            x_node1  = curve_jax.gamma_eval(phi_s)
-            u_ep     = u_beams[b, 0:3]
-            theta_ep = u_beams[b, 3:6]
-            r_k = surface_pts - x_node1[None, :]
-            u_beam_k = u_ep[None, :] + jax.vmap(
-                lambda r: jnp.cross(theta_ep, r))(r_k)
-            t_raw = curve_jax.gamma_eval(phi_s, diff_order=1)
-            t_dir = t_raw / (jnp.linalg.norm(t_raw) + 1e-300)
-            w_k = self.clamp_fn(surface_pts, curve_jax, dofs, t_dir)
-            w_total      = w_total + w_k
-            u_attach_num = u_attach_num + w_k[:, None] * u_beam_k
-
-        # Weighted average; guard against division by zero
-        w_safe = jnp.where(w_total > 1e-300, w_total, jnp.ones_like(w_total))
+        w_safe   = jnp.where(w_total > 1e-300, w_total, jnp.ones_like(w_total))
         u_attach = jnp.where(
             (w_total > 1e-300)[:, None],
             u_attach_num / w_safe[:, None],
@@ -882,7 +905,7 @@ class SupportBeams(SupportFixed):
         **Physics convention:**
         For a spring connecting beam endpoint ``b`` (translation DOF ``u_b``,
         rotation DOF ``θ_b``) to coil surface node ``k`` with weight ``w_k^b``
-        and moment-arm ``r_k^b = x_k - x_{b,\\text{rest}}``:
+        and moment-arm ``r_k^b`` (in the endpoint's local frame):
 
         .. math::
 
@@ -921,126 +944,66 @@ class SupportBeams(SupportFixed):
         """
         curves = self._reconstruct_curves(base_curves_dofs)
         geom   = self._beam_geometry(curves, support_dofs)
+        gamma3 = self._direction_cosine_matrices(geom, support_dofs)
+        specs  = self._endpoint_specs(geom, gamma3)
 
         I_cs_list, J_cs_list, V_cs_list = [], [], []
         I_sc_list, J_sc_list, V_sc_list = [], [], []
 
-        phi_start_cc = support_dofs['phi_start_cc']
-        phi_end_cc   = support_dofs['phi_end_cc']
-        phi_start_cf = support_dofs['phi_start_cf']
+        for spec in specs:
+            coil_i    = spec['coil']
+            b         = spec['b']
+            node_side = spec['node_side']
 
-        def _add_coil_endpoint_coupling(
-            coil_i: int,
-            b: int,
-            node_side: int,
-            geom_x_endpoint: jax.Array,
-            phi_approx,
-            direction: jax.Array,
-        ):
-            """Add K_cs / K_sc triplets for one beam endpoint coupled to coil_i."""
-            surf_pts = surface_pts_by_coil[coil_i]        # (n_surf, 3)
-            surf_idx = surface_node_indices_by_coil[coil_i]  # (n_surf,) int
+            surf_pts = surface_pts_by_coil[coil_i]
+            surf_idx = surface_node_indices_by_coil[coil_i]
             n_surf   = surf_pts.shape[0]
 
-            curve_i  = curves[coil_i]
-            w_k = self.clamp_fn(surf_pts, curve_i, support_dofs, direction)  # (n_surf,)
-
-            # Moment arm: r_k = surf_pts[k] - x_endpoint
-            r_k = surf_pts - geom_x_endpoint[None, :]    # (n_surf, 3)
+            w_k, r_k = self._clamp_weights_for_spec(spec, surf_pts, support_dofs)
 
             t_off = 6 * node_side          # translation DOF within beam (0 or 6)
             r_off = 6 * node_side + 3      # rotation DOF within beam (3 or 9)
 
-            # Global beam DOF offsets in the merged system
             beam_trans_global_base = support_dof_offset + 12 * b + t_off
             beam_rot_global_base   = support_dof_offset + 12 * b + r_off
 
             # ── K_cs: coil rows, beam cols ──────────────────────────────────
             for k in range(n_surf):
-                node_global = int(surf_idx[k])
+                node_global   = int(surf_idx[k])
                 coil_dof_base = coil_dof_offsets[coil_i] + 3 * node_global
-                w = w_k[k]                     # scalar weight at node k
-                r = r_k[k]                     # (3,) moment arm at node k
-                skew_r = _skew(r)              # (3, 3)
+                w      = w_k[k]
+                r      = r_k[k]
+                skew_r = _skew(r)
 
-                for d1 in range(3):            # coil translation component
+                for d1 in range(3):
                     coil_dof = coil_dof_base + d1
-                    # Translation–translation: -k_lin * w * I_3
                     I_cs_list.append(coil_dof)
                     J_cs_list.append(beam_trans_global_base + d1)
                     V_cs_list.append(-self.k_lin * w)
-                    # Translation–rotation: +k_lin * w * [r]×  (row d1)
-                    for d2 in range(3):        # beam rotation component
+                    for d2 in range(3):
                         I_cs_list.append(coil_dof)
                         J_cs_list.append(beam_rot_global_base + d2)
                         V_cs_list.append(self.k_lin * w * skew_r[d1, d2])
 
             # ── K_sc: beam rows, coil cols ──────────────────────────────────
             for k in range(n_surf):
-                node_global = int(surf_idx[k])
+                node_global   = int(surf_idx[k])
                 coil_dof_base = coil_dof_offsets[coil_i] + 3 * node_global
-                w = w_k[k]
-                r = r_k[k]
+                w      = w_k[k]
+                r      = r_k[k]
                 skew_r = _skew(r)
 
-                for d2 in range(3):            # coil translation component
-                    coil_dof = coil_dof_base + d2
-                    # Beam translation, coil translation: -k_lin * w * I_3
+                for d2 in range(3):
+                    coil_dof       = coil_dof_base + d2
                     beam_trans_dof = beam_trans_global_base + d2
                     I_sc_list.append(beam_trans_dof)
                     J_sc_list.append(coil_dof)
                     V_sc_list.append(-self.k_lin * w)
-                    # Beam rotation, coil translation: +k_tor * w * [r]×  (col d2)
-                    for d1 in range(3):        # beam rotation component
+                    for d1 in range(3):
                         I_sc_list.append(beam_rot_global_base + d1)
                         J_sc_list.append(coil_dof)
                         V_sc_list.append(self.k_tor * w * skew_r[d1, d2])
 
-        # Iterate over beams in the same order as _endpoint_weights_and_r
-        for i, curve_i in enumerate(curves):
-            end_idx = self._end_coil_local_idx[i]
-            end_tfm = self._end_coil_transform[i]
-
-            # ── CC beams for coil i ──────────────────────────────────────────
-            for j in range(self.n_beam_cc):
-                b = i * self.n_beams_per_coil + j
-                t_b = geom['t_beam'][b]
-
-                # Node-1 side: coupled to coil i
-                x_node1 = geom['x_start'][b]
-                t_dir1 = t_b / (jnp.linalg.norm(t_b) + 1e-300)
-                _add_coil_endpoint_coupling(
-                    i, b, node_side=0,
-                    geom_x_endpoint=x_node1,
-                    phi_approx=phi_start_cc[i, j],
-                    direction=t_dir1,
-                )
-
-                # Node-2 side: coupled to coil end_idx
-                x_node2 = geom['x_end'][b]
-                t_dir2 = -t_b / (jnp.linalg.norm(t_b) + 1e-300)
-                _add_coil_endpoint_coupling(
-                    end_idx, b, node_side=1,
-                    geom_x_endpoint=x_node2,
-                    phi_approx=phi_end_cc[i, j],
-                    direction=t_dir2,
-                )
-
-            # ── CF beams for coil i ──────────────────────────────────────────
-            for j in range(self.n_beam_cf):
-                b = i * self.n_beams_per_coil + self.n_beam_cc + j
-                t_b = geom['t_beam'][b]
-                x_node1 = geom['x_start'][b]
-                t_dir1 = t_b / (jnp.linalg.norm(t_b) + 1e-300)
-                _add_coil_endpoint_coupling(
-                    i, b, node_side=0,
-                    geom_x_endpoint=x_node1,
-                    phi_approx=phi_start_cf[i, j],
-                    direction=t_dir1,
-                )
-                # Node-2 (foundation) has no coil coupling — skip.
-
-        # Convert collected scalars/arrays to JAX arrays
         if not I_cs_list:
             empty_i = jnp.zeros(0, dtype=jnp.int32)
             empty_v = jnp.zeros(0)
@@ -1049,17 +1012,13 @@ class SupportBeams(SupportFixed):
                 'I_sc': empty_i, 'J_sc': empty_i, 'V_sc': empty_v,
             }
 
-        I_cs = jnp.array(I_cs_list, dtype=jnp.int32)
-        J_cs = jnp.array(J_cs_list, dtype=jnp.int32)
-        V_cs = jnp.stack(V_cs_list)
-
-        I_sc = jnp.array(I_sc_list, dtype=jnp.int32)
-        J_sc = jnp.array(J_sc_list, dtype=jnp.int32)
-        V_sc = jnp.stack(V_sc_list)
-
         return {
-            'I_cs': I_cs, 'J_cs': J_cs, 'V_cs': V_cs,
-            'I_sc': I_sc, 'J_sc': J_sc, 'V_sc': V_sc,
+            'I_cs': jnp.array(I_cs_list, dtype=jnp.int32),
+            'J_cs': jnp.array(J_cs_list, dtype=jnp.int32),
+            'V_cs': jnp.stack(V_cs_list),
+            'I_sc': jnp.array(I_sc_list, dtype=jnp.int32),
+            'J_sc': jnp.array(J_sc_list, dtype=jnp.int32),
+            'V_sc': jnp.stack(V_sc_list),
         }
 
     # ============================================================================
@@ -1070,95 +1029,62 @@ class SupportBeams(SupportFixed):
         self,
         curves: list[CurveXYZFourierJAX],
         geom: dict,
+        gamma3: jax.Array,
         support_dofs: dict,
         surface_pts_by_coil: list[jax.Array],
     ) -> list[dict]:
-        """Compute per-beam endpoint spring weight arrays and moment-arm vectors.
+        """Per-beam endpoint spring weights and moment arms.
 
-        For each beam, returns a list of at most two endpoint dicts (one per
-        coupled endpoint).  Each dict contains:
+        Returns a list of length ``N_beams``.  Each element is a list of
+        endpoint dicts (two per CC beam, two per CF beam) with keys:
 
-        * ``'w'``        — weight array ``(n_surface_nodes,)`` from ``clamp_fn``.
-        * ``'r'``        — moment-arm array ``(n_surface_nodes, 3)``:
-          ``surface_pts[k] - x_endpoint`` for each surface node ``k``.
-        * ``'node_side'``— ``0`` (node-1) or ``1`` (node-2).
-
-        For CF beam foundation sides, ``w`` is a scalar ``1.0`` and ``r``
-        is a single ``(3,)`` vector (no surface-node index).
+        * ``'w'``           — weight array ``(n_surf,)`` or scalar ``1.0``.
+        * ``'r'``           — moment-arm array ``(n_surf, 3)`` or ``(3,)``.
+        * ``'node_side'``   — ``0`` or ``1``.
+        * ``'coil'``        — base-coil index (absent for foundation entries).
+        * ``'is_foundation'``— present and ``True`` for CF node-2 entries.
 
         Parameters
         ----------
         curves : list[CurveXYZFourierJAX]
         geom : dict  — output of :meth:`_beam_geometry`.
+        gamma3 : jax.Array, shape ``(N_beams, 3, 3)``
+            Output of :meth:`_direction_cosine_matrices`, passed in from
+            :meth:`coo` so it is computed only once.
         support_dofs : dict
         surface_pts_by_coil : list[jax.Array]
-            One ``(n_surface_nodes_i, 3)`` array per base coil, giving the
-            current surface node positions (traced through coil DOFs).
+            One ``(n_surf_i, 3)`` array per base coil.
 
         Returns
         -------
         list of length ``N_beams``, each element a list of endpoint dicts.
         """
-        phi_start_cc = support_dofs['phi_start_cc']
-        phi_end_cc   = support_dofs['phi_end_cc']
-        phi_start_cf = support_dofs['phi_start_cf']
-        x_foundation = support_dofs['x_foundation']
-        t_beam       = geom['t_beam']  # (N, 3)
+        x_foundation  = support_dofs['x_foundation']
+        specs         = self._endpoint_specs(geom, gamma3)
 
-        beam_endpoints = []
-        beam_b = 0  # flat beam index
+        # Group coil-side specs by beam index
+        beam_eps: list[list] = [[] for _ in range(self.n_beams_total)]
+        for spec in specs:
+            surf_pts = surface_pts_by_coil[spec['coil']]
+            w_k, r_k = self._clamp_weights_for_spec(spec, surf_pts, support_dofs)
+            beam_eps[spec['b']].append({
+                'w': w_k, 'r': r_k,
+                'node_side': spec['node_side'],
+                'coil': spec['coil'],
+            })
 
-        for i, curve_i in enumerate(curves):
-            surf_i = surface_pts_by_coil[i]   # (n_surf_i, 3)
-            end_idx = self._end_coil_local_idx[i]
-            end_tfm = self._end_coil_transform[i]
-            surf_end = surface_pts_by_coil[end_idx]  # surface nodes of end coil
-
-            # ── CC beams ─────────────────────────────────────────────────────
-            for j in range(self.n_beam_cc):
-                b = beam_b
-                t_b = t_beam[b]        # (3,) unit beam tangent
-
-                # Node-1 side (coil i)
-                x_node1 = geom['x_start'][b]   # (3,)
-                w1 = self.clamp_fn(surf_i, curve_i, support_dofs, t_b)
-                r1 = surf_i - x_node1[None, :]  # (n_surf_i, 3)
-
-                # Node-2 side (coil end_idx, possibly transformed)
-                x_node2 = geom['x_end'][b]     # (3,)
-                phi_e   = phi_end_cc[i, j]
-                curve_end = curves[end_idx]
-                w2 = self.clamp_fn(surf_end, curve_end, support_dofs, -t_b)
-                # Transform surface points to the same frame as x_node2
-                surf_end_tfm = self._apply_end_transform(surf_end, end_tfm)
-                r2 = surf_end_tfm - x_node2[None, :]  # (n_surf_end, 3)
-
-                beam_endpoints.append([
-                    {'w': w1, 'r': r1, 'node_side': 0},
-                    {'w': w2, 'r': r2, 'node_side': 1},
-                ])
-                beam_b += 1
-
-            # ── CF beams ─────────────────────────────────────────────────────
+        # Append foundation entries for CF beams (node-2 side, no clamp)
+        for i in range(self.n_base):
             for j in range(self.n_beam_cf):
-                b = beam_b
-                t_b = t_beam[b]
+                b      = i * self.n_beams_per_coil + self.n_beam_cc + j
+                x_ep   = geom['x_end'][b]                  # = x_foundation[i, j]
+                r_fnd  = x_foundation[i, j] - x_ep         # ~zero at rest
+                beam_eps[b].append({
+                    'w': 1.0, 'r': r_fnd,
+                    'node_side': 1, 'is_foundation': True,
+                })
 
-                # Node-1 side (coil i)
-                x_node1 = geom['x_start'][b]
-                w1 = self.clamp_fn(surf_i, curve_i, support_dofs, t_b)
-                r1 = surf_i - x_node1[None, :]  # (n_surf_i, 3)
-
-                # Node-2 side (foundation — no clamp_fn; w=1 scalar)
-                x_node2    = geom['x_end'][b]    # = x_foundation[i, j]
-                r_found    = x_foundation[i, j] - x_node2  # should be ~zero at rest
-                beam_endpoints.append([
-                    {'w': w1, 'r': r1,     'node_side': 0},
-                    {'w': 1.0, 'r': r_found, 'node_side': 1, 'is_foundation': True},
-                ])
-                beam_b += 1
-
-        return beam_endpoints
+        return beam_eps
 
     def _spring_stiffness_contributions(
         self,
@@ -1278,9 +1204,9 @@ class SupportBeams(SupportFixed):
         base_curves_dofs : list[jax.Array]
             Traced coil DOF vectors, one per base coil.
         support_dofs : dict
-            Traced support DOF pytree containing ``phi_start_cc``,
-            ``phi_end_cc``, ``phi_start_cf``, ``x_foundation``,
-            ``theta_orientation_cc``, ``theta_orientation_cf``, and any
+            Traced support DOF pytree containing ``phis_start_cc``,
+            ``phis_end_cc``, ``phis_start_cf``, ``x_foundation``,
+            ``thetas_orientation_cc``, ``thetas_orientation_cf``, and any
             keys required by ``cross_section_fn`` and ``clamp_fn``.
         surface_pts_by_coil : list[jax.Array] or None
             Current surface node positions per coil, shape
@@ -1321,7 +1247,7 @@ class SupportBeams(SupportFixed):
         # 6. Endpoint spring contributions (diagonal K_ss part).
         if surface_pts_by_coil is not None:
             beam_endpoints = self._endpoint_weights_and_r(
-                curves, geom, support_dofs, surface_pts_by_coil
+                curves, geom, Gamma_3, support_dofs, surface_pts_by_coil
             )
             K_spring = self._spring_stiffness_contributions(beam_endpoints)
             K_beam = K_global + K_spring
@@ -1377,23 +1303,10 @@ class SupportBeams(SupportFixed):
                 else:
                     # Coil side: f += k_lin * Σ w_i u_mesh_i  (force target)
                     if u_mesh_by_coil is not None:
-                        # Identify which coil this endpoint belongs to
-                        # (node-1 → coil i; node-2 of CC → end_coil).
-                        # The ep dict was built in the same loop order, so we
-                        # access it via the ep's w and r dimensions.
-                        w   = ep['w']          # (n_surf,)
-                        # Weighted sum of coil surface displacements
-                        # u_mesh_by_coil is ordered by flat beam index;
-                        # for CC beams the end coil is stored in ep's r.
-                        # We use a heuristic: pick the coil index from beam b.
-                        coil_i = b // self.n_beams_per_coil
-                        if n == 0:
-                            coil_for_ep = coil_i
-                        else:
-                            coil_for_ep = self._end_coil_local_idx[coil_i]
-                        u_mesh = u_mesh_by_coil[coil_for_ep]  # (n_surf, 3)
-                        # f_trans += k_lin * Σ w_i u_mesh_i
-                        f_trans = self.k_lin * jnp.einsum('n,nd->d', w, u_mesh)  # (3,)
+                        w          = ep['w']               # (n_surf,)
+                        coil_for_ep = ep['coil']
+                        u_mesh     = u_mesh_by_coil[coil_for_ep]   # (n_surf, 3)
+                        f_trans    = self.k_lin * jnp.einsum('n,nd->d', w, u_mesh)
                         f = f.at[dof_base + t_off: dof_base + t_off + 3].add(f_trans)
 
         return f
@@ -1446,10 +1359,11 @@ class SupportBeams(SupportFixed):
         K_ss = K_ss.at[I, J].add(V)
 
         # Assemble RHS.
-        curves = self._reconstruct_curves(base_curves_dofs)
-        geom   = self._beam_geometry(curves, support_dofs)
+        curves  = self._reconstruct_curves(base_curves_dofs)
+        geom    = self._beam_geometry(curves, support_dofs)
+        gamma3  = self._direction_cosine_matrices(geom, support_dofs)
         beam_endpoints = self._endpoint_weights_and_r(
-            curves, geom, support_dofs, surface_pts_by_coil
+            curves, geom, gamma3, support_dofs, surface_pts_by_coil
         )
         f_s = self._assemble_rhs(geom, beam_endpoints, u_mesh_by_coil)
 

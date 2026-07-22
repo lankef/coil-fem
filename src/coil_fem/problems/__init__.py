@@ -5,7 +5,7 @@ Winkler BCs and thermal eigenstrain), :class:`DeviceProblem` (JAX
 device-assembly base class for the cuDSS solver backend), and the stub
 :class:`HeatConduction3D` from a single namespace::
 
-    from coil_fem.problem import LinearElasticity3D, DeviceProblem
+    from coil_fem.problems import LinearElasticity3D, DeviceProblem
 """
 
 from .device_problem import DeviceProblem

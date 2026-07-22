@@ -36,7 +36,7 @@ from jax_fem.solver import (
 _HAS_SPINEAX = importlib.util.find_spec("spineax") is not None
 
 _SPINEAX_INSTALL_HINT = (
-    "coil_fem.solver.cudss requires the optional GPU stack (spineax + "
+    "coil_fem.solvers.cudss requires the optional GPU stack (spineax + "
     "NVIDIA cuDSS), which is not installed. Install it with:\n"
     "  conda install -c conda-forge cuda-nvcc=<version>\n"
     '  pip install --no-build-isolation -e ".[cudss]"'
@@ -53,7 +53,7 @@ def _import_cudss_solver():
 
 if TYPE_CHECKING:
     from jax_fem.problem import Problem
-    from ..problem import LinearElasticity3D
+    from ..problems import LinearElasticity3D
 
 
 # ============================================================================

@@ -14,8 +14,8 @@ import jax
 import jax.flatten_util
 import jax.numpy as jnp
 
-from .problem import LinearElasticity3D, lame_parameters, itc_strain
-from .solver import build_fwd_pred, needs_gpu_assembly
+from .problems import LinearElasticity3D, lame_parameters, itc_strain
+from .solvers import build_fwd_pred, needs_gpu_assembly
 
 if TYPE_CHECKING:
     from .meshing import CoilMesh
@@ -25,9 +25,9 @@ class ElasticPipeline:
     """All per-coil state for a purely elastic differentiable FEM solve.
 
     Owns the :class:`~coil_fem.meshing.CoilMesh`, the
-    :class:`~coil_fem.problem.LinearElasticity3D` problem instance, and the
+    :class:`~coil_fem.problems.LinearElasticity3D` problem instance, and the
     differentiable forward-prediction callable built by
-    :func:`~coil_fem.solver.build_fwd_pred`.
+    :func:`~coil_fem.solvers.build_fwd_pred`.
 
     Parameters
     ----------
@@ -45,7 +45,7 @@ class ElasticPipeline:
     winkler_k : float
         Base Winkler spring stiffness [N/m³].
     problem_options : dict
-        Options forwarded to :func:`~coil_fem.solver.build_fwd_pred`.
+        Options forwarded to :func:`~coil_fem.solvers.build_fwd_pred`.
     """
 
     def __init__(
@@ -128,7 +128,7 @@ class ElasticPipeline:
     def solve_residual(self, params: dict) -> jnp.ndarray:
         """Compute the flat FEM residual vector at the zero-displacement solution.
 
-        Calls :meth:`~coil_fem.problem.LinearElasticity3D.set_params` then
+        Calls :meth:`~coil_fem.problems.LinearElasticity3D.set_params` then
         evaluates the residual ``R(0)`` (the negation of the load vector for
         a linear problem).  Used by the monolithic driver to assemble the
         merged right-hand side without re-running a full Newton solve.
@@ -154,9 +154,9 @@ class ElasticPipeline:
     def assemble_coo(self, params: dict) -> tuple:
         """Assemble the stiffness matrix in COO format (cuDSS path only).
 
-        Calls :meth:`~coil_fem.problem.LinearElasticity3D.set_params` then
+        Calls :meth:`~coil_fem.problems.LinearElasticity3D.set_params` then
         triggers a device-side Jacobian assembly via
-        :meth:`~coil_fem.problem.DeviceProblem.compute_newton_vars`, populating
+        :meth:`~coil_fem.problems.DeviceProblem.compute_newton_vars`, populating
         ``problem.V_jax``.  Returns the static ``I_jax``, ``J_jax`` index
         arrays together with the freshly assembled ``V_jax`` and the total DOF
         count.
