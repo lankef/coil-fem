@@ -30,10 +30,12 @@ Local beam frame: x along the centroidal axis, y and z as cross-section axes.
 
 from __future__ import annotations
 
+import jax.numpy as jnp
 import math
+
+from ..utils import clamp_sigmoid
 from typing import Callable
 
-import jax.numpy as jnp
 
 def bool_to_sign(a):
     if a:
@@ -80,21 +82,23 @@ def solid_circle(support_dofs: dict):
     J  = jnp.pi * r ** 4 / 2.0
     return A, I, I, J
 
-def solid_circle_clamp(surface_pts_beam_frame, clamp_point, sign_x, dofs, constants):
+def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, constants):
     pts_x = surface_pts_beam_frame[:, 0]
     pts_y = surface_pts_beam_frame[:, 1]
     pts_z = surface_pts_beam_frame[:, 2]
     r = dofs['r_beam']
     
     in_correct_direction = jnp.where(
-        bool_to_sign(sign_x) * pts_x <= 0,
-        1
+        bool_to_sign(sign_x) * pts_x >= 0,
+        1, 0
     )
-
-    in_long_cylinder = jnp.where(
-        pts_y**2 + pts_z**2 <= r**2,
-        1
+    distance_sq = pts_y**2 + pts_z**2
+    return in_correct_direction * clamp_sigmoid(
+        distance_sq=distance_sq,
+        r_attachment=constants['r_attachment'], 
+        sigmoid_eps=constants['sigmoid_eps'],
     )
+    
 
 # ============================================================================
 # Solid rectangle
@@ -196,3 +200,5 @@ def hollow_circle(support_dofs: dict) -> Callable:
     I  = jnp.pi * (r_o ** 4 - r_i ** 4) / 4.0
     J  = jnp.pi * (r_o ** 4 - r_i ** 4) / 2.0
     return A, I, I, J
+
+hollow_circle_attachment = solid_circle_attachment

@@ -61,7 +61,7 @@ def _constant_section_fn(A_val=1e-4, Iy_val=1e-8, Iz_val=1e-8, J_val=2e-8):
     return fn
 
 
-def _uniform_clamp_fn(surface_pts_beam_frame, dofs, sign_x):
+def _uniform_clamp_fn(surface_pts_beam_frame, dofs, sign_x, constants):
     """Returns uniform unit weights (all surface nodes equally clamped)."""
     return jnp.ones(surface_pts_beam_frame.shape[0])
 
@@ -72,23 +72,26 @@ def _make_support_beams(
     n_beam_cf: int = 1,
     nfp: int = 2,
     stellsym: bool = False,
-    support_fns=None,
+    fixed_clamp_fns=None,
 ) -> SupportBeams:
     """Build a minimal SupportBeams instance for testing."""
     curves = [_make_circle(N=8, R=1.0 + 0.1 * i) for i in range(n_base)]
+    constants = {
+        'nfp': nfp,
+        'stellsym': stellsym,
+        'n_beam_cc': n_beam_cc,
+        'n_beam_cf': n_beam_cf,
+        'E': 200e9,
+        'nu': 0.3,
+        'k_lin': 1e8,
+        'k_tor': 1e4,
+    }
     return SupportBeams(
+        constants=constants,
         base_curves_jax=curves,
-        nfp=nfp,
-        stellsym=stellsym,
-        n_beam_cc=n_beam_cc,
-        n_beam_cf=n_beam_cf,
-        E=200e9,
-        nu=0.3,
         cross_section_fn=_constant_section_fn(),
-        clamp_fn=_uniform_clamp_fn,
-        k_lin=1e8,
-        k_tor=1e4,
-        support_fns=support_fns,
+        attachment_fn=_uniform_clamp_fn,
+        fixed_clamp_fns=fixed_clamp_fns,
     )
 
 
@@ -297,17 +300,17 @@ def test_support_beams_grad_through_x_foundation():
 
 
 # ============================================================================
-# 7. compute_weights pass-through via SupportFixed
+# 7. compute_weights pass-through via Support
 # ============================================================================
 
 def test_support_beams_compute_weights_passthrough():
-    """When dofs=None, compute_weights delegates to SupportFixed (returns support_fns result)."""
+    """When dofs=None, compute_weights delegates to Support (returns fixed_clamp_fns result)."""
     n_surf = 12
     # A constant weight function that returns 0.5 for all nodes
     def half_fn(surface_pts, curve_jax, dofs):
         return jnp.full(surface_pts.shape[0], 0.5)
 
-    sb     = _make_support_beams(n_base=2, support_fns=half_fn)
+    sb     = _make_support_beams(n_base=2, fixed_clamp_fns=half_fn)
     curves = sb.base_curves_jax          # list[CurveXYZFourierJAX]
     surf   = jnp.ones((n_surf, 3))
 
@@ -383,24 +386,26 @@ def test_support_beams_end_side_gradient():
     n_base, n_cc, n_cf = 2, 1, 0
     nfp = 2
 
-    def sigmoid_clamp_fn(surface_pts_beam_frame, dofs, sign_x):
+    def sigmoid_clamp_fn(surface_pts_beam_frame, dofs, sign_x, constants):
         """Sigmoid of max distance in beam frame — smoothly differentiable."""
         d = jnp.sqrt(jnp.sum(surface_pts_beam_frame ** 2, axis=1) + 1e-8)
         return jax.nn.sigmoid(1.0 - d)
 
     base_curves = [_make_circle(N=8, R=1.0 + 0.1 * i) for i in range(n_base)]
     sb = SupportBeams(
+        constants={
+            'nfp': nfp,
+            'stellsym': False,
+            'n_beam_cc': n_cc,
+            'n_beam_cf': n_cf,
+            'E': 200e9,
+            'nu': 0.3,
+            'k_lin': 1e8,
+            'k_tor': 1e4,
+        },
         base_curves_jax=base_curves,
-        nfp=nfp,
-        stellsym=False,
-        n_beam_cc=n_cc,
-        n_beam_cf=n_cf,
-        E=200e9,
-        nu=0.3,
         cross_section_fn=_constant_section_fn(),
-        clamp_fn=sigmoid_clamp_fn,
-        k_lin=1e8,
-        k_tor=1e4,
+        attachment_fn=sigmoid_clamp_fn,
     )
 
     sdofs = _make_support_dofs(n_base, n_cc, n_cf)

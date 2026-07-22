@@ -1,13 +1,12 @@
 """Simsopt-optimizable coil support models.
 
 A *support* describes where a coil is structurally clamped.  Each concrete
-subclass of :class:`CoilSupport` implements
-:meth:`~coil_fem.coupling.Support.compute_weights`, which returns per-surface-node
-Winkler spring weights in ``[0, 1]`` for a given base coil::
-
-    weights = coil_support.compute_weights(
-        coil_idx, surface_pts, curve_jax, support_dofs
-    )
+subclass of :class:`CoilSupport` holds a pure-functional
+:class:`~coil_fem.coupling.Support` (or
+:class:`~coil_fem.coupling.SupportBeams`) instance accessible via
+:attr:`CoilSupport.support`.  That functional object is passed directly to
+:class:`~coil_fem.CoilFEM`; the simsopt layer is responsible only for
+maintaining the DOF state.
 
 :class:`CoilSupport` holds the base coils (curves + currents), ``nfp``, and
 ``stellsym`` so that :class:`~coil_fem.simsopt.CoilFEMObjective` needs only a
@@ -24,11 +23,10 @@ from __future__ import annotations
 
 import numpy as np
 import jax.numpy as jnp
-from jax.nn import sigmoid
 from jax.flatten_util import ravel_pytree
 from ..presets import cross_section_fns
 from ..utils import fetch_attr
-from ..coupling import Support, SupportFixed, SupportBeams
+from ..coupling import Support, SupportBeams, make_clamp_fn, make_topbottom_fn
 
 try:
     from simsopt._core.optimizable import Optimizable
@@ -43,11 +41,9 @@ class CoilSupport(Optimizable):
 
     Holds the base coils (curves + currents), the symmetry parameters ``nfp``
     and ``stellsym``, and any optimisable support parameters (the ``dofs``
-    pytree).  Subclasses must also inherit a concrete
-    :class:`~coil_fem.coupling.Support` implementation (e.g.
-    :class:`~coil_fem.coupling.SupportFixed` or
-    :class:`~coil_fem.coupling.SupportBeams`) and call that class's
-    ``__init__`` explicitly before calling ``super().__init__``.
+    pytree).  The functional support model is stored in :attr:`support` and is
+    passed directly to :class:`~coil_fem.CoilFEM`; subclasses do **not** need
+    to inherit :class:`~coil_fem.coupling.Support` themselves.
 
     Parameters
     ----------
@@ -58,14 +54,22 @@ class CoilSupport(Optimizable):
         Number of field periods.
     stellsym : bool
         Whether to apply stellarator symmetry during the symmetry expansion.
+    support : Support
+        Pure-functional support instance (e.g. a bare
+        :class:`~coil_fem.coupling.Support` with ``fixed_clamp_fns``, or a
+        :class:`~coil_fem.coupling.SupportBeams`).  Passed verbatim to
+        :class:`~coil_fem.CoilFEM` via :attr:`support`.
     support_dofs_jax : dict
         Optimisable support parameters.  Flattened into the simsopt DOF vector.
     constants : dict or None
-        Fixed (non-optimised) scalars forwarded to :meth:`compute_weights` via
-        :attr:`constants`.
+        Fixed (non-optimised) scalars for introspection (e.g. ``r_clamp``).
+        Not forwarded to the functional support; that object owns its own
+        constants.
     names : list[str] or None
         Optional DOF names, length equal to the flattened ``support_dofs_jax``
         size.
+    fixed : array-like or None
+        Boolean fixed-mask aligned with the flattened DOF vector.
     dofs : DOFs or None
         Simsopt ``DOFs`` object used to restore serialised state (passed by
         :meth:`from_dict` / :meth:`from_file`).  Leave as ``None`` when
@@ -77,6 +81,7 @@ class CoilSupport(Optimizable):
         base_coils: list,
         nfp: int,
         stellsym: bool,
+        support: Support,
         support_dofs_jax: dict,
         constants: dict | None = None,
         names=None,
@@ -89,11 +94,10 @@ class CoilSupport(Optimizable):
         self._base_coils = list(base_coils)
         self.nfp = int(nfp)
         self.stellsym = bool(stellsym)
+        self._support = support
 
         flat, self._unravel = ravel_pytree(support_dofs_jax)
         self.constants = dict(constants or {})
-        # np.array (not asarray) so the DOF buffer is writable: converting a
-        # JAX array via np.asarray yields a read-only view.
         if dofs is not None:
             Optimizable.__init__(self, dofs=dofs, depends_on=self._base_coils)
         else:
@@ -104,6 +108,15 @@ class CoilSupport(Optimizable):
                 fixed=fixed,
                 depends_on=self._base_coils,
             )
+
+    # ============================================================================
+    # Functional support accessor
+    # ============================================================================
+
+    @property
+    def support(self) -> Support:
+        """The pure-functional :class:`~coil_fem.coupling.Support` instance."""
+        return self._support
 
     # ============================================================================
     # Coil accessors
@@ -138,17 +151,28 @@ class CoilSupport(Optimizable):
         return np.asarray(ravel_pytree(grad_dofs)[0], dtype=float)
 
 
-class CoilSupportFixed(CoilSupport, SupportFixed):
-    """Support modelled as ``clamp_num`` clamps at optimisable arclengths.
+def _broadcast_phis(phis, n_coils, n_clamp):
+    if phis is None:
+        row = jnp.linspace(0.0, 1.0, n_clamp, endpoint=False)
+        phis_arr = jnp.broadcast_to(row, (n_coils, n_clamp))
+    else:
+        phis_arr = jnp.asarray(phis, dtype=float)
+        if phis_arr.ndim == 1:
+            phis_arr = jnp.broadcast_to(phis_arr, (n_coils, n_clamp))
+    return phis_arr
 
-    Each clamp is a sphere of radius ``clamp_radius`` centred on the coil at
+
+class CoilSupportFixed(CoilSupport):
+    """Support modelled as ``n_clamp`` clamps at optimisable arclengths.
+
+    Each clamp is a sphere of radius ``r_clamp`` centred on the coil at
     curve parameter ``phi``; the per-node weight is the (smooth) union of all
     clamp indicator spheres.  Only the clamp locations ``phis`` are DOFs;
-    ``clamp_radius``, ``sigmoid_eps`` and ``clamp_num`` are fixed.
+    ``r_clamp``, ``sigmoid_eps`` and ``n_clamp`` are fixed.
 
-    Holds a merged ``phis`` array of shape ``(n_coils, clamp_num)`` covering
+    Holds a merged ``phis`` array of shape ``(n_coils, n_clamp)`` covering
     all base coils; a single flat DOF vector of length
-    ``n_coils * clamp_num`` is registered with simsopt.
+    ``n_coils * n_clamp`` is registered with simsopt.
 
     Parameters
     ----------
@@ -158,16 +182,18 @@ class CoilSupportFixed(CoilSupport, SupportFixed):
         Number of field periods.
     stellsym : bool
         Whether to apply stellarator symmetry.
-    clamp_radius : float
-        Sphere radius [m] of each clamp (region of non-zero spring weight).
-    clamp_num : int
-        Number of clamps per coil (default 2).
-    sigmoid_eps : float
-        Edge sharpness of the clamp (default 0.1).
+    fixed_clamp_options : dict
+        Contains the following entries:
+        r_clamp : float
+            Sphere radius [m] of each clamp (region of non-zero spring weight).
+        n_clamp : int
+            Number of clamps per coil.
+        sigmoid_eps : float
+            Edge sharpness of the clamp (default 0.1).
     phis : array-like or None
-        Initial clamp locations, shape ``(n_coils, clamp_num)`` or
-        ``(clamp_num,)`` (broadcast to all coils).  ``None`` (default) spreads
-        ``clamp_num`` clamps uniformly via ``linspace(0, 1, clamp_num,
+        Initial clamp locations, shape ``(n_coils, n_clamp)`` or
+        ``(n_clamp,)`` (broadcast to all coils).  ``None`` (default) spreads
+        ``n_clamp`` clamps uniformly via ``linspace(0, 1, n_clamp,
         endpoint=False)`` for every coil.
     names : list[str] or None
         Optional DOF names.
@@ -180,103 +206,48 @@ class CoilSupportFixed(CoilSupport, SupportFixed):
         base_coils: list,
         nfp: int,
         stellsym: bool,
-        clamp_radius: float,
-        clamp_num: int = 2,
-        sigmoid_eps: float = 0.1,
+        fixed_clamp_options: dict,
         phis=None,
         names=None,
         dofs=None,
     ):
-        SupportFixed.__init__(self, support_fns=None)
-
         n_coils = len(base_coils)
-        clamp_radius = float(clamp_radius)
-        clamp_num = int(clamp_num)
 
-        if phis is None:
-            row = jnp.linspace(0.0, 1.0, clamp_num, endpoint=False)
-            phis_arr = jnp.broadcast_to(row, (n_coils, clamp_num))
-        else:
-            phis_arr = jnp.asarray(phis, dtype=float)
-            if phis_arr.ndim == 1:
-                phis_arr = jnp.broadcast_to(phis_arr, (n_coils, clamp_num))
+        try:
+            r_clamp = fixed_clamp_options['r_clamp']
+            n_clamp = fixed_clamp_options['n_clamp']
+        except KeyError:
+            raise KeyError(
+                "fixed_clamp_options must contain 'r_clamp' and 'n_clamp'."
+            )
+        sigmoid_eps = fixed_clamp_options.get('sigmoid_eps', 0.1)
 
-        self.clamp_radius = clamp_radius
-        self.clamp_num    = clamp_num
-        self.sigmoid_eps  = float(sigmoid_eps)
-        self.phis         = phis_arr
-        self.names        = names
+        phis_arr = _broadcast_phis(phis, n_coils, n_clamp)
+
+        # Build one closure per coil so Support.compute_weights can dispatch
+        # correctly even when the phis come from the simsopt DOF store.
+        fns = [
+            make_clamp_fn(i, r_clamp, sigmoid_eps, phis_arr[i])
+            for i in range(n_coils)
+        ]
 
         super().__init__(
             base_coils, nfp, stellsym,
+            support=Support(fixed_clamp_fns=fns),
             support_dofs_jax={'phis': phis_arr},
             constants={
-                'clamp_radius': clamp_radius,
+                'r_clamp': float(r_clamp),
                 'sigmoid_eps': float(sigmoid_eps),
             },
             names=names,
             dofs=dofs,
         )
 
-    @staticmethod
-    def support_fn(surface_points, curve_jax, phis_i, constants):
-        """Per-surface-node Winkler weights for one coil: smooth union of clamp spheres.
 
-        Parameters
-        ----------
-        surface_points : jax.Array, shape (n_surface_nodes, 3)
-        curve_jax : CurveXYZFourierJAX
-        phis_i : jax.Array, shape (clamp_num,)
-            Clamp arc-length locations for this coil.
-
-        Returns
-        -------
-        jax.Array, shape (n_surface_nodes,)
-        """
-        clamp_radius = constants['clamp_radius']
-        sigmoid_eps = constants['sigmoid_eps']
-        
-        gamma_support = curve_jax.gamma_eval(phis_i)            # (clamp_num, 3)
-        distances = jnp.sum(
-            (surface_points[:, None, :] - gamma_support[None, :, :]) ** 2,
-            axis=-1,
-        )                                           # (n_nodes, clamp_num)
-        sigmoid_width = sigmoid_eps * clamp_radius
-        w = sigmoid((clamp_radius**2 - distances) / (sigmoid_width**2))
-        return jnp.sum(w, axis=-1)                 # union of clamps
-
-    def compute_weights(self, coil_idx, surface_pts, curves_jax, dofs):
-        """Winkler weights for base coil ``coil_idx``.
-
-        Parameters
-        ----------
-        coil_idx : int
-        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
-        curves_jax : list[CurveXYZFourierJAX]
-            All base-coil curves; ``curves_jax[coil_idx]`` is used.
-        dofs : dict or None
-            Merged support dofs dict with key ``'phis'``, shape
-            ``(n_coils, clamp_num)``.  ``None`` falls back to the initial
-            ``phis`` stored at construction.
-
-        Returns
-        -------
-        jax.Array, shape ``(n_surface_nodes,)``
-        """
-        if dofs is None:
-            phis_i = self.phis[coil_idx]
-        else:
-            phis_i = dofs['phis'][coil_idx]
-        return self.support_fn(
-            surface_pts, curves_jax[coil_idx], phis_i,
-            constants=self.constants,
-        )
-
-
-class CoilSupportTopBottom(CoilSupport, SupportFixed):
+class CoilSupportTopBottom(CoilSupport):
     """Static soft-sphere support at the top and bottom of the coil centreline.
 
-    Has no optimisable DOFs (``support_dofs_jax={}``); ``clamp_radius`` and
+    Has no optimisable DOFs (``support_dofs_jax={}``); ``r_clamp`` and
     ``sigmoid_eps`` are fixed constants.
 
     Parameters
@@ -287,10 +258,12 @@ class CoilSupportTopBottom(CoilSupport, SupportFixed):
         Number of field periods.
     stellsym : bool
         Whether to apply stellarator symmetry.
-    clamp_radius : float
-        Sphere radius [m] around the top and bottom curve points.
-    sigmoid_eps : float
-        Edge sharpness of each sphere (default 0.1).
+    fixed_clamp_options : dict
+        Contains the following entries:
+        r_clamp : float
+            Sphere radius [m] of each clamp (region of non-zero spring weight).
+        sigmoid_eps : float
+            Edge sharpness of the clamp (default 0.1).
     dofs : DOFs or None
         Simsopt ``DOFs`` object for restoring serialised state.
     """
@@ -300,175 +273,38 @@ class CoilSupportTopBottom(CoilSupport, SupportFixed):
         base_coils: list,
         nfp: int,
         stellsym: bool,
-        clamp_radius: float,
-        sigmoid_eps: float = 0.1,
+        fixed_clamp_options: dict,
         dofs=None,
     ):
-        SupportFixed.__init__(self, support_fns=None)
-
-        self.clamp_radius = float(clamp_radius)
-        self.sigmoid_eps  = float(sigmoid_eps)
+        try:
+            r_clamp = fixed_clamp_options['r_clamp']
+        except KeyError:
+            raise KeyError("fixed_clamp_options must contain 'r_clamp'.")
+        sigmoid_eps = fixed_clamp_options.get('sigmoid_eps', 0.1)
 
         super().__init__(
             base_coils, nfp, stellsym,
+            support=Support(fixed_clamp_fns=make_topbottom_fn(float(r_clamp), float(sigmoid_eps))),
             support_dofs_jax={},
             constants={
-                'clamp_radius': float(clamp_radius),
+                'r_clamp': float(r_clamp),
                 'sigmoid_eps': float(sigmoid_eps),
             },
             dofs=dofs,
         )
 
-    @staticmethod
-    def support_fn(surface_points, curve_jax, *, clamp_radius, sigmoid_eps):
-        """Per-surface-node weights: soft union of top and bottom spheres.
 
-        Parameters
-        ----------
-        surface_points : jax.Array, shape (n_surface_nodes, 3)
-        curve_jax : CurveXYZFourierJAX
-        clamp_radius : float
-        sigmoid_eps : float
-
-        Returns
-        -------
-        jax.Array, shape (n_surface_nodes,)
-        """
-        gamma  = curve_jax.gamma()                         # (n_quad, 3)
-        top    = gamma[jnp.argmax(gamma[:, 2])]            # (3,) highest point
-        bottom = gamma[jnp.argmin(gamma[:, 2])]            # (3,) lowest point
-
-        d_top    = jnp.sum((surface_points - top)**2,    axis=-1)
-        d_bottom = jnp.sum((surface_points - bottom)**2, axis=-1)
-
-        sigmoid_width = sigmoid_eps * clamp_radius
-        w_top    = sigmoid((clamp_radius**2 - d_top)   / (sigmoid_width**2))
-        w_bottom = sigmoid((clamp_radius**2 - d_bottom) / (sigmoid_width**2))
-        return w_top + w_bottom
-
-    def compute_weights(self, coil_idx, surface_pts, curves_jax, dofs):
-        """Winkler weights for base coil ``coil_idx``.
-
-        Parameters
-        ----------
-        coil_idx : int
-            Ignored (same top/bottom logic applied to every coil).
-        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
-        curves_jax : list[CurveXYZFourierJAX]
-            All base-coil curves; ``curves_jax[coil_idx]`` is forwarded.
-        dofs : dict or None
-            Ignored (no optimisable DOFs).
-
-        Returns
-        -------
-        jax.Array, shape ``(n_surface_nodes,)``
-        """
-        return self.support_fn(
-            surface_pts, curves_jax[coil_idx],
-            constants=self.constants,
-        )
+_REQUIRED_BEAM_OPTIONS = (
+    'n_beam_cc',
+    'n_beam_cf',
+    'E',
+    'nu',
+    'k_lin',
+    'k_tor',
+)
 
 
-class CoilSupportTopBottom(CoilSupport, SupportFixed):
-    """Static soft-sphere support at the top and bottom of the coil centreline.
-
-    Has no optimisable DOFs (``support_dofs_jax={}``); ``clamp_radius`` and
-    ``sigmoid_eps`` are fixed constants.
-
-    Parameters
-    ----------
-    base_coils : list
-        Simsopt ``Coil`` objects (before symmetry expansion).
-    nfp : int
-        Number of field periods.
-    stellsym : bool
-        Whether to apply stellarator symmetry.
-    clamp_radius : float
-        Sphere radius [m] around the top and bottom curve points.
-    sigmoid_eps : float
-        Edge sharpness of each sphere (default 0.1).
-    dofs : DOFs or None
-        Simsopt ``DOFs`` object for restoring serialised state.
-    """
-
-    def __init__(
-        self,
-        base_coils: list,
-        nfp: int,
-        stellsym: bool,
-        clamp_radius: float,
-        sigmoid_eps: float = 0.1,
-        dofs=None,
-    ):
-        SupportFixed.__init__(self, support_fns=None)
-
-        self.clamp_radius = float(clamp_radius)
-        self.sigmoid_eps  = float(sigmoid_eps)
-
-        super().__init__(
-            base_coils, nfp, stellsym,
-            support_dofs_jax={},
-            constants={
-                'clamp_radius': float(clamp_radius),
-                'sigmoid_eps': float(sigmoid_eps),
-            },
-            dofs=dofs,
-        )
-
-    @staticmethod
-    def support_fn(surface_points, curve_jax, constants):
-        """Per-surface-node weights: soft union of top and bottom spheres.
-
-        Parameters
-        ----------
-        surface_points : jax.Array, shape (n_surface_nodes, 3)
-        curve_jax : CurveXYZFourierJAX
-        clamp_radius : float
-        sigmoid_eps : float
-
-        Returns
-        -------
-        jax.Array, shape (n_surface_nodes,)
-        """
-        clamp_radius = constants['clamp_radius']
-        sigmoid_eps = constants['sigmoid_eps']
-        
-        gamma  = curve_jax.gamma()                         # (n_quad, 3)
-        top    = gamma[jnp.argmax(gamma[:, 2])]            # (3,) highest point
-        bottom = gamma[jnp.argmin(gamma[:, 2])]            # (3,) lowest point
-
-        d_top    = jnp.sum((surface_points - top)**2,    axis=-1)
-        d_bottom = jnp.sum((surface_points - bottom)**2, axis=-1)
-
-        sigmoid_width = sigmoid_eps * clamp_radius
-        w_top    = sigmoid((clamp_radius**2 - d_top)   / (sigmoid_width**2))
-        w_bottom = sigmoid((clamp_radius**2 - d_bottom) / (sigmoid_width**2))
-        return w_top + w_bottom
-
-    def compute_weights(self, coil_idx, surface_pts, curves_jax, dofs):
-        """Winkler weights for base coil ``coil_idx``.
-
-        Parameters
-        ----------
-        coil_idx : int
-            Ignored (same top/bottom logic applied to every coil).
-        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
-        curves_jax : list[CurveXYZFourierJAX]
-            All base-coil curves; ``curves_jax[coil_idx]`` is forwarded.
-        dofs : dict or None
-            Ignored (no optimisable DOFs).
-
-        Returns
-        -------
-        jax.Array, shape ``(n_surface_nodes,)``
-        """
-        return self.support_fn(
-            surface_pts, curves_jax[coil_idx],
-            constants=self.constants,
-        )
-
-        
-class CoilSupportBeams(CoilSupport, SupportBeams):
+class CoilSupportBeams(CoilSupport):
     """Simsopt-optimizable beam-network coil support.
 
     Wraps :class:`~coil_fem.coupling.SupportBeams` as a simsopt
@@ -476,6 +312,9 @@ class CoilSupportBeams(CoilSupport, SupportBeams):
     angles (``phis_start_cc``, ``phis_end_cc``, ``phis_start_cf``), cross-section
     orientations (``thetas_orientation_cc``, ``thetas_orientation_cf``), and
     foundation anchor positions (``x_foundation``) are the optimisable DOFs.
+
+    The underlying :class:`~coil_fem.coupling.SupportBeams` instance is
+    accessible via :attr:`~CoilSupport.support`.
 
     Parameters
     ----------
@@ -486,57 +325,52 @@ class CoilSupportBeams(CoilSupport, SupportBeams):
         Number of field periods.
     stellsym : bool
         Whether stellarator symmetry is applied.
-    n_beam_cc : int
-        Number of coil-coil beams per base coil.
-    n_beam_cf : int
-        Number of coil-foundation beams per base coil.
-    E : float
-        Young's modulus [Pa].
-    nu : float
-        Poisson ratio.
-    cross_section_type : str
-        Cross section shape. Must choose from the functions available in 
-        coil_fem.constant.cross_section_fns.
-    clamp_type : callable
-        ``clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights``;
-        selects coil surface nodes for beam endpoint coupling.
-        ``surface_pts_beam_frame`` is ``(n_surf, 3)`` in the beam's local
-        frame (origin at the endpoint, column-0 aligned with the true beam
-        tangent).  ``sign_x`` is ``True`` at the node-1 end.
-    k_lin : float
-        Translational spring stiffness [N/m²].
-    k_tor : float
-        Torsional spring stiffness [N·m/m²].
+    beam_options : dict
+        Contains the following entries:
+        n_beam_cc : int
+            Number of coil-coil beams per base coil.
+        n_beam_cf : int
+            Number of coil-foundation beams per base coil.
+        E : float
+            Young's modulus [Pa].
+        nu : float
+            Poisson ratio.
+        cross_section_type : str
+            Cross section shape. Must choose from the functions available in
+            coil_fem.presets.cross_section_fns.
+        attachment_type : callable
+            ``clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights``;
+            selects coil surface nodes for beam endpoint coupling.
+        k_lin : float
+            Translational spring stiffness [N/m²].
+        k_tor : float
+            Torsional spring stiffness [N·m/m²].
     phis_start_cc : array-like or None
         Initial start-attachment angles for CC beams, shape
-        ``(n_base, n_beam_cc)``.  ``None`` defaults to uniform
-        ``linspace(0, 1, n_beam_cc, endpoint=False)`` broadcast to all coils.
+        ``(n_base, n_beam_cc)``.
     phis_end_cc : array-like or None
         Initial end-attachment angles for CC beams, shape
-        ``(n_base, n_beam_cc)``.  Same default as ``phis_start_cc``.
+        ``(n_base, n_beam_cc)``.
     phis_start_cf : array-like or None
         Initial start-attachment angles for CF beams, shape
-        ``(n_base, n_beam_cf)``.  Same uniform default.
+        ``(n_base, n_beam_cf)``.
     x_foundation : array-like or None
         Initial foundation anchor positions, shape ``(n_base, n_beam_cf, 3)``.
-        ``None`` defaults to zeros.
     thetas_orientation_cc : array-like or None
         Initial cross-section roll angles for CC beams, shape
-        ``(n_base, n_beam_cc)``.  ``None`` defaults to zeros.
+        ``(n_base, n_beam_cc)``.
     thetas_orientation_cf : array-like or None
         Initial cross-section roll angles for CF beams, shape
-        ``(n_base, n_beam_cf)``.  ``None`` defaults to zeros.
-    support_fns : callable or list[callable] or None
-        Optional Winkler weight functions forwarded to
-        :class:`~coil_fem.coupling.SupportFixed`.  When set,
-        :meth:`compute_weights` behaves identically to
-        :class:`~coil_fem.coupling.SupportFixed`.
-    fixed_support_dofs_keys : iterable of str
+        ``(n_base, n_beam_cf)``.
+    fixed_clamp_options : dict
+        Optional additional fixed-sphere Winkler clamps on the coil surface.
+        Set ``{'enabled': True, 'r_clamp': ..., 'n_clamp': ...}`` to enable;
+        ``{'enabled': False}`` (default) disables.
+    phis : array-like or None
+        Initial clamp locations for the optional fixed-sphere clamps.
+    fixed_dof_names : iterable of str or None
         Names of ``support_dofs`` keys whose values should be **fixed** (not
-        optimised).  Valid keys: ``'phis'``, ``'phis_end_cc'``, ``'phis_start_cc'``,
-        ``'phis_start_cf'``, ``'thetas_orientation_cc'``,
-        ``'thetas_orientation_cf'``, ``'x_foundation'``.  Each named key is
-        fixed to its initial value; all remaining keys are free DOFs.
+        optimised).
     names : list[str] or None
         Optional DOF names for the full (free + fixed) DOF vector.
     dofs : DOFs or None
@@ -549,14 +383,7 @@ class CoilSupportBeams(CoilSupport, SupportBeams):
         nfp: int,
         stellsym: bool,
         # Beam info
-        n_beam_cc: int,
-        n_beam_cf: int,
-        cross_section_type: str,
-        clamp_type: str,
-        E: float,
-        nu: float,
-        k_lin: float,
-        k_tor: float,
+        beam_options={},
         phis_start_cc=None,
         phis_end_cc=None,
         phis_start_cf=None,
@@ -564,8 +391,10 @@ class CoilSupportBeams(CoilSupport, SupportBeams):
         thetas_orientation_cc=None,
         thetas_orientation_cf=None,
         # Clamp info
-        support_fns=None,
-        fixed_support_dofs_keys=None,
+        fixed_clamp_options={'enabled': False},
+        phis=None,
+        # Simsopt info
+        fixed_dof_names=None,
         names=None,
         dofs=None,
         **kwargs,
@@ -578,47 +407,36 @@ class CoilSupportBeams(CoilSupport, SupportBeams):
         ]
         n_base = len(base_coils)
 
-        # ── Loading cross sections from presets ───────────────────────────────
+        # ── Load beam options ─────────────────────────────────────────────────
+        missing_beam_options = [k for k in _REQUIRED_BEAM_OPTIONS if k not in beam_options]
+        if missing_beam_options:
+            raise ValueError(
+                f"beam_options must contain {missing_beam_options}."
+            )
+        n_beam_cc = beam_options['n_beam_cc']
+        n_beam_cf = beam_options['n_beam_cf']
+        E = beam_options['E']
+        nu = beam_options['nu']
+        k_lin = beam_options['k_lin']
+        k_tor = beam_options['k_tor']
+        cross_section_type = beam_options.get('cross_section_type', 'solid_circle')
+        attachment_type = beam_options.get('attachment_type', 'direct')
+
+        # ── Cross-section preset ──────────────────────────────────────────────
         cross_section_fn = fetch_attr(cross_section_type, cross_section_fns)
         cross_section_fn_keys = fetch_attr(cross_section_type + '_keys', cross_section_fns)
 
-        # ── Loading clamp shapes from presets ─────────────────────────────────
-        # Clamp shape depends on cross section shapes. 
-        # For studying attachment point stress.
-        if clamp_type == 'direct':
-            clamp_fn = fetch_attr(cross_section_type + '_clamp', cross_section_fns)
-        # Clamp wraps the whole cross section.
-        elif clamp_type == 'wrap':
-            clamp_fn = fetch_attr('wrap_clamp', cross_section_fns)
-
-        # ── Initialise SupportBeams (also calls SupportFixed.__init__) ────────
-        SupportBeams.__init__(
-            self,
-            base_curves_jax=base_curves_jax,
-            nfp=nfp,
-            stellsym=stellsym,
-            n_beam_cc=n_beam_cc,
-            n_beam_cf=n_beam_cf,
-            E=E,
-            nu=nu,
-            cross_section_fn=cross_section_fn,
-            clamp_fn=clamp_fn,
-            k_lin=k_lin,
-            k_tor=k_tor,
-            support_fns=support_fns,
-        )
-
         # ── Build initial support_dofs_jax with defaults ──────────────────────
-        # Keys are listed alphabetically — this matches the ravel_pytree sort
-        # order and makes the fixed-mask computation easy to verify.
         _uniform_cc = jnp.broadcast_to(
             jnp.linspace(0., 1., n_beam_cc, endpoint=False),
             (n_base, n_beam_cc),
         )
-        _uniform_cf = jnp.broadcast_to(
-            jnp.linspace(0., 1., n_beam_cf, endpoint=False),
-            (n_base, n_beam_cf),
-        ) if n_beam_cf > 0 else jnp.zeros((n_base, n_beam_cf))
+        _uniform_cf = (
+            jnp.broadcast_to(
+                jnp.linspace(0., 1., n_beam_cf, endpoint=False),
+                (n_base, n_beam_cf),
+            ) if n_beam_cf > 0 else jnp.zeros((n_base, n_beam_cf))
+        )
 
         support_dofs_jax = {
             'phis_end_cc': (
@@ -646,61 +464,119 @@ class CoilSupportBeams(CoilSupport, SupportBeams):
                 else jnp.asarray(x_foundation, dtype=float)
             ),
         }
-        # Loop over the needed cross section parameters and see if they are provided
+
+        # Cross-section DOF keys (e.g. radius for solid_circle).
         if kwargs is None:
             raise AttributeError(
-                "The cross section shape requires an initial values of "
+                "The cross section shape requires initial values of "
                 f"'{cross_section_fn_keys}' as keyword arguments for "
                 "CoilSupportBeams. No keyword arguments are detected."
             )
         for k in cross_section_fn_keys:
-            if k in kwargs.keys():
+            if k in kwargs:
                 support_dofs_jax[k] = kwargs[k]
             else:
                 raise AttributeError(
                     "The cross section shape requires an initial value of "
-                    f"{k}' as keyword arguments for CoilSupportBeams."
+                    f"'{k}' as keyword argument for CoilSupportBeams."
                 )
 
-        # ── Compute boolean fixed_mask from fixed_support_dofs_keys ──────────
-        # The probe-dict technique: ravel a version of the dict where only
-        # the target key is non-zero, then find those flat indices.
-        
-        # By default, the beam info are fixed.
-        if fixed_support_dofs_keys is None:
-            fixed_support_dofs_keys = list(cross_section_fn_keys) + \
+        # ── SupportBeams constants (owned by the functional object) ───────────
+        beam_constants = {
+            'nfp':        nfp,
+            'stellsym':   stellsym,
+            'n_beam_cc':  n_beam_cc,
+            'n_beam_cf':  n_beam_cf,
+            'E':          E,
+            'nu':         nu,
+            'k_lin':      k_lin,
+            'k_tor':      k_tor,
+        }
+
+        # ── Optional fixed-sphere Winkler clamps ──────────────────────────────
+        if fixed_clamp_options.get('enabled', False):
+            try:
+                r_clamp = fixed_clamp_options['r_clamp']
+                n_clamp = fixed_clamp_options['n_clamp']
+            except KeyError:
+                raise KeyError(
+                    "fixed_clamp_options must contain 'r_clamp' and 'n_clamp'."
+                )
+            sigmoid_eps = fixed_clamp_options.get('sigmoid_eps', 0.1)
+
+            phis_arr = _broadcast_phis(phis, n_base, n_clamp)
+            support_dofs_jax['phis'] = phis_arr
+
+            fixed_clamp_fns = [
+                make_clamp_fn(i, r_clamp, sigmoid_eps, phis_arr[i])
+                for i in range(n_base)
+            ]
+        else:
+            if n_beam_cf == 0:
+                raise AttributeError(
+                    "The coils must be supported by either fixed clamps or "
+                    "coil-foundation beams. Currently neither is enabled."
+                )
+            fixed_clamp_fns = None
+
+        # ── Attachment function preset ─────────────────────────────────────────
+        if attachment_type == 'direct':
+            attachment_fn = fetch_attr(cross_section_type + '_attachment', cross_section_fns)
+        elif attachment_type == 'wrap':
+            attachment_fn = fetch_attr('wrap_attachment', cross_section_fns)
+
+        # ── Build the functional SupportBeams ─────────────────────────────────
+        beams = SupportBeams(
+            constants=beam_constants,
+            base_curves_jax=base_curves_jax,
+            cross_section_fn=cross_section_fn,
+            attachment_fn=attachment_fn,
+            fixed_clamp_fns=fixed_clamp_fns,
+        )
+
+        # ── Compute boolean fixed_mask from fixed_dof_names ───────────────────
+        if fixed_dof_names is None:
+            fixed_dof_names = list(cross_section_fn_keys) + \
                 ['thetas_orientation_cc', 'thetas_orientation_cf']
+
+        fixed_dof_names = list(fixed_dof_names)
+        if n_beam_cc == 0:
+            fixed_dof_names += ['phis_start_cc', 'phis_end_cc', 'thetas_orientation_cc']
+        if n_beam_cf == 0:
+            fixed_dof_names += ['phis_start_cf', 'x_foundation', 'thetas_orientation_cf']
+
         valid_keys = support_dofs_jax.keys()
-        invalid_keys = [k for k in fixed_support_dofs_keys if k not in valid_keys]
+        invalid_keys = [k for k in fixed_dof_names if k not in valid_keys]
         if invalid_keys:
             raise ValueError(
-                f"fixed_support_dofs_keys: {invalid_keys} not valid "
+                f"fixed_dof_names: {invalid_keys} not valid "
                 f"support_dofs key(s). Valid keys: {valid_keys}"
             )
         probe = {
-            k: np.full_like(v, k in fixed_support_dofs_keys, dtype=bool)
+            k: np.full_like(v, k in fixed_dof_names, dtype=bool)
             for k, v in support_dofs_jax.items()
         }
         fixed_mask, _ = ravel_pytree(probe)
-        
-        print('Beam network initialized.')
-        print('Optimizing:', [k for k in valid_keys if k not in fixed_support_dofs_keys])
-        print('# dofs:    ', len(fixed_mask) - np.sum(fixed_mask))
 
-        # ── Initialize constants ──────────────────────────────────────────────
-        constants = {
-            'n_beam_cc': n_beam_cc,
-            'n_beam_cf': n_beam_cf,
-            'k_lin':     k_lin,
-            'k_tor':     k_tor,
-        }
+        # ── Summary ───────────────────────────────────────────────────────────
+        print('Beam network initialized.')
+        print('Optimizing:')
+        for k in valid_keys:
+            if k not in fixed_dof_names:
+                print('   ', k, '- shape:', np.array(support_dofs_jax[k]).shape)
+        print('Fixing:')
+        for k in fixed_dof_names:
+            print('   ', k)
+        print('Total # dofs:', len(fixed_mask) - np.sum(fixed_mask))
+
         # ── Initialize CoilSupport (calls Optimizable.__init__) ───────────────
         super().__init__(
             base_coils,
             nfp,
             stellsym,
+            support=beams,
             support_dofs_jax=support_dofs_jax,
-            constants=constants,
+            constants=None,
             names=names,
             fixed=np.array(fixed_mask),
             dofs=dofs,

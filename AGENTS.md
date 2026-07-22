@@ -70,8 +70,8 @@ src/coil_fem/                  # main package (Hatchling src-layout)
     framed_curve_jax.py        # FramedCurveCentroidJAX / FramedCurveRMFJAX
     symmetries.py              # Stellarator symmetry expansion (pure JAX)
   coupling/                    # Support structure coupling subpackage
-    __init__.py                # re-exports Support, SupportFixed, SupportBeams, solve_staggered, solve_monolithic
-    supports.py                # Support ABC + SupportFixed (grounded Winkler/Robin BC)
+    __init__.py                # re-exports Support, SupportBeams, solve_staggered, solve_monolithic
+    supports.py                # Support (concrete grounded Winkler/Robin BC)
     beam_networks.py           # SupportBeams — bisymmetric beam-network support (coil-coil + coil-foundation)
     drivers.py                 # solve_staggered (BG-S + Aitken + IFT grad), solve_monolithic (cuDSS-only)
   simsopt/                     # simsopt Optimizable interop subpackage
@@ -216,11 +216,11 @@ The coupling between coil FEM and support structures is split across three layer
 | `n_support_dofs` | attribute | Required when `is_coupled=True` |
 | `k_lin` | attribute | Required when `is_coupled=True` (must match `winkler_k`) |
 
-`SupportFixed` is the built-in uncoupled support (`is_coupled=False`): it holds attachment points at zero displacement through a Winkler spring field whose spatial distribution is controlled by an optional `support_fn` callable.
+`Support` is the built-in uncoupled (grounded) support (`is_coupled=False`): it holds attachment points at zero displacement through a Winkler spring field whose spatial distribution is controlled by an optional `fixed_clamp_fn` callable.
 
 ### `SupportBeams` (`coupling/beam_networks.py`)
 
-`SupportBeams` extends `SupportFixed` with a bisymmetric beam-network model.  It overrides `compute_weights`, `compute_attach`, `coupling_terms`, `coo`, and `solve`.
+`SupportBeams` extends `Support` with a bisymmetric beam-network model.  It overrides `compute_weights`, `compute_attach`, `coupling_terms`, `coo`, and `solve`.
 
 Key constructor arguments (all static; set once at construction):
 
@@ -263,7 +263,7 @@ When `is_coupled=True`, `CoilFEM` enforces `problem_options['winkler_k'] == supp
 
 ### Adding a new `Support` subclass
 
-1. Subclass `Support` (or `SupportFixed` to inherit the `support_fn` weight logic).
+1. Subclass `Support` (to inherit the `fixed_clamp_fn` weight logic).
 2. Set `is_coupled = True` (property) and declare `n_support_dofs` and `k_lin`.
 3. Implement `solve(inputs) -> {'u_s': ...}` using `lineax` or any JAX-compatible solver.
 4. Override `compute_weights` to return per-surface-node Winkler weights.
