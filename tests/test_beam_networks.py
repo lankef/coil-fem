@@ -48,9 +48,9 @@ def _constant_section_fn(A_val=1e-4, Iy_val=1e-8, Iz_val=1e-8, J_val=2e-8):
     """Returns a cross_section_fn with constant properties."""
     def fn(support_dofs):
         # support_dofs not used; just broadcast constants.
-        phi_cc = support_dofs['phi_start_cc']
+        phi_cc = support_dofs['phis_start_cc']
         n_base, n_beam_cc = phi_cc.shape
-        n_beam_cf = support_dofs['phi_start_cf'].shape[1]
+        n_beam_cf = support_dofs['phis_start_cf'].shape[1]
         n_per = n_beam_cc + n_beam_cf
         shape = (n_base, n_per)
         A  = jnp.full(shape, A_val)
@@ -61,9 +61,9 @@ def _constant_section_fn(A_val=1e-4, Iy_val=1e-8, Iz_val=1e-8, J_val=2e-8):
     return fn
 
 
-def _uniform_clamp_fn(surface_pts, curve_jax, dofs, direction):
+def _uniform_clamp_fn(surface_pts_beam_frame, dofs, sign_x):
     """Returns uniform unit weights (all surface nodes equally clamped)."""
-    return jnp.ones(surface_pts.shape[0])
+    return jnp.ones(surface_pts_beam_frame.shape[0])
 
 
 def _make_support_beams(
@@ -121,12 +121,12 @@ def _make_support_dofs(n_base: int = 2, n_beam_cc: int = 1, n_beam_cf: int = 1):
     theta_cf = jnp.zeros((n_base, n_beam_cf))
 
     return {
-        'phi_start_cc':         phi_cc_start,
-        'phi_end_cc':           phi_cc_end,
-        'phi_start_cf':         phi_cf_start,
-        'x_foundation':         x_foundation,
-        'theta_orientation_cc': theta_cc,
-        'theta_orientation_cf': theta_cf,
+        'phis_start_cc':         phi_cc_start,
+        'phis_end_cc':           phi_cc_end,
+        'phis_start_cf':         phi_cf_start,
+        'x_foundation':          x_foundation,
+        'thetas_orientation_cc': theta_cc,
+        'thetas_orientation_cf': theta_cf,
     }
 
 
@@ -301,17 +301,17 @@ def test_support_beams_grad_through_x_foundation():
 # ============================================================================
 
 def test_support_beams_compute_weights_passthrough():
-    """When support_fns=const_fn, compute_weights matches SupportFixed."""
+    """When dofs=None, compute_weights delegates to SupportFixed (returns support_fns result)."""
     n_surf = 12
     # A constant weight function that returns 0.5 for all nodes
     def half_fn(surface_pts, curve_jax, dofs):
         return jnp.full(surface_pts.shape[0], 0.5)
 
-    sb      = _make_support_beams(n_base=2, support_fns=half_fn)
-    curve   = _make_circle()
-    surf    = jnp.ones((n_surf, 3))
+    sb     = _make_support_beams(n_base=2, support_fns=half_fn)
+    curves = sb.base_curves_jax          # list[CurveXYZFourierJAX]
+    surf   = jnp.ones((n_surf, 3))
 
-    w = sb.compute_weights(0, surf, curve, None)
+    w = sb.compute_weights(0, surf, curves, None)
 
     assert w.shape == (n_surf,)
     assert jnp.allclose(w, 0.5), f"Expected 0.5 everywhere, got {w}"
@@ -366,4 +366,60 @@ def test_support_beams_bare_beam_rank():
     # The bisymmetric beam element has exactly 6 rigid-body modes → rank 6
     assert rank == 6, (
         f"Bare-beam block expected rank 6 but got {rank}."
+    )
+
+
+# ============================================================================
+# 10. End-side gradient: gradients flow to the end coil's DOFs
+# ============================================================================
+
+def test_support_beams_end_side_gradient():
+    """compute_weights gradient w.r.t. end-side coil DOFs is non-zero and finite.
+
+    Before the beam-frame clamp_fn refactor, clamp weights for node-2 only
+    traced through the *start* coil's DOFs (coil-tangent approximation).
+    This test verifies that gradients now flow to the end coil's DOFs.
+    """
+    n_base, n_cc, n_cf = 2, 1, 0
+    nfp = 2
+
+    def sigmoid_clamp_fn(surface_pts_beam_frame, dofs, sign_x):
+        """Sigmoid of max distance in beam frame — smoothly differentiable."""
+        d = jnp.sqrt(jnp.sum(surface_pts_beam_frame ** 2, axis=1) + 1e-8)
+        return jax.nn.sigmoid(1.0 - d)
+
+    base_curves = [_make_circle(N=8, R=1.0 + 0.1 * i) for i in range(n_base)]
+    sb = SupportBeams(
+        base_curves_jax=base_curves,
+        nfp=nfp,
+        stellsym=False,
+        n_beam_cc=n_cc,
+        n_beam_cf=n_cf,
+        E=200e9,
+        nu=0.3,
+        cross_section_fn=_constant_section_fn(),
+        clamp_fn=sigmoid_clamp_fn,
+        k_lin=1e8,
+        k_tor=1e4,
+    )
+
+    sdofs = _make_support_dofs(n_base, n_cc, n_cf)
+    surf  = jnp.ones((8, 3))
+
+    def weight_sum_end_coil(dofs_end):
+        """Sum of weights for coil 1 (end-side) parameterised by coil 1's DOFs."""
+        curves_jax = [
+            CurveXYZFourierJAX(base_curves[0].quadpoints, base_curves[0].dofs, base_curves[0].order),
+            CurveXYZFourierJAX(base_curves[1].quadpoints, dofs_end, base_curves[1].order),
+        ]
+        # coil_idx=1 receives node-2 of all CC beams from coil 0
+        w = sb.compute_weights(1, surf, curves_jax, sdofs)
+        return jnp.sum(w)
+
+    grad = jax.grad(weight_sum_end_coil)(base_curves[1].dofs)
+
+    assert jnp.all(jnp.isfinite(grad)), "End-side gradient contains NaN/Inf"
+    assert jnp.any(grad != 0.0), (
+        "End-side gradient is identically zero; "
+        "gradients should flow through the end coil's DOFs."
     )

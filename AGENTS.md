@@ -56,11 +56,14 @@ src/coil_fem/                  # main package (Hatchling src-layout)
   metrics.py                   # Von Mises / strain metrics on FEM solutions
   meshing.py                   # Fixed-topology hex/tet meshing (rectangle/disk sweep, curved-sided TET10)
   pipelines.py                 # ElasticPipeline / ThermoElasticPipeline — per-coil FEM state
-  problem/                     # FEM Problem subpackage
+  problems/                    # FEM Problem subpackage
     __init__.py                # re-exports LinearElasticity3D, DeviceProblem (+ elasticity helpers)
     linear_elasticity.py       # LinearElasticity3D — JAX-FEM Problem subclass; itc_strain thermal eigenstrain; support_attach shifted Winkler
     device_problem.py          # DeviceProblem — JAX device-assembly Problem subclass
     heat_conduction.py         # HeatConduction3D stub (future thermoelastic coupling)
+  presets/                     # Named material / cross-section factory helpers
+    __init__.py
+    cross_section_fns.py       # solid/hollow circle & rectangle section factories
   geo/                         # Curve geometry and symmetry subpackage
     __init__.py                # re-exports CurveXYZFourierJAX, framed curves, symmetry helpers
     curve_jax.py               # CurveXYZFourierJAX — JAX pytree, simsopt interop
@@ -75,7 +78,7 @@ src/coil_fem/                  # main package (Hatchling src-layout)
     __init__.py                # re-exports CoilFEMObjective, CoilSupport, CoilSupportFixed, CoilSupportTopBottom
     objectives.py              # CoilFEMObjective — simsopt Optimizable wrapper
     optimizables.py            # CoilSupport (base), CoilSupportFixed, CoilSupportTopBottom
-  solver/                      # Optional GPU solver subpackage
+  solvers/                     # Optional GPU solver subpackage
     __init__.py
     cudss.py                   # GPU sparse direct solver (spineax + NVIDIA cuDSS)
 pyproject.toml                 # Hatchling build, deps, pytest config
@@ -206,8 +209,8 @@ The coupling between coil FEM and support structures is split across three layer
 | `is_coupled` | property | `True` when the support has its own DOFs |
 | `solve(inputs)` | abstract | Advance support state; returns dict with `'u_s'` |
 | `displacement_at(state, points)` | abstract | Support displacement at query points |
-| `compute_weights(coil_idx, surf_pts, curve_jax, dofs)` | default=1 | Per-surface-node Winkler weights |
-| `compute_attach(coil_idx, surf_pts, curve_jax, dofs, state)` | default=0 | Beam attachment displacement at surface nodes |
+| `compute_weights(coil_idx, surf_pts, curves_jax, dofs)` | default=1 | Per-surface-node Winkler weights; `curves_jax` is the full list of all base-coil curves |
+| `compute_attach(coil_idx, surf_pts, curves_jax, dofs, state)` | default=0 | Beam attachment displacement at surface nodes; same full-list signature |
 | `coupling_terms(bcd, sdofs, surf_pts, coil_offsets, s_offset, surf_idx)` | default=empty | COO triplets for off-diagonal K_cs / K_sc blocks |
 | `coo(bcd, sdofs, surf_pts)` | default stub | Support stiffness K_ss in COO format |
 | `n_support_dofs` | attribute | Required when `is_coupled=True` |
@@ -224,15 +227,17 @@ Key constructor arguments (all static; set once at construction):
 - `n_beam_cc`, `n_beam_cf` — beams per coil (coil-coil and coil-foundation).
 - `E`, `nu` — Young's modulus and Poisson's ratio.
 - `cross_section_fn(support_dofs) -> (A, Iy, Iz, J)` — cross-section properties.
-- `clamp_fn(surface_pts, curve_jax, dofs, direction) -> weights` — like `support_fn` but with a beam-tangent `direction` argument.
+- `clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights` — selects coil surface nodes for coupling.
+  - `surface_pts_beam_frame`: `(n_surf, 3)` — surface points in the beam's local frame, origin at the endpoint, computed as `(pts − x_endpoint) @ Gamma_3` (column 0 is the true beam tangent).
+  - `sign_x`: `True` at the node-1 end (beam extends toward `+x_local`), `False` at node-2.
 - `k_lin`, `k_tor` — translational and torsional spring stiffness for endpoint-to-mesh coupling.
 
 Optimisable quantities live in `support_dofs` (passed at solve time, never stored):
 
-- `phi_start_cc[n_base, n_beam_cc]`, `phi_end_cc[n_base, n_beam_cc]` — attachment angles for CC beams.
-- `phi_start_cf[n_base, n_beam_cf]` — attachment angles for CF beams.
+- `phis_start_cc[n_base, n_beam_cc]`, `phis_end_cc[n_base, n_beam_cc]` — attachment angles for CC beams.
+- `phis_start_cf[n_base, n_beam_cf]` — attachment angles for CF beams.
 - `x_foundation[n_base, n_beam_cf, 3]` — foundation anchor positions for CF beams.
-- `theta_orientation_cc`, `theta_orientation_cf` — cross-section roll angle per beam.
+- `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam.
 
 ### Solver drivers (`coupling/drivers.py`)
 

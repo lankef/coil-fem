@@ -99,10 +99,10 @@ class _TrivialCoupledSupport(Support):
     def displacement_at(self, state: dict, points: jax.Array) -> jax.Array:
         return jnp.zeros_like(points)
 
-    def compute_weights(self, coil_idx, surface_pts, curve_jax, dofs):
+    def compute_weights(self, coil_idx, surface_pts, curves_jax, dofs):
         return jnp.ones(surface_pts.shape[0])
 
-    def compute_attach(self, coil_idx, surface_pts, curve_jax, dofs, state):
+    def compute_attach(self, coil_idx, surface_pts, curves_jax, dofs, state):
         return jnp.zeros((surface_pts.shape[0], 3), dtype=surface_pts.dtype)
 
     def coupling_terms(

@@ -78,7 +78,7 @@ class Support(abc.ABC):
         self,
         coil_idx: int,
         surface_pts: jax.Array,
-        curve_jax,
+        curves_jax: list,
         dofs,
     ) -> jax.Array:
         """Per-surface-node Winkler weights for coil ``coil_idx``.
@@ -94,9 +94,10 @@ class Support(abc.ABC):
             Index of the base coil (0-based).
         surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
             Current positions of the coil surface nodes.
-        curve_jax : CurveXYZFourierJAX
-            Differentiable representation of the coil centreline at the
-            current DOFs.
+        curves_jax : list[CurveXYZFourierJAX]
+            Differentiable centreline curves for **all** base coils.  The full
+            list is required so that beam-network supports can evaluate the
+            true beam tangent (which depends on both endpoint curves).
         dofs : dict or None
             Optimisable support parameters for the full coil set (as
             returned by :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).
@@ -171,7 +172,7 @@ class Support(abc.ABC):
         self,
         coil_idx: int,
         surface_pts: jax.Array,
-        curve_jax,
+        curves_jax: list,
         dofs,
         state: dict,
     ) -> jax.Array:
@@ -194,8 +195,8 @@ class Support(abc.ABC):
             Index of the base coil (0-based).
         surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
             Current positions of the coil surface nodes.
-        curve_jax : CurveXYZFourierJAX
-            Differentiable coil centreline at current DOFs.
+        curves_jax : list[CurveXYZFourierJAX]
+            Differentiable centreline curves for all base coils.
         dofs : dict or None
             Full merged support-dofs dict for the coil set.
         state : dict
@@ -275,7 +276,7 @@ class SupportFixed(Support):
 
     This is the default support used when no coupling to an external
     structural model is needed.  It corresponds to the Winkler / Robin BC
-    built into :class:`~coil_fem.problem.LinearElasticity3D`.
+    built into :class:`~coil_fem.problems.LinearElasticity3D`.
 
     Parameters
     ----------
@@ -336,7 +337,7 @@ class SupportFixed(Support):
         self,
         coil_idx: int,
         surface_pts: jax.Array,
-        curve_jax,
+        curves_jax: list,
         dofs,
     ) -> jax.Array:
         """Per-surface-node Winkler weights for coil ``coil_idx``.
@@ -346,7 +347,9 @@ class SupportFixed(Support):
         coil_idx : int
             Index of the base coil (0-based).
         surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
-        curve_jax : CurveXYZFourierJAX
+        curves_jax : list[CurveXYZFourierJAX]
+            All base-coil centreline curves.  ``curves_jax[coil_idx]`` is
+            forwarded to the user ``support_fn``.
         dofs : dict or None
             Full merged support-dofs dict for the coil set; subclasses
             slice out the per-coil portion as needed.
@@ -361,4 +364,5 @@ class SupportFixed(Support):
             fn = self._support_fns[coil_idx]
         else:
             fn = self._support_fns
-        return fn(surface_pts, curve_jax, dofs)
+        curve_i = curves_jax[coil_idx] if curves_jax is not None else None
+        return fn(surface_pts, curve_i, dofs)

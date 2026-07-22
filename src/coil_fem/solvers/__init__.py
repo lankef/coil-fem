@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..problem.linear_elasticity import LinearElasticity3D
+    from ..problems.linear_elasticity import LinearElasticity3D
 
 
 def needs_gpu_assembly(problem_options: dict) -> bool:

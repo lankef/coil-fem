@@ -26,7 +26,7 @@ from .geo import (
 from .meshing import CoilMesh
 from .magnetic import biot_savart, B_self_quadrature, lorentz_body_force
 
-from .problem import (
+from .problems import (
     lame_parameters,
     recompute_fe_geometry,
 )
@@ -583,7 +583,7 @@ class CoilFEM:
                 all_gammas, all_gammadashs, all_currents,
             )
             wt_i = self._compute_support_weights(
-                i, pts_i, base_curves_dofs[i], base_support_dofs
+                i, pts_i, base_curves_dofs, base_support_dofs
             )
             pts_by_coil.append(pts_i)
             bf_by_coil.append(bf_i)
@@ -762,7 +762,7 @@ class CoilFEM:
           one per base coil.  Uniform per coil (zeros when no thermal
           parameters were configured); left un-broadcast for memory efficiency.
         """
-        from .problem import recompute_fe_geometry
+        from .problems import recompute_fe_geometry
 
         result = self.run(
             base_curves_dofs=base_curves_dofs,
@@ -946,7 +946,7 @@ class CoilFEM:
         self,
         coil_idx: int,
         pts_i: jax.Array,
-        dofs_i: jax.Array,
+        all_curves_dofs: list,
         support_dofs: dict | None,
     ) -> jax.Array:
         """Compute per-surface-node Winkler weights for coil ``coil_idx``.
@@ -954,18 +954,23 @@ class CoilFEM:
         Parameters
         ----------
         pts_i : (n_nodes, 3) traced
-        dofs_i : (n_dofs,) traced
+        all_curves_dofs : list[jax.Array]
+            DOF vectors for **all** base coils (needed so that beam-network
+            supports can evaluate the true beam tangent using both endpoint
+            curves).
         support_dofs : dict or None
             Full merged support-dofs dict for the coil set (as returned by
             :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).  Passed
             directly to :meth:`~coil_fem.coupling.Support.compute_weights`;
             the support object is responsible for slicing out per-coil data.
         """
-        surf_idx  = self.pipelines[coil_idx].surface_node_indices  # (n_surf_nodes,) static
-        surf_pts  = pts_i[surf_idx]                               # (n_surf_nodes, 3) traced
-        base      = self.base_curves_jax[coil_idx]
-        coil_curr = CurveXYZFourierJAX(base.quadpoints, dofs_i, base.order)
-        return self.support.compute_weights(coil_idx, surf_pts, coil_curr, support_dofs)
+        surf_idx    = self.pipelines[coil_idx].surface_node_indices
+        surf_pts    = pts_i[surf_idx]
+        curves_jax  = [
+            CurveXYZFourierJAX(base.quadpoints, d, base.order)
+            for base, d in zip(self.base_curves_jax, all_curves_dofs)
+        ]
+        return self.support.compute_weights(coil_idx, surf_pts, curves_jax, support_dofs)
 
     # ============================================================================
     # Properties
@@ -1102,7 +1107,7 @@ class CoilFEM:
 
             surf_idx = onp.asarray(self.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
-                self._compute_support_weights(i, pts_i, base_curves_dofs[i], base_support_dofs),
+                self._compute_support_weights(i, pts_i, base_curves_dofs, base_support_dofs),
                 dtype=onp.float64,
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
@@ -1229,7 +1234,7 @@ class CoilFEM:
 
             surf_idx = onp.asarray(self.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
-                self._compute_support_weights(i, pts_i, base_curves_dofs[i], base_support_dofs),
+                self._compute_support_weights(i, pts_i, base_curves_dofs, base_support_dofs),
                 dtype=onp.float64,
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
@@ -1507,7 +1512,7 @@ class CoilFEM:
             )
             weights_surf = onp.asarray(
                 self._compute_support_weights(
-                    i, pts_i, base_curves_dofs[i], base_support_dofs
+                    i, pts_i, base_curves_dofs, base_support_dofs
                 ),
                 dtype=onp.float64,
             )

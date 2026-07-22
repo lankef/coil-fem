@@ -2,7 +2,7 @@
 
 Will provide :class:`HeatConduction3D`, a JAX-FEM ``Problem`` subclass that
 solves ``−∇·(k ∇T) = Q`` on the coil volume.  The solution temperature field
-feeds into :class:`~coil_fem.problem.LinearElasticity3D` as a spatially varying
+feeds into :class:`~coil_fem.problems.LinearElasticity3D` as a spatially varying
 thermal eigenstrain for thermoelastic coupling.
 """
 

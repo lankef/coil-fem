@@ -150,7 +150,7 @@ def solve_staggered(
         u_mesh_by_coil = []
         for i, pipeline in enumerate(pipelines):
             u_attach_i = support.compute_attach(
-                i, surface_pts_by_coil[i], curves_by_coil[i], support_dofs, state
+                i, surface_pts_by_coil[i], curves_by_coil, support_dofs, state
             )
             sol = pipeline.solve(
                 mesh_points_by_coil[i],
@@ -284,7 +284,7 @@ def solve_staggered(
     sol_list_by_coil = []
     for i, pipeline in enumerate(pipelines):
         u_attach_i = support.compute_attach(
-            i, surface_pts_by_coil[i], curves_by_coil[i], support_dofs, state_star
+            i, surface_pts_by_coil[i], curves_by_coil, support_dofs, state_star
         )
         sol = pipeline.solve(
             mesh_points_by_coil[i],
@@ -487,7 +487,7 @@ def solve_monolithic(
         f_merged = jnp.concatenate(f_list)
 
         # Use cuDSS for the merged solve
-        from ..solver.cudss import _import_cudss_solver, assemble_csr_from_coo
+        from ..solvers.cudss import _import_cudss_solver, assemble_csr_from_coo
         CuDSSSolver = _import_cudss_solver()
 
         csr_indptr, csr_cols, coo_to_csr, nnz_csr = assemble_csr_from_coo(
@@ -514,7 +514,7 @@ def solve_monolithic(
 
         # Re-assemble K at the converged solution (linear → same K as forward)
         # and solve K^T λ = g for the adjoint variable.
-        from ..solver.cudss import _import_cudss_solver, assemble_csr_from_coo
+        from ..solvers.cudss import _import_cudss_solver, assemble_csr_from_coo
         CuDSSSolver = _import_cudss_solver()
 
         I_list, J_list, V_list = [], [], []

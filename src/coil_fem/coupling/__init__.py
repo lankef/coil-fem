@@ -8,7 +8,7 @@ functions :func:`~coil_fem.coupling.drivers.solve_staggered` and
 """
 
 from .supports import Support, SupportFixed
-from .beam_networks import SupportBeams
+from .beam_network import SupportBeams
 from .drivers import solve_staggered, solve_monolithic
 
 __all__ = [
