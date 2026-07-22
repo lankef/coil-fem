@@ -1,17 +1,15 @@
-"""Bisymmetric beam-network support structure.
+"""Beam-network support structure.
 
-Provides :class:`SupportBeams`, which models coil-to-coil and
-coil-to-foundation structural connections as batches of independent
-bisymmetric space-frame elements (McGuire, Gallagher & Ziemian, Eq. 4.34;
+Provides :class:`SupportBeams`, which models a cage-type support structure
+with two types of support beams: 
+
+1. Coil-coil (CC) beams that link adjacent coils.
+2. Coil-foundation (CF) that link a coil to the foundation (fixed points in space).
+
+All beams are treated as bisymmetric frame elements (McGuire, Gallagher & Ziemian, Eq. 4.34;
 see ``docs/theory/bisymbeam.rst``).  Each beam endpoint couples to coil
 exterior mesh points via translational and torsional springs whose spatial
-distribution is governed by a user-supplied ``clamp_fn``.
-
-Two beam types are supported:
-
-* **Coil-coil (CC):** both endpoints attach to two different coils.
-* **Coil-foundation (CF):** one endpoint attaches to a coil; the other is
-  anchored to a known xyz coordinate in ``support_dofs['x_foundation']``.
+distribution is governed by a user-supplied ``attachment_fn``.
 
 :meth:`SupportBeams.coo` returns the support-local stiffness block
 ``K_ss`` in COO format (differentiable w.r.t. all traced inputs).
@@ -120,12 +118,8 @@ class SupportBeams(Support):
         Base coil centreline curves (before symmetry expansion).  Used only
         for static metadata (``quadpoints``, ``order``) at construction;
         traced curves are always rebuilt inside :meth:`coo` / :meth:`solve`.
-    constants : dict
+    beam_options : dict
         Contains the following entries
-        nfp : int
-            Number of field periods.
-        stellsym : bool
-            Whether stellarator symmetry is applied.
         n_beam_cc : int
             Number of coil-coil beams per base coil (connecting coil ``i`` to
             coil ``i+1``, with symmetry-aware wraparound at the last coil).
@@ -147,13 +141,13 @@ class SupportBeams(Support):
         returned array has shape ``(n_base, n_beam_cc + n_beam_cf)``.
         Section-property validation is delegated to this callable.
     attachment_fn : callable
-        ``attachment_fn(surface_pts_beam_frame, dofs, sign_x, constants) -> weights``
+        ``attachment_fn(surface_pts_beam_frame, dofs, sign_x, beam_options) -> weights``
         where ``surface_pts_beam_frame`` is ``(n_surface_nodes, 3)`` — surface
         points expressed in the beam's local frame with origin at the endpoint
         (computed as ``(pts − x_endpoint) @ Gamma_3``), ``dofs`` is the merged
         support-dofs dict, ``sign_x`` is ``True`` at the node-1 end (beam
-        extends toward ``+x_local``) and ``False`` at node-2, and ``constants``
-        is the beam constants dict.  ``weights`` is ``(n_surface_nodes,)`` in
+        extends toward ``+x_local``) and ``False`` at node-2, and ``beam_options``
+        is the options dict.  ``weights`` is ``(n_surface_nodes,)`` in
         ``[0, 1]``.
     fixed_clamp_fns : callable or list[callable] or None
         Optional Winkler weight functions forwarded to :class:`Support`.
@@ -191,27 +185,32 @@ class SupportBeams(Support):
 
     def __init__(
         self,
-        constants: dict,
+        nfp:int,
+        stellsym:bool,
+        beam_options: dict,
         base_curves_jax: list[CurveXYZFourierJAX],
         cross_section_fn: Callable,
         attachment_fn: Callable,
+        cross_section_fn_keys: tuple = (),
         fixed_clamp_fns=None,
     ):
         super().__init__(fixed_clamp_fns=fixed_clamp_fns)
 
         self.base_curves_jax = list(base_curves_jax)
-        # The constants stores the minimal beam properties
-        # required to study the problem. When used with 
-        # CoilSupportBeam, this constants is shared with the 
-        # simsopt Optimizable.
-        self.constants = constants
-        self._n_beam_cc = int(constants['n_beam_cc'])
-        self._n_beam_cf = int(constants['n_beam_cf'])
-        self._k_lin = float(constants['k_lin'])
-        self._k_tor = float(constants['k_tor'])
-        
+        self._beam_options = beam_options
+        self._nfp = nfp
+        self._stellsym = stellsym
+        self._n_beam_cc = int(beam_options['n_beam_cc'])
+        self._n_beam_cf = int(beam_options['n_beam_cf'])
+        self._k_lin = float(beam_options['k_lin'])
+        self._k_tor = float(beam_options['k_tor'])
+
         self.cross_section_fn = cross_section_fn
         self.attachment_fn = attachment_fn
+        # Keys in support_dofs whose values are shaped (n_base, n_beams_per_coil);
+        # _clamp_weights_for_spec slices [coil, local_beam] before passing to
+        # attachment_fn so each call receives a scalar, not the full array.
+        self._cross_section_fn_keys = tuple(cross_section_fn_keys)
 
         # Per-coil: which local base-coil index is the CC-beam end target,
         # and which symmetry transform to apply to its geometry.
@@ -238,7 +237,7 @@ class SupportBeams(Support):
                 transform.append('none')
             else:
                 # Last coil wraps around
-                if self.constants['stellsym']:
+                if self.stellsym:
                     idx.append(self.n_base - 1)
                     transform.append('flip')
                 else:
@@ -272,6 +271,21 @@ class SupportBeams(Support):
     def is_coupled(self) -> bool:
         """``True`` — beams have their own DOFs coupled to coil surface nodes."""
         return True
+    
+    @property
+    def nfp(self) -> bool:
+        """``True`` — beams have their own DOFs coupled to coil surface nodes."""
+        return self._nfp
+        
+    @property
+    def beam_options(self) -> bool:
+        """``True`` — beams have their own DOFs coupled to coil surface nodes."""
+        return self._beam_options
+
+    @property
+    def stellsym(self) -> bool:
+        """``True`` — beams have their own DOFs coupled to coil surface nodes."""
+        return self._stellsym
 
     @property
     def n_beam_cc(self):
@@ -382,7 +396,7 @@ class SupportBeams(Support):
         elif transform == 'flip':
             return _flip_points(pts)   # self-inverse
         else:  # 'rotate'
-            angle = 2.0 * math.pi / self.constants['nfp']
+            angle = 2.0 * math.pi / self.nfp
             if inverse:
                 angle = -angle
             return _rotate_points_z(pts, angle)
@@ -651,7 +665,18 @@ class SupportBeams(Support):
         surf_tfm = self._apply_end_transform(surf_pts, spec['tfm'])
         r_k      = surf_tfm - spec['x_ep'][None, :]
         pts_beam = r_k @ spec['gamma3']
-        w_k      = self.attachment_fn(pts_beam, support_dofs, spec['sign_x'], self.constants)
+        # Slice per-beam cross-section scalars out of (n_base, n_beams_per_coil) arrays
+        # so attachment_fn receives the scalar for this specific beam.
+        if self._cross_section_fn_keys:
+            i = spec['coil']
+            j = spec['b'] % self.n_beams_per_coil
+            beam_dofs = {
+                **support_dofs,
+                **{k: support_dofs[k][i, j] for k in self._cross_section_fn_keys},
+            }
+        else:
+            beam_dofs = support_dofs
+        w_k      = self.attachment_fn(pts_beam, beam_dofs, spec['sign_x'], self.beam_options)
         return w_k, r_k
 
     # ============================================================================
@@ -685,7 +710,7 @@ class SupportBeams(Support):
         -------
         jax.Array, shape ``(N, 12, 12)``
         """
-        E, nu = self.constants['E'], self.constants['nu']
+        E, nu = self._beam_options['E'], self._beam_options['nu']
         G = E / (2.0 * (1.0 + nu))      # shear modulus
 
         # Convenience scalars per beam

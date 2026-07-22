@@ -370,7 +370,11 @@ class CoilSupportBeams(CoilSupport):
         Initial clamp locations for the optional fixed-sphere clamps.
     fixed_dof_names : iterable of str or None
         Names of ``support_dofs`` keys whose values should be **fixed** (not
-        optimised).
+        optimised). Some dofs will cause the problem to become ill-posed
+        if not fixed/constrained. If wither of ``n_beam_cc`` or ``n_beam_cf`` 
+        is 0, then all dofs associated with that type of beam will be fixed.
+        By default, the attachment points of CF beams and the 
+        parameters of each individual beam is fixed.
     names : list[str] or None
         Optional DOF names for the full (free + fixed) DOF vector.
     dofs : DOFs or None
@@ -408,17 +412,13 @@ class CoilSupportBeams(CoilSupport):
         n_base = len(base_coils)
 
         # ── Load beam options ─────────────────────────────────────────────────
+        n_beam_cc = beam_options['n_beam_cc']
+        n_beam_cf = beam_options['n_beam_cf']
         missing_beam_options = [k for k in _REQUIRED_BEAM_OPTIONS if k not in beam_options]
         if missing_beam_options:
             raise ValueError(
                 f"beam_options must contain {missing_beam_options}."
             )
-        n_beam_cc = beam_options['n_beam_cc']
-        n_beam_cf = beam_options['n_beam_cf']
-        E = beam_options['E']
-        nu = beam_options['nu']
-        k_lin = beam_options['k_lin']
-        k_tor = beam_options['k_tor']
         cross_section_type = beam_options.get('cross_section_type', 'solid_circle')
         attachment_type = beam_options.get('attachment_type', 'direct')
 
@@ -466,6 +466,9 @@ class CoilSupportBeams(CoilSupport):
         }
 
         # Cross-section DOF keys (e.g. radius for solid_circle).
+        # Each key is broadcast to shape (n_base, n_beam_cc + n_beam_cf) so that
+        # every beam can carry its own cross-section parameter as a separate DOF.
+        # Callers may pass a scalar (same value for all beams) or a full array.
         if kwargs is None:
             raise AttributeError(
                 "The cross section shape requires initial values of "
@@ -474,24 +477,15 @@ class CoilSupportBeams(CoilSupport):
             )
         for k in cross_section_fn_keys:
             if k in kwargs:
-                support_dofs_jax[k] = kwargs[k]
+                support_dofs_jax[k] = jnp.broadcast_to(
+                    jnp.asarray(kwargs[k], dtype=float),
+                    (n_base, n_beam_cc + n_beam_cf),
+                )
             else:
                 raise AttributeError(
                     "The cross section shape requires an initial value of "
                     f"'{k}' as keyword argument for CoilSupportBeams."
                 )
-
-        # ── SupportBeams constants (owned by the functional object) ───────────
-        beam_constants = {
-            'nfp':        nfp,
-            'stellsym':   stellsym,
-            'n_beam_cc':  n_beam_cc,
-            'n_beam_cf':  n_beam_cf,
-            'E':          E,
-            'nu':         nu,
-            'k_lin':      k_lin,
-            'k_tor':      k_tor,
-        }
 
         # ── Optional fixed-sphere Winkler clamps ──────────────────────────────
         if fixed_clamp_options.get('enabled', False):
@@ -527,9 +521,12 @@ class CoilSupportBeams(CoilSupport):
 
         # ── Build the functional SupportBeams ─────────────────────────────────
         beams = SupportBeams(
-            constants=beam_constants,
+            nfp=nfp,
+            stellsym=stellsym,
+            beam_options=beam_options,
             base_curves_jax=base_curves_jax,
             cross_section_fn=cross_section_fn,
+            cross_section_fn_keys=cross_section_fn_keys,
             attachment_fn=attachment_fn,
             fixed_clamp_fns=fixed_clamp_fns,
         )
