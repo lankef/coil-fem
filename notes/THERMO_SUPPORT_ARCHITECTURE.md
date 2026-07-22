@@ -119,7 +119,7 @@ per-quad `(n_cells, n_quads)` arrays; uniform material is the broadcast
 special case (`jnp.full`). That ships without any new user-facing API.
 
 **Optional sugar** for spatially varying *optimizable* materials: a callable
-evaluated per forward pass, mirroring the existing `support_fn` pattern:
+evaluated per forward pass, mirroring the existing `fixed_clamp_fn` pattern:
 
 ```python
 material_fn(x_quad, phi_quad, uv_quad, dofs) -> {'lam': ..., 'mu': ..., 'eps_th': ...}
@@ -310,7 +310,7 @@ backend-agnostic. The only branching is at *construction*
 ([src/coil_fem/coil_fem.py](../src/coil_fem/coil_fem.py):403-469): the
 `_use_cudss` switch for the `gpu_assembly` flag, the solver-option dicts, and
 `cudss_ad_wrapper` vs `ad_wrapper`. No unifying `Solver` abstraction is needed
-— two small helpers (natural home: `coil_fem/solver/__init__.py`) collapse the
+— two small helpers (natural home: `coil_fem/solvers/__init__.py`) collapse the
 branch to one uniform call site:
 
 ```python
@@ -465,7 +465,7 @@ Concrete subclasses (in priority order):
   needed. This is exactly today's grounded-spring behavior and the
   ``support_attach = 0`` special case; it keeps working unchanged and requires
   no coupling routine at all. The spring-weight distribution ``k(x)`` still
-  comes from the existing ``support_fn`` (e.g. ``CoilSupportDiscrete``), which
+  comes from the existing ``fixed_clamp_fn`` (e.g. ``CoilSupportDiscrete``), which
   is orthogonal to the anchor target.
 - **`BeamNetworkSupport`** *(to develop)* — assemble the 12-DOF frame-element
   stiffness in JAX, solve with `lineax` (dense/sparse — these systems are

@@ -24,7 +24,7 @@ jax.config.update("jax_enable_x64", True)
 from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
 from coil_fem.meshing import CoilMesh
 from coil_fem.pipelines import ElasticPipeline
-from coil_fem.coupling import Support, SupportFixed, solve_staggered, solve_monolithic
+from coil_fem.coupling import Support, solve_staggered, solve_monolithic
 from coil_fem.coil_fem import CoilFEM
 
 
@@ -72,7 +72,7 @@ def _make_coilfem(
         nfp=1,
         stellsym=False,
         mesh_options=mesh_opts,
-        support=support if support is not None else SupportFixed(),
+        support=support if support is not None else Support(),
         problem_options={'winkler_k': 1e9, 'solver': 'umfpack'},
         coupling=coupling,
     )
@@ -245,12 +245,12 @@ def test_coilfem_dispatch_calls_monolithic(monkeypatch):
 
 
 # ============================================================================
-# 4. Uncoupled path: _solve_all with SupportFixed is backward-compatible
+# 4. Uncoupled path: _solve_all with Support is backward-compatible
 # ============================================================================
 
 def test_uncoupled_solve_all_backward_compatible():
-    """_solve_all with SupportFixed produces the same displacement as old path."""
-    fem  = _make_coilfem(coupling='staggered', support=SupportFixed())
+    """_solve_all with Support produces the same displacement as old path."""
+    fem  = _make_coilfem(coupling='staggered', support=Support())
     dofs = [c.dofs for c in fem.base_curves_jax]
     curr = jnp.array([1.0])
 

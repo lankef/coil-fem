@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import lineax
 
-from .supports import SupportFixed
+from .supports import Support
 from ..geo.curve_jax import CurveXYZFourierJAX
 from ..geo.symmetries import _flip_points, _rotate_points_z
 
@@ -106,13 +106,13 @@ def _gamma_12(gamma_3: jax.Array) -> jax.Array:
 # SupportBeams
 # ============================================================================
 
-class SupportBeams(SupportFixed):
+class SupportBeams(Support):
     """Bisymmetric beam-network support.
 
     Models connections between adjacent coils (coil-coil, CC) and between
     coils and fixed anchor points (coil-foundation, CF) using independent
     bisymmetric space-frame elements.  Inherits the grounded Winkler weight
-    machinery from :class:`SupportFixed` when ``support_fns`` is provided.
+    machinery from :class:`Support` when ``fixed_clamp_fns`` is provided.
 
     Parameters
     ----------
@@ -120,41 +120,45 @@ class SupportBeams(SupportFixed):
         Base coil centreline curves (before symmetry expansion).  Used only
         for static metadata (``quadpoints``, ``order``) at construction;
         traced curves are always rebuilt inside :meth:`coo` / :meth:`solve`.
-    nfp : int
-        Number of field periods.
-    stellsym : bool
-        Whether stellarator symmetry is applied.
-    n_beam_cc : int
-        Number of coil-coil beams per base coil (connecting coil ``i`` to
-        coil ``i+1``, with symmetry-aware wraparound at the last coil).
-    n_beam_cf : int
-        Number of coil-foundation beams per base coil.
-    E : float
-        Young's modulus [Pa].
-    nu : float
-        Poisson ratio.
+    constants : dict
+        Contains the following entries
+        nfp : int
+            Number of field periods.
+        stellsym : bool
+            Whether stellarator symmetry is applied.
+        n_beam_cc : int
+            Number of coil-coil beams per base coil (connecting coil ``i`` to
+            coil ``i+1``, with symmetry-aware wraparound at the last coil).
+        n_beam_cf : int
+            Number of coil-foundation beams per base coil.
+        E : float
+            Young's modulus [Pa].
+        nu : float
+            Poisson ratio.
+        k_lin : float
+            Translational spring stiffness [N/m²] (applied as ``k_lin * w``
+            per surface node).
+        k_tor : float
+            Torsional spring stiffness [N·m/m²] (applied as ``k_tor * w``
+            per surface node).
+        and additional constants that ``attachment_fn`` needs.
     cross_section_fn : callable
         ``cross_section_fn(support_dofs) -> (A, Iy, Iz, J)`` where each
         returned array has shape ``(n_base, n_beam_cc + n_beam_cf)``.
         Section-property validation is delegated to this callable.
-    clamp_fn : callable
-        ``clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights``
+    attachment_fn : callable
+        ``attachment_fn(surface_pts_beam_frame, dofs, sign_x, constants) -> weights``
         where ``surface_pts_beam_frame`` is ``(n_surface_nodes, 3)`` — surface
         points expressed in the beam's local frame with origin at the endpoint
         (computed as ``(pts − x_endpoint) @ Gamma_3``), ``dofs`` is the merged
         support-dofs dict, ``sign_x`` is ``True`` at the node-1 end (beam
-        extends toward ``+x_local``) and ``False`` at node-2.
-        ``weights`` is ``(n_surface_nodes,)`` in ``[0, 1]``.
-    k_lin : float
-        Translational spring stiffness [N/m²] (applied as ``k_lin * w``
-        per surface node).
-    k_tor : float
-        Torsional spring stiffness [N·m/m²] (applied as ``k_tor * w``
-        per surface node).
-    support_fns : callable or list[callable] or None
-        Optional Winkler weight functions forwarded to :class:`SupportFixed`.
+        extends toward ``+x_local``) and ``False`` at node-2, and ``constants``
+        is the beam constants dict.  ``weights`` is ``(n_surface_nodes,)`` in
+        ``[0, 1]``.
+    fixed_clamp_fns : callable or list[callable] or None
+        Optional Winkler weight functions forwarded to :class:`Support`.
         When set, :meth:`compute_weights` behaves identically to
-        :class:`SupportFixed` regardless of the beam network.
+        :class:`Support` regardless of the beam network.
 
     Notes
     -----
@@ -187,45 +191,27 @@ class SupportBeams(SupportFixed):
 
     def __init__(
         self,
-        base_curves_jax: list[CurveXYZFourierJAX] | None = None,
-        nfp: int | None = None,
-        stellsym: bool | None = None,
-        n_beam_cc: int | None = None,
-        n_beam_cf: int | None = None,
-        E: float | None = None,
-        nu: float | None = None,
-        cross_section_fn: Callable | None = None,
-        clamp_fn: Callable | None = None,
-        k_lin: float | None = None,
-        k_tor: float | None = None,
-        support_fns=None,
-        **kwargs,
+        constants: dict,
+        base_curves_jax: list[CurveXYZFourierJAX],
+        cross_section_fn: Callable,
+        attachment_fn: Callable,
+        fixed_clamp_fns=None,
     ):
-        # Called with no required args from cooperative __init__ chain
-        # (e.g. Optimizable -> super().__init__()): skip re-initialization.
-        if base_curves_jax is None:
-            super().__init__(support_fns=support_fns, **kwargs)
-            return
-
-        super().__init__(support_fns=support_fns, **kwargs)
+        super().__init__(fixed_clamp_fns=fixed_clamp_fns)
 
         self.base_curves_jax = list(base_curves_jax)
-        self.nfp = int(nfp)
-        self.stellsym = bool(stellsym)
-        self.n_beam_cc = int(n_beam_cc)
-        self.n_beam_cf = int(n_beam_cf)
-        self.E = float(E)
-        self.nu = float(nu)
+        # The constants stores the minimal beam properties
+        # required to study the problem. When used with 
+        # CoilSupportBeam, this constants is shared with the 
+        # simsopt Optimizable.
+        self.constants = constants
+        self._n_beam_cc = int(constants['n_beam_cc'])
+        self._n_beam_cf = int(constants['n_beam_cf'])
+        self._k_lin = float(constants['k_lin'])
+        self._k_tor = float(constants['k_tor'])
+        
         self.cross_section_fn = cross_section_fn
-        self.clamp_fn = clamp_fn
-        self.k_lin = float(k_lin)
-        self.k_tor = float(k_tor)
-
-        # ── Static topology ──────────────────────────────────────────────────
-        self.n_base = len(base_curves_jax)
-        self.n_beams_per_coil = n_beam_cc + n_beam_cf
-        self.n_beams_total = self.n_base * self.n_beams_per_coil
-        self.n_support_dofs = 12 * self.n_beams_total
+        self.attachment_fn = attachment_fn
 
         # Per-coil: which local base-coil index is the CC-beam end target,
         # and which symmetry transform to apply to its geometry.
@@ -252,7 +238,7 @@ class SupportBeams(SupportFixed):
                 transform.append('none')
             else:
                 # Last coil wraps around
-                if self.stellsym:
+                if self.constants['stellsym']:
                     idx.append(self.n_base - 1)
                     transform.append('flip')
                 else:
@@ -281,14 +267,48 @@ class SupportBeams(SupportFixed):
              + local_j[None, None, :] * np.ones((n, 12, 12), dtype=int)).reshape(-1)
         return I.astype(np.int32), J.astype(np.int32)
 
-    # ============================================================================
-    # ABC implementation
-    # ============================================================================
 
     @property
     def is_coupled(self) -> bool:
         """``True`` — beams have their own DOFs coupled to coil surface nodes."""
         return True
+
+    @property
+    def n_beam_cc(self):
+        return self._n_beam_cc 
+        
+    @property
+    def n_beam_cf(self):
+        return self._n_beam_cf
+        
+    @property
+    def k_lin(self):
+        return self._k_lin 
+        
+    @property
+    def k_tor(self):
+        return self._k_tor 
+
+    @property
+    def n_base(self):
+        return len(self.base_curves_jax)
+        
+    @property
+    def n_beams_per_coil(self):
+        return self.n_beam_cc + self.n_beam_cf
+        
+    @property
+    def n_beams_total(self):
+        return self.n_base * self.n_beams_per_coil
+        
+    @property
+    def n_support_dofs(self):
+        """Each beam has 2 nodes, and each node carries 6 DOFs (linear system dofs, not optimizable dofs).
+        The dofs are:
+        3 translational: u (axial), v (bending in plane 1), w (bending in plane 2)
+        3 rotational: θx (torsion), θy, θz (bending rotations)
+        """
+        return 12 * self.n_beams_total
 
     def displacement_at(self, state: dict, points: jax.Array) -> jax.Array:
         """Return beam-side displacement at query points.
@@ -362,7 +382,7 @@ class SupportBeams(SupportFixed):
         elif transform == 'flip':
             return _flip_points(pts)   # self-inverse
         else:  # 'rotate'
-            angle = 2.0 * math.pi / self.nfp
+            angle = 2.0 * math.pi / self.constants['nfp']
             if inverse:
                 angle = -angle
             return _rotate_points_z(pts, angle)
@@ -608,11 +628,11 @@ class SupportBeams(SupportFixed):
         surf_pts: jax.Array,
         support_dofs,
     ):
-        """Compute clamp weights and moment arms for one beam endpoint.
+        """Compute weights and moment arms for one beam endpoint.
 
         Applies the endpoint's symmetry transform to ``surf_pts``, projects
         the shifted surface points into the beam's local frame, and calls
-        :attr:`clamp_fn`.
+        :attr:`attachment_fn`.
 
         Parameters
         ----------
@@ -631,7 +651,7 @@ class SupportBeams(SupportFixed):
         surf_tfm = self._apply_end_transform(surf_pts, spec['tfm'])
         r_k      = surf_tfm - spec['x_ep'][None, :]
         pts_beam = r_k @ spec['gamma3']
-        w_k      = self.clamp_fn(pts_beam, support_dofs, spec['sign_x'])
+        w_k      = self.attachment_fn(pts_beam, support_dofs, spec['sign_x'], self.constants)
         return w_k, r_k
 
     # ============================================================================
@@ -665,7 +685,7 @@ class SupportBeams(SupportFixed):
         -------
         jax.Array, shape ``(N, 12, 12)``
         """
-        E, nu = self.E, self.nu
+        E, nu = self.constants['E'], self.constants['nu']
         G = E / (2.0 * (1.0 + nu))      # shear modulus
 
         # Convenience scalars per beam
@@ -776,10 +796,10 @@ class SupportBeams(SupportFixed):
         """Winkler weights for coil ``coil_idx``.
 
         When ``dofs`` is ``None`` (e.g. during weight visualisation before a
-        solve), delegates entirely to :class:`SupportFixed` (uniform ones when
-        no ``support_fns`` were provided).  Otherwise sums the beam spring
+        solve), delegates entirely to :class:`Support` (uniform ones when
+        no ``fixed_clamp_fns`` were provided).  Otherwise sums the beam spring
         weights from all endpoints attached to ``coil_idx`` using the exact
-        beam-frame geometry, then optionally adds the ``SupportFixed`` term.
+        beam-frame geometry, then optionally adds the :class:`Support` term.
 
         Parameters
         ----------
@@ -794,7 +814,7 @@ class SupportBeams(SupportFixed):
         jax.Array, shape ``(n_surf,)``
         """
         if dofs is None:
-            return SupportFixed.compute_weights(
+            return Support.compute_weights(
                 self, coil_idx, surface_pts, curves_jax, dofs
             )
 
@@ -808,8 +828,8 @@ class SupportBeams(SupportFixed):
                 w_k, _ = self._clamp_weights_for_spec(spec, surface_pts, dofs)
                 w_total = w_total + w_k
 
-        if self._support_fns is not None:
-            w_total = w_total + SupportFixed.compute_weights(
+        if self._fixed_clamp_fns is not None:
+            w_total = w_total + Support.compute_weights(
                 self, coil_idx, surface_pts, curves_jax, dofs
             )
         return w_total
@@ -1207,7 +1227,7 @@ class SupportBeams(SupportFixed):
             Traced support DOF pytree containing ``phis_start_cc``,
             ``phis_end_cc``, ``phis_start_cf``, ``x_foundation``,
             ``thetas_orientation_cc``, ``thetas_orientation_cf``, and any
-            keys required by ``cross_section_fn`` and ``clamp_fn``.
+            keys required by ``cross_section_fn`` and ``attachment_fn``.
         surface_pts_by_coil : list[jax.Array] or None
             Current surface node positions per coil, shape
             ``(n_surface_nodes_i, 3)`` for coil ``i``.  Required when

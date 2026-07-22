@@ -18,7 +18,7 @@ fem = CoilFEM(
     stellsym        = stellsym,
     mesh_options    = mesh_options,
     material_options = material_options,   # E, nu, density
-    support_fn      = support_fn,          # Winkler BC (or None)
+    fixed_clamp_fn  = fixed_clamp_fn,      # Winkler BC (or None)
     support_dofs    = support_dofs,
     problem_options = problem_options,     # winkler_k
 )
@@ -35,7 +35,7 @@ This writes `vtu_out/coil00_run.vtu` (one file per base coil) containing:
 | `f_vol_Npm3` | cell, vector | N/m³ | Lorentz + gravity body-force density |
 | `B_self_T` | cell, vector | T | Self-field (quad-averaged) |
 | `B_ext_T` | cell, vector | T | Mutual (external) field (quad-averaged) |
-| `support_weight` | point, scalar | — | Winkler weight ∈ [0, 1] (if `support_fn` set) |
+| `support_weight` | point, scalar | — | Winkler weight ∈ [0, 1] (if `fixed_clamp_fn` set) |
 | `spring_k_Npm3` | point, scalar | N/m³ | Effective spring stiffness = `winkler_k × support_weight` |
 
 Print the parameters you will need in COMSOL:
@@ -129,7 +129,7 @@ analytically in COMSOL without importing a field:
 
 ### 6a. Winkler elastic foundation (distributed spring)
 
-If `support_fn` was supplied, the point field `spring_k_Npm3` in the VTU
+If `fixed_clamp_fn` was supplied, the point field `spring_k_Npm3` in the VTU
 gives the spatially varying Winkler stiffness (N/m³).
 
 In COMSOL:
@@ -150,7 +150,7 @@ selections instead of a spring — this is equivalent in the limit
 
 ### 6b. No support / Dirichlet BC
 
-If `support_fn = None`, coil-fem enforces a Dirichlet condition on specific
+If `fixed_clamp_fn = None`, coil-fem enforces a Dirichlet condition on specific
 boundary nodes through `support_dofs`.  Apply the same **Fixed Constraint** on
 the corresponding boundary selection in COMSOL.
 

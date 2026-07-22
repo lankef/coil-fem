@@ -70,7 +70,7 @@ class CoilFEMObjective(Optimizable):
             base_coils,
             nfp=plasma_surface.nfp,
             stellsym=plasma_surface.stellsym,
-            clamp_radius=0.05,
+            r_clamp=0.05,
         )
         Jstress = CoilFEMObjective(
             coil_support,
@@ -142,7 +142,7 @@ class CoilFEMObjective(Optimizable):
             coil_support.nfp,
             coil_support.stellsym,
             mesh_options,
-            support=coil_support,
+            support=coil_support.support,
             gravity_options=gravity_options,
             material_options=material_options,
             problem_options=problem_options,

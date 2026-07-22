@@ -31,7 +31,7 @@ from .problems import (
     recompute_fe_geometry,
 )
 from .pipelines import ElasticPipeline, ThermoElasticPipeline
-from .coupling import Support, SupportFixed, SupportBeams, solve_staggered, solve_monolithic
+from .coupling import Support, SupportBeams, solve_staggered, solve_monolithic
 from .metrics import (
     max_von_mises_hard,
     max_von_mises_lse,
@@ -159,7 +159,7 @@ class CoilFEM:
     Builds the full pipeline from base-coil geometry (DOFs + currents + support
     parameters) to per-metric structural objectives.  :meth:`objective` is
     differentiable via ``jax.grad`` w.r.t. all three argument groups.  Winkler
-    spring BC weights are computed by the :class:`~coil_fem.coupling.SupportFixed`
+    spring BC weights are computed by the :class:`~coil_fem.coupling.Support`
     object passed as ``support``.
 
     Parameters
@@ -191,10 +191,10 @@ class CoilFEM:
         then fixed for the rest of the optimisation run.
 
         A single dict is broadcast to all base coils.
-    support : SupportFixed or None
+    support : Support or None
         Support model providing per-surface-node Winkler weights via
         :meth:`~coil_fem.coupling.Support.compute_weights`.  ``None`` (default)
-        installs a :class:`~coil_fem.coupling.SupportFixed` with uniform unit
+        installs a :class:`~coil_fem.coupling.Support` with uniform unit
         weights (fully supported everywhere).
     gravity_options : dict or None
         If provided, enables a uniform gravitational body force ``ρ·g``.  May
@@ -247,7 +247,7 @@ class CoilFEM:
     ):
         self.verbose = verbose
         self._set_jaxfem_log_level()
-        self.support = support if support is not None else SupportFixed()
+        self.support = support if support is not None else Support()
 
         _valid_coupling = {'staggered', 'monolithic'}
         if coupling not in _valid_coupling:
@@ -519,7 +519,7 @@ class CoilFEM:
         body_force  : (n_cells, n_quads, 3)
         support_weights : (n_surface_nodes,) or None
             Per-surface-node Winkler weights in ``[0, 1]``.  Required when
-            ``support_fn`` was set at construction.
+            ``fixed_clamp_fn`` was set at construction.
 
         Returns
         -------
@@ -1123,15 +1123,15 @@ class CoilFEM:
             )
             written.append(mesh_path)
 
-        # ── Beam network geometry (SupportBeams only) ────────────────────────
-        if isinstance(self.support, SupportBeams) and base_support_dofs is not None:
+        # ── Beam network geometry (SupportBeams / CoilSupportBeams) ─────────────
+        if hasattr(self.support, 'n_beams_per_coil') and base_support_dofs is not None:
             import meshio
 
             curves_jax = [
                 CurveXYZFourierJAX(c.quadpoints, base_curves_dofs[i], c.order)
                 for i, c in enumerate(self.base_curves_jax)
             ]
-            geom = self.support._rest_geometry(curves_jax, base_support_dofs)
+            geom = self.support._beam_geometry(curves_jax, base_support_dofs)
 
             x_s = onp.asarray(geom['x_start'], dtype=onp.float64)  # (N, 3)
             x_e = onp.asarray(geom['x_end'],   dtype=onp.float64)  # (N, 3)
@@ -1440,7 +1440,7 @@ class CoilFEM:
           - cell field ``B_ext_T``  / ``B_ext_mag_T``  — quad-averaged external
             (mutual) field vector and magnitude ``(n_cells, 3)`` / ``(n_cells,)`` [T].
           - point field ``support_weight`` (``[0, 1]``) and ``spring_k_Npm3``
-            (N/m³) — only written when a ``support_fn`` was supplied.
+            (N/m³) — only written when a ``fixed_clamp_fn`` was supplied.
 
         Parameters
         ----------
