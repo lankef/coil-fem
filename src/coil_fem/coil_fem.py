@@ -1047,29 +1047,13 @@ class CoilFEM:
     ) -> list[str]:
         """Export Winkler support weights and full mesh as VTU files.
 
-        For each base coil ``i``, writes:
-
-        * ``{out_dir}/{prefix}{i:02d}_support.vtu`` — full tetrahedral mesh with:
-
-          - point field ``support_weight`` in ``[0, 1]``; ``1`` = fully
-            supported, ``0`` = free.
-          - point field ``spring_k_Npm3`` — effective Winkler spring stiffness
-            ``winkler_k × support_weight`` in N/m³.
-
-        When :attr:`support` is a :class:`~coil_fem.coupling.SupportBeams`
-        instance and ``base_support_dofs`` is provided, also writes:
-
-        * ``{out_dir}/{prefix}_beams.vtu`` — VTU file containing every base-coil
-          beam as a ``"line"`` cell.  Each line connects the two beam endpoints
-          (``x_start`` / ``x_end`` from :meth:`~coil_fem.coupling.SupportBeams._rest_geometry`).
-          Cell data fields:
-
-          - ``beam_type`` — ``0`` for coil-coil (CC), ``1`` for coil-foundation (CF).
-          - ``beam_length`` — rest-state beam length in metres.
-          - ``coil_index`` — index of the originating base coil (0-based).
-
-        Open in ParaView; use *Filters → Threshold* on ``support_weight`` or
-        ``spring_k_Npm3`` to isolate the clamped region.
+        Thin wrapper around :meth:`coil_fem.coupling.Support.save_support_vtu`;
+        the concrete support decides what is written.  The base
+        :class:`~coil_fem.coupling.Support` writes one
+        ``{prefix}{i:02d}_support.vtu`` per coil (``support_weights`` and
+        ``spring_k_Npm3`` point fields); :class:`~coil_fem.coupling.SupportBeams`
+        additionally writes ``{prefix}_beams.vtu`` when ``base_support_dofs`` is
+        provided.
 
         Parameters
         ----------
@@ -1088,83 +1072,13 @@ class CoilFEM:
         list[str]
             Paths of all files written, in order.
         """
-        import os
-        import numpy as onp
-
-        n_base = len(self.base_curves_jax)
-        if base_curves_dofs is None:
-            base_curves_dofs = [c.dofs for c in self.base_curves_jax]
-
-        winkler_k = float(self.problem_options['winkler_k'])
-
-        os.makedirs(out_dir, exist_ok=True)
-        written: list[str] = []
-
-        for i, coil_mesh in enumerate(self.meshes):
-            pts_i  = self.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
-            pts_np = onp.asarray(pts_i, dtype=onp.float64)
-            n_nodes = pts_np.shape[0]
-
-            surf_idx = onp.asarray(self.pipelines[i].surface_node_indices, dtype=onp.int32)
-            weights_surf = onp.asarray(
-                self._compute_support_weights(i, pts_i, base_curves_dofs, base_support_dofs),
-                dtype=onp.float64,
-            )
-            weight_full = onp.zeros(n_nodes, dtype=onp.float64)
-            weight_full[surf_idx] = weights_surf
-
-            mesh_path = os.path.join(out_dir, f"{prefix}{i:02d}_support.vtu")
-            self._write_coil_vtu(
-                mesh_path, coil_mesh, pts_np,
-                point_data={
-                    "support_weights":   weight_full,
-                    "spring_k_Npm3":    weight_full * winkler_k,
-                },
-            )
-            written.append(mesh_path)
-
-        # ── Beam network geometry (SupportBeams / CoilSupportBeams) ─────────────
-        if hasattr(self.support, 'n_beams_per_coil') and base_support_dofs is not None:
-            import meshio
-
-            curves_jax = [
-                CurveXYZFourierJAX(c.quadpoints, base_curves_dofs[i], c.order)
-                for i, c in enumerate(self.base_curves_jax)
-            ]
-            geom = self.support._beam_geometry(curves_jax, base_support_dofs)
-
-            x_s = onp.asarray(geom['x_start'], dtype=onp.float64)  # (N, 3)
-            x_e = onp.asarray(geom['x_end'],   dtype=onp.float64)  # (N, 3)
-            L   = onp.asarray(geom['L'],        dtype=onp.float64)  # (N,)
-            n_beams = x_s.shape[0]
-
-            # Build point array: first half = node-1 (start), second = node-2 (end).
-            pts_beams = onp.concatenate([x_s, x_e], axis=0)        # (2N, 3)
-            conn = onp.column_stack([                               # (N, 2)
-                onp.arange(n_beams),
-                onp.arange(n_beams, 2 * n_beams),
-            ]).astype(onp.int32)
-
-            # Cell labels: beam_type (CC=0, CF=1) and originating coil index.
-            n_per  = self.support.n_beams_per_coil
-            n_cc   = self.support.n_beam_cc
-            coil_idx_arr = onp.repeat(onp.arange(n_base), n_per).astype(onp.int32)
-            local_idx    = onp.tile(onp.arange(n_per), n_base)
-            beam_type    = (local_idx >= n_cc).astype(onp.int32)   # 0=CC, 1=CF
-
-            beam_path = os.path.join(out_dir, f"{prefix}_beams.vtu")
-            meshio.Mesh(
-                points=pts_beams,
-                cells=[("line", conn)],
-                cell_data={
-                    "beam_type":   [beam_type],
-                    "beam_length": [L],
-                    "coil_index":  [coil_idx_arr],
-                },
-            ).write(beam_path)
-            written.append(beam_path)
-
-        return written
+        return self.support.save_support_vtu(
+            self,
+            out_dir,
+            prefix=prefix,
+            base_curves_dofs=base_curves_dofs,
+            base_support_dofs=base_support_dofs,
+        )
 
     def plot_support(
         self,
@@ -1214,74 +1128,17 @@ class CoilFEM:
             The 3-D axes used for the plot.  The parent figure is available as
             ``ax.get_figure()``.
         """
-        import numpy as onp
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import to_rgb
-
-        n_base = len(self.base_curves_jax)
-        if base_curves_dofs is None:
-            base_curves_dofs = [c.dofs for c in self.base_curves_jax]
-
-        if ax is None:
-            _, ax = plt.subplots(subplot_kw={"projection": "3d"})
-        fig = ax.get_figure()
-
-        sc = None
-        for i in range(n_base):
-            pts_i  = self.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
-            pts_np = onp.asarray(pts_i, dtype=onp.float64)
-            n_nodes = pts_np.shape[0]
-
-            surf_idx = onp.asarray(self.pipelines[i].surface_node_indices, dtype=onp.int32)
-            weights_surf = onp.asarray(
-                self._compute_support_weights(i, pts_i, base_curves_dofs, base_support_dofs),
-                dtype=onp.float64,
-            )
-            weight_full = onp.zeros(n_nodes, dtype=onp.float64)
-            weight_full[surf_idx] = weights_surf
-
-            if simple_mode:
-                # No colormap/colorbar: encode weight as per-point alpha.
-                # Build an explicit (n_nodes, 4) RGBA array so per-point
-                # transparency survives even for hollow markers.
-                rgba = onp.empty((n_nodes, 4), dtype=onp.float64)
-                rgba[:, :3] = to_rgb(color)
-                rgba[:, 3] = onp.clip(weight_full, 0.0, 1.0)
-                # Route the per-point colour to the edges for hollow markers
-                # (``facecolors="none"``) and to the faces otherwise, avoiding
-                # the ``c``-vs-``facecolors`` precedence conflict.
-                scatter_kw = dict(kwargs)
-                if str(scatter_kw.get("facecolors")) == "none":
-                    scatter_kw.setdefault("edgecolors", rgba)
-                else:
-                    scatter_kw.setdefault("facecolors", rgba)
-                ax.scatter(
-                    pts_np[:, 0], pts_np[:, 1], pts_np[:, 2],
-                    s=s, **scatter_kw,
-                )
-            else:
-                sc = ax.scatter(
-                    pts_np[:, 0], pts_np[:, 1], pts_np[:, 2],
-                    s=s, c=weight_full, cmap=cmap, vmin=0.0, vmax=1.0,
-                    **kwargs,
-                )
-            # self.support.plot_support(
-            #     *,
-            #     base_curves_dofs: list[jax.Array] | None = None,
-            #     base_support_dofs: dict | None = None,
-            #     ax=ax,
-            #     s=s,
-            #     cmap=cmap,
-            #     color=color,
-            #     simple_mode=simple_mode,
-            #     **kwargs,
-            # )
-        if sc is not None and not simple_mode:
-            fig.colorbar(sc, ax=ax, label="support weight")
-        ax.set_xlabel("x [m]")
-        ax.set_ylabel("y [m]")
-        ax.set_zlabel("z [m]")
-        return ax
+        return self.support.plot_support(
+            self,
+            base_curves_dofs=base_curves_dofs,
+            base_support_dofs=base_support_dofs,
+            ax=ax,
+            s=s,
+            cmap=cmap,
+            color=color,
+            simple_mode=simple_mode,
+            **kwargs,
+        )
 
     def plot(
         self,
