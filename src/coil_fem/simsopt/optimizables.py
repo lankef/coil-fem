@@ -22,6 +22,7 @@ in :attr:`CoilSupport.constants` and are not optimised.
 from __future__ import annotations
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from ..presets import cross_section_fns
@@ -327,10 +328,14 @@ class CoilSupportBeams(CoilSupport):
         Whether stellarator symmetry is applied.
     beam_options : dict
         Contains the following entries:
-        n_beam_cc : int
-            Number of coil-coil beams per base coil.
-        n_beam_cf : int
-            Number of coil-foundation beams per base coil.
+        n_beam_cc : int or sequence of int
+            Number of coil-coil beams per CC group.  A scalar is broadcast
+            to every group; a sequence must have one entry per group:
+            ``n_base + 1`` entries when ``stellsym=True`` (the extra last
+            entry is the coil-0 ``phi = 0`` wrap group), else ``n_base``.
+        n_beam_cf : int or sequence of int
+            Number of coil-foundation beams per base coil.  Scalar (broadcast)
+            or length-``n_base`` sequence.
         E : float
             Young's modulus [Pa].
         nu : float
@@ -348,23 +353,25 @@ class CoilSupportBeams(CoilSupport):
         sigmoid_eps : float
             Sigmoid function widths of attachment points. Default is 0.1.
         and additional options needed by attachment_fn.
-    phis_start_cc : array-like or None
-        Initial start-attachment angles for CC beams, shape
-        ``(n_base, n_beam_cc)``.
-    phis_end_cc : array-like or None
-        Initial end-attachment angles for CC beams, shape
-        ``(n_base, n_beam_cc)``.
-    phis_start_cf : array-like or None
-        Initial start-attachment angles for CF beams, shape
-        ``(n_base, n_beam_cf)``.
-    x_foundation : array-like or None
-        Initial foundation anchor positions, shape ``(n_base, n_beam_cf, 3)``.
-    thetas_orientation_cc : array-like or None
-        Initial cross-section roll angles for CC beams, shape
-        ``(n_base, n_beam_cc)``.
-    thetas_orientation_cf : array-like or None
-        Initial cross-section roll angles for CF beams, shape
-        ``(n_base, n_beam_cf)``.
+    phis_start_cc : sequence of array-like or None
+        Initial start-attachment angles for CC beams, one entry per CC group
+        (``n_base + 1`` entries when ``stellsym=True``, else ``n_base``)
+        with entry ``g`` of shape ``(n_beam_cc[g],)``.
+    phis_end_cc : sequence of array-like or None
+        Initial end-attachment angles for CC beams, one entry per CC group
+        with entry ``g`` of shape ``(n_beam_cc[g],)``.
+    phis_start_cf : sequence of array-like or None
+        Initial start-attachment angles for CF beams, a length-``n_base``
+        sequence with entry ``i`` of shape ``(n_beam_cf[i],)``.
+    x_foundation : sequence of array-like or None
+        Initial foundation anchor positions, a length-``n_base`` sequence with
+        entry ``i`` of shape ``(n_beam_cf[i], 3)``.
+    thetas_orientation_cc : sequence of array-like or None
+        Initial cross-section roll angles for CC beams, one entry per CC
+        group with entry ``g`` of shape ``(n_beam_cc[g],)``.
+    thetas_orientation_cf : sequence of array-like or None
+        Initial cross-section roll angles for CF beams, a length-``n_base``
+        sequence with entry ``i`` of shape ``(n_beam_cf[i],)``.
     fixed_clamp_options : dict
         Optional additional fixed-sphere Winkler clamps on the coil surface.
         Set ``{'enabled': True, 'r_clamp': ..., 'n_clamp': ...}`` to enable;
@@ -432,72 +439,18 @@ class CoilSupportBeams(CoilSupport):
             raise ValueError(
                 f"beam_options must contain {missing_beam_options}."
             )
-        n_beam_cc = beam_options['n_beam_cc']
-        n_beam_cf = beam_options['n_beam_cf']
-
-
-        # ── Build initial support_dofs_jax with defaults ──────────────────────
-        _uniform_cc = jnp.broadcast_to(
-            jnp.linspace(0., 1., n_beam_cc, endpoint=False),
-            (n_base, n_beam_cc),
-        )
-        _uniform_cf = (
-            jnp.broadcast_to(
-                jnp.linspace(0., 1., n_beam_cf, endpoint=False),
-                (n_base, n_beam_cf),
-            ) if n_beam_cf > 0 else jnp.zeros((n_base, n_beam_cf))
-        )
-
-        support_dofs_jax = {
-            'phis_end_cc': (
-                _uniform_cc if phis_end_cc is None
-                else jnp.asarray(phis_end_cc, dtype=float)
-            ),
-            'phis_start_cc': (
-                _uniform_cc if phis_start_cc is None
-                else jnp.asarray(phis_start_cc, dtype=float)
-            ),
-            'phis_start_cf': (
-                _uniform_cf if phis_start_cf is None
-                else jnp.asarray(phis_start_cf, dtype=float)
-            ),
-            'thetas_orientation_cc': (
-                jnp.zeros((n_base, n_beam_cc)) if thetas_orientation_cc is None
-                else jnp.asarray(thetas_orientation_cc, dtype=float)
-            ),
-            'thetas_orientation_cf': (
-                jnp.zeros((n_base, n_beam_cf)) if thetas_orientation_cf is None
-                else jnp.asarray(thetas_orientation_cf, dtype=float)
-            ),
-            'x_foundation': (
-                jnp.zeros((n_base, n_beam_cf, 3)) if x_foundation is None
-                else jnp.asarray(x_foundation, dtype=float)
-            ),
-        }
-
-        # Cross-section DOF keys (e.g. radius for solid_circle).
-        # Each key is broadcast to shape (n_base, n_beam_cc + n_beam_cf) so that
-        # every beam can carry its own cross-section parameter as a separate DOF.
-        # Callers may pass a scalar (same value for all beams) or a full array.
-        if kwargs is None:
-            raise AttributeError(
-                "The cross section shape requires initial values of "
-                f"'{cross_section_dof_keys}' as keyword arguments for "
-                "CoilSupportBeams. No keyword arguments are detected."
-            )
-        for k in cross_section_dof_keys:
-            if k in kwargs:
-                support_dofs_jax[k] = jnp.broadcast_to(
-                    jnp.asarray(kwargs[k], dtype=float),
-                    (n_base, n_beam_cc + n_beam_cf),
-                )
-            else:
-                raise AttributeError(
-                    "The cross section shape requires an initial value of "
-                    f"'{k}' as keyword argument for CoilSupportBeams."
-                )
+        # ── Attachment function preset ─────────────────────────────────────────
+        if attachment_type == 'direct':
+            attachment_fn = fetch_attr(cross_section_type + '_attachment', cross_section_fns)
+        elif attachment_type == 'wrap':
+            attachment_fn = fetch_attr('wrap_attachment', cross_section_fns)
 
         # ── Optional fixed-sphere Winkler clamps ──────────────────────────────
+        # Resolved before SupportBeams construction because fixed_clamp_fns is
+        # a constructor argument.  The "must have >=1 CF beam" fallback check
+        # (disabled-clamp branch) needs n_beam_cf, so it is
+        # deferred until after SupportBeams has checked the counts below.
+        phis_arr = None
         if fixed_clamp_options.get('enabled', False):
             try:
                 r_clamp = fixed_clamp_options['r_clamp']
@@ -509,27 +462,18 @@ class CoilSupportBeams(CoilSupport):
             sigmoid_eps = fixed_clamp_options.get('sigmoid_eps', 0.1)
 
             phis_arr = _broadcast_phis(phis, n_base, n_clamp)
-            support_dofs_jax['phis'] = phis_arr
 
             fixed_clamp_fns = [
                 make_clamp_fn(i, r_clamp, sigmoid_eps, phis_arr[i])
                 for i in range(n_base)
             ]
         else:
-            if n_beam_cf == 0:
-                raise AttributeError(
-                    "The coils must be supported by either fixed clamps or "
-                    "coil-foundation beams. Currently neither is enabled."
-                )
             fixed_clamp_fns = None
 
-        # ── Attachment function preset ─────────────────────────────────────────
-        if attachment_type == 'direct':
-            attachment_fn = fetch_attr(cross_section_type + '_attachment', cross_section_fns)
-        elif attachment_type == 'wrap':
-            attachment_fn = fetch_attr('wrap_attachment', cross_section_fns)
-
         # ── Build the functional SupportBeams ─────────────────────────────────
+        # SupportBeams.__init__ is the single owner of the beam-count
+        # normalization (including the n_base + 1 stellsym convention); read
+        # the final counts back from it instead of recomputing them here.
         beams = SupportBeams(
             nfp=nfp,
             stellsym=stellsym,
@@ -540,6 +484,147 @@ class CoilSupportBeams(CoilSupport):
             attachment_fn=attachment_fn,
             fixed_clamp_fns=fixed_clamp_fns,
         )
+        n_beam_cc = beams.n_beam_cc
+        n_beam_cf = beams.n_beam_cf
+        n_groups_cc = beams.n_groups_cc
+
+        if not fixed_clamp_options.get('enabled', False):
+            # Each coil must be supported by either fixed clamps (handled
+            # above, applies to all coils) or at least one coil-foundation
+            # beam.
+            unsupported = [i for i in range(n_base) if n_beam_cf[i] < 1]
+            if unsupported:
+                raise AttributeError(
+                    "Each coil must be supported by either fixed clamps or at "
+                    "least one coil-foundation beam. Coils with neither: "
+                    f"{unsupported}."
+                )
+
+        # ── Build initial support_dofs_jax with defaults (ragged per-group) ────
+        # Every DOF is a Python list of per-group JAX arrays (a pytree, so
+        # ravel_pytree flattens it deterministically even with ragged sizes).
+        # CC keys have len(n_beam_cc) == n_groups_cc entries; CF keys have
+        # len(n_beam_cf) == n_base entries.
+        def _uniform_list(counts, cc_stellsym=False, cc_end=False):
+            out = []
+            for i in range(len(counts)):
+                c = counts[i]
+                if c==0:
+                    out.append(jnp.array([]))
+                    continue
+                # When stellsym=True, cc beams' initial positions must be generated 
+                # carefully.
+                if not cc_stellsym or i < len(counts)-2:
+                    # The first counts-2 elements are initialized normally.
+                    a, b = 0.0, 1.0
+                    half_interval = 0.5/c
+                else:
+                    # The last two elements must use ranges from:
+                    # - 0 to 0.5       (beam start)
+                    # - 1 - (phi init) (beam end)
+                    # otherwise, after reflections, the beams will overlap.
+                    # or intersect, which are intuitively not good initial 
+                    # conditions.
+                    a, b = 0.0, 0.5
+                    half_interval = 0.5/c/2
+                # The 0.5/c factor behind all terms also serves to 
+                # prevent overlaps after reflections 
+                phi_init = jnp.linspace(a, b, c, endpoint=False) + half_interval
+                if cc_end and i >= len(counts)-2:
+                    phi_init = 1 - phi_init
+                print('phi_init', i, phi_init)
+                out.append(phi_init)
+            return out
+
+        def _zeros_list(counts, trailing=()):
+            return [jnp.zeros((counts[i],) + trailing) for i in range(len(counts))]
+
+        def _check_ragged_shape(value, counts, name, trailing=()):
+            """Validate and cast a user-supplied ragged DOF to a per-group list."""
+            if value is None:
+                return None
+            seq = list(value)
+            if len(seq) != len(counts):
+                raise ValueError(
+                    f"{name} must be a length-{len(counts)} sequence (one entry "
+                    f"per CC group for cc keys — n_base + 1 when stellsym=True "
+                    f"— or per base coil for cf keys); got length {len(seq)}."
+                )
+            out = []
+            for i, v in enumerate(seq):
+                arr = jnp.asarray(v, dtype=float)
+                expected = (counts[i],) + trailing
+                if arr.shape != expected:
+                    raise ValueError(
+                        f"{name}[{i}] must have shape {expected}; got {arr.shape}."
+                    )
+                out.append(arr)
+            return out
+
+        _phis_end_cc   = _check_ragged_shape(phis_end_cc,           n_beam_cc, 'phis_end_cc')
+        _phis_start_cc = _check_ragged_shape(phis_start_cc,         n_beam_cc, 'phis_start_cc')
+        _phis_start_cf = _check_ragged_shape(phis_start_cf,         n_beam_cf, 'phis_start_cf')
+        _theta_cc      = _check_ragged_shape(thetas_orientation_cc, n_beam_cc, 'thetas_orientation_cc')
+        _theta_cf      = _check_ragged_shape(thetas_orientation_cf, n_beam_cf, 'thetas_orientation_cf')
+        _x_foundation  = _check_ragged_shape(x_foundation,          n_beam_cf, 'x_foundation', trailing=(3,))
+
+        support_dofs_jax = {
+            'phis_end_cc':        _phis_end_cc if _phis_end_cc   is not None else _uniform_list(n_beam_cc, stellsym, True),
+            'phis_start_cc':    _phis_start_cc if _phis_start_cc is not None else _uniform_list(n_beam_cc, stellsym),
+            'phis_start_cf':    _phis_start_cf if _phis_start_cf is not None else _uniform_list(n_beam_cf),
+            'thetas_orientation_cc': _theta_cc if _theta_cc      is not None else _zeros_list(n_beam_cc),
+            'thetas_orientation_cf': _theta_cf if _theta_cf      is not None else _zeros_list(n_beam_cf),
+            'x_foundation':      _x_foundation if _x_foundation  is not None else _zeros_list(n_beam_cf, trailing=(3,)),
+        }
+        if phis_arr is not None:
+            support_dofs_jax['phis'] = phis_arr
+
+        # Cross-section DOF keys (e.g. radius for solid_circle).
+        # Each key becomes a per-group list so every beam can carry its own
+        # cross-section parameter as a DOF: entry i < n_base has shape
+        # (n_beam_cc[i] + n_beam_cf[i],); with stellsym an extra entry n_base
+        # has shape (n_beam_cc[n_base],) for the wrap group (no CF part).
+        # Callers may pass a scalar (same value for every beam) or a
+        # per-group sequence of arrays.
+        _cs_counts = [
+            n_beam_cc[i] + (n_beam_cf[i] if i < n_base else 0)
+            for i in range(n_groups_cc)
+        ]
+        if kwargs is None:
+            raise AttributeError(
+                "The cross section shape requires initial values of "
+                f"'{cross_section_dof_keys}' as keyword arguments for "
+                "CoilSupportBeams. No keyword arguments are detected."
+            )
+        for k in cross_section_dof_keys:
+            if k not in kwargs:
+                raise AttributeError(
+                    "The cross section shape requires an initial value of "
+                    f"'{k}' as keyword argument for CoilSupportBeams."
+                )
+            val = kwargs[k]
+            if np.ndim(val) == 0:
+                support_dofs_jax[k] = [
+                    jnp.broadcast_to(
+                        jnp.asarray(val, dtype=float), (_cs_counts[i],)
+                    )
+                    for i in range(n_groups_cc)
+                ]
+            else:
+                seq = list(val)
+                if len(seq) != n_groups_cc:
+                    raise ValueError(
+                        f"Cross-section DOF '{k}' must be a scalar or a "
+                        f"length-{n_groups_cc} sequence (one entry per CC "
+                        f"group; n_base + 1 when stellsym=True); got length "
+                        f"{len(seq)}."
+                    )
+                support_dofs_jax[k] = [
+                    jnp.broadcast_to(
+                        jnp.asarray(seq[i], dtype=float), (_cs_counts[i],)
+                    )
+                    for i in range(n_groups_cc)
+                ]
 
         # ── Compute boolean fixed_mask from fixed_dof_names ───────────────────
         if fixed_dof_names is None:
@@ -547,9 +632,13 @@ class CoilSupportBeams(CoilSupport):
                 ['thetas_orientation_cc', 'thetas_orientation_cf']
 
         fixed_dof_names = list(fixed_dof_names)
-        if n_beam_cc == 0:
+        # When *no* coil has CC (resp. CF) beams, those keys are all zero-size
+        # leaves anyway; marking them fixed is harmless and documents intent.
+        # Per-coil zero counts are handled automatically: an empty leaf
+        # contributes no DOFs to the flattened vector.
+        if sum(n_beam_cc) == 0:
             fixed_dof_names += ['phis_start_cc', 'phis_end_cc', 'thetas_orientation_cc']
-        if n_beam_cf == 0:
+        if sum(n_beam_cf) == 0:
             fixed_dof_names += ['phis_start_cf', 'x_foundation', 'thetas_orientation_cf']
 
         valid_keys = support_dofs_jax.keys()
@@ -559,22 +648,32 @@ class CoilSupportBeams(CoilSupport):
                 f"fixed_dof_names: {invalid_keys} not valid "
                 f"support_dofs key(s). Valid keys: {valid_keys}"
             )
+        # Build the boolean fixed-mask over the same (possibly ragged) pytree
+        # structure as support_dofs_jax so it stays bit-aligned after ravel.
         probe = {
-            k: np.full_like(v, k in fixed_dof_names, dtype=bool)
+            k: jax.tree_util.tree_map(
+                lambda leaf, kk=k: np.full(np.shape(leaf), kk in fixed_dof_names, dtype=bool),
+                v,
+            )
             for k, v in support_dofs_jax.items()
         }
         fixed_mask, _ = ravel_pytree(probe)
 
         # ── Summary ───────────────────────────────────────────────────────────
+        def _shapes(v):
+            if isinstance(v, list):
+                return [tuple(np.shape(leaf)) for leaf in v]
+            return tuple(np.shape(v))
+
         print('Beam network initialized.')
         print('Optimizing:')
         for k in valid_keys:
             if k not in fixed_dof_names:
-                print('   ', k, '- shape:', np.array(support_dofs_jax[k]).shape)
+                print('   ', k, '- per-coil shapes:', _shapes(support_dofs_jax[k]))
         print('Fixing:')
         for k in fixed_dof_names:
             print('   ', k)
-        print('Total # dofs:', len(fixed_mask) - np.sum(fixed_mask))
+        print('Total # dofs:', len(fixed_mask) - int(np.sum(fixed_mask)))
 
         # ── Initialize CoilSupport (calls Optimizable.__init__) ───────────────
         super().__init__(

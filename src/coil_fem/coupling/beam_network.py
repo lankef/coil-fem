@@ -29,7 +29,6 @@ import lineax
 
 from .supports import Support
 from ..geo.curve_jax import CurveXYZFourierJAX
-from ..geo.symmetries import _flip_points, _rotate_points_z
 
 
 # ============================================================================
@@ -120,11 +119,15 @@ class SupportBeams(Support):
         traced curves are always rebuilt inside :meth:`coo` / :meth:`solve`.
     beam_options : dict
         Contains the following entries
-        n_beam_cc : int
-            Number of coil-coil beams per base coil (connecting coil ``i`` to
-            coil ``i+1``, with symmetry-aware wraparound at the last coil).
-        n_beam_cf : int
-            Number of coil-foundation beams per base coil.
+        n_beam_cc : int or sequence of int
+            Number of coil-coil beams per CC group.  A scalar is broadcast to
+            every group; a sequence must have one entry per group:
+            ``n_base + 1`` entries when ``stellsym=True`` (the extra last
+            entry is the coil-0 ``phi = 0`` wrap group), else ``n_base``.
+            See the *CC beam groups* note below.
+        n_beam_cf : int or sequence of int
+            Number of coil-foundation beams per base coil.  Scalar (broadcast)
+            or length-``n_base`` sequence.
         E : float
             Young's modulus [Pa].
         nu : float
@@ -138,8 +141,11 @@ class SupportBeams(Support):
         and additional constants that ``attachment_fn`` needs.
     cross_section_fn : callable
         ``cross_section_fn(support_dofs) -> (A, Iy, Iz, J)`` where each
-        returned array has shape ``(n_base, n_beam_cc + n_beam_cf)``.
-        Section-property validation is delegated to this callable.
+        returned value is a per-group list of arrays: entry ``i < n_base``
+        has shape ``(n_beam_cc[i] + n_beam_cf[i],)``; when ``stellsym=True``
+        an extra entry ``n_base`` has shape ``(n_beam_cc[n_base],)`` (wrap
+        group, no CF part).  Section-property validation is delegated to
+        this callable.
     attachment_fn : callable
         ``attachment_fn(surface_pts_beam_frame, dofs, sign_x, beam_options) -> weights``
         where ``surface_pts_beam_frame`` is ``(n_surface_nodes, 3)`` — surface
@@ -159,26 +165,45 @@ class SupportBeams(Support):
     **Beam DOF layout** (support-local numbering, one beam = 12 consecutive
     DOFs):
 
-    * Beams are indexed ``b = i * (n_beam_cc + n_beam_cf) + j``, with CC
-      beams ``j = 0 … n_beam_cc-1`` and CF beams
-      ``j = n_beam_cc … n_beam_cc+n_beam_cf-1`` within coil ``i``.
+    * Beams are ordered coil-major, cc-then-cf.  With per-coil counts, coil
+      ``i`` starts at the cumulative offset ``beam_offsets[i] =
+      Σ_{i'<i} (n_beam_cc[i'] + n_beam_cf[i'])``; its CC beams occupy local
+      slots ``0 … n_beam_cc[i]-1`` and its CF beams
+      ``n_beam_cc[i] … n_beam_cc[i]+n_beam_cf[i]-1``.  When ``stellsym=True``
+      the wrap group's beams (group ``n_base``) are appended after all
+      per-coil blocks, starting at ``wrap_beam_offset``.
     * Local DOF ordering per beam follows Figure 4.6 of
       ``docs/theory/bisymbeam.rst``:
       ``[u1, v1, w1, θx1, θy1, θz1, u2, v2, w2, θx2, θy2, θz2]``.
 
-    **Wraparound for the last coil's CC beams**:
+    **CC beam groups and symmetry wraparound**:
 
-    * ``i < n_base - 1``: endpoint attaches to ``base_coil[i+1]`` without
-      any transform.
-    * ``i == n_base - 1``, ``stellsym=True``: attaches to a stellarator-
-      symmetric image of ``base_coil[n_base-1]`` (flip ``y, z`` signs).
-    * ``i == n_base - 1``, ``stellsym=False``: attaches to the first
-      field-period rotation of ``base_coil[0]`` (rotate by
-      ``2π / nfp`` about z).
+    CC beams are organised in ``n_groups_cc`` groups (``n_base + 1`` when
+    ``stellsym=True``, else ``n_base``):
+
+    * group ``i < n_base - 1``: connects ``base_coil[i]`` to
+      ``base_coil[i+1]`` (no transform).
+    * group ``n_base - 1``, ``stellsym=True``: connects the last coil to its
+      stellarator reflection about the ``phi = pi/nfp`` half-period plane
+      (``'flip_half'``).
+    * group ``n_base - 1``, ``stellsym=False``: connects the last coil to
+      the next field-period rotation of ``base_coil[0]`` (``'rotate'``).
+    * group ``n_base`` (``stellsym=True`` only): connects ``base_coil[0]``
+      to its stellarator reflection about the ``phi = 0`` plane (``'flip'``).
+
+    Each boundary beam has a stellarator-symmetric partner beam whose
+    attachment angles are the master's swapped
+    (``phi_start <-> phi_end``).  Partner beams are never assembled:
+    symmetry implies ``u_partner = Q u_master``, so the pair is represented
+    exactly by the master's 12 DOFs plus ``Q``-transformed coupling blocks.
+    All transforms ``Q`` are proper rotations (the stellarator flip is a C2
+    rotation about x), so displacements, forces, torques and rotation DOFs
+    transform alike.
 
     **Stiffness matrix symmetry**: the torque law
-    ``τ = k_tor (u_endpoint − u_mesh) × r`` contributes an asymmetric
-    ``[r]×`` block.  ``K_ss`` is therefore **not symmetric** in general.
+    ``τ = k_tor Σ w r × (u_attach − u_mesh)`` uses ``k_tor`` while the force
+    law uses ``k_lin``, so the torque rows are not the transpose of the
+    translation rows and ``K_ss`` is **not symmetric** in general.
     :meth:`solve` uses ``lineax`` which imposes no symmetry assumption.
     A future monolithic cuDSS path must use ``mtype_id=0`` (general).
     """
@@ -200,25 +225,70 @@ class SupportBeams(Support):
         self._beam_options = beam_options
         self._nfp = nfp
         self._stellsym = stellsym
-        self._n_beam_cc = int(beam_options['n_beam_cc'])
-        self._n_beam_cf = int(beam_options['n_beam_cf'])
+        n_base = len(self.base_curves_jax)
+        # CC beams are organised in n_groups_cc groups: group i < n_base
+        # connects coil i toward +phi (coil i+1, with a symmetry wrap at
+        # i = n_base-1).  With stellsym an extra group n_base connects coil 0
+        # to its phi = 0 stellarator image.
+        self._n_groups_cc = n_base + (1 if stellsym else 0)
+        # Beam counts: accept an int (broadcast) or a length-n_groups_cc
+        # (cc) / length-n_base (cf) list/array.  Stored as tuples of ints.
+        self._n_beam_cc = self._check_beam_counts(
+            beam_options['n_beam_cc'], self._n_groups_cc, 'n_beam_cc'
+        )
+        # When stellsym==True, the beams connecting the last coil to its 
+        # reflection (_n_beam_cc[-2]) and the first coil to its reflection 
+        # (_n_beam_cc[-1]) are copied by reflection as well. Therefore, 
+        # we HALF the corresponding _n_beam_cc entries to make sure that 
+        # the final beam counts is still the even integer closest to the 
+        # specified n_beam_cc.
+        if stellsym:
+            _n_beam_cc_temp = list(self._n_beam_cc)
+            _n_beam_cc_temp[-1] = int(math.ceil(_n_beam_cc_temp[-1]/2))
+            _n_beam_cc_temp[-2] = int(math.ceil(_n_beam_cc_temp[-2]/2))
+            self._n_beam_cc = tuple(_n_beam_cc_temp)
+        self._n_beam_cf = self._check_beam_counts(
+            beam_options['n_beam_cf'], n_base, 'n_beam_cf'
+        )
+        # Cumulative global-beam offset per coil (coil-major, cc-then-cf order):
+        # beam b of coil i starts at 12 * (_beam_offsets[i] + local_index).
+        # The stellsym wrap group (group n_base) is appended after all
+        # per-coil blocks, starting at _wrap_beam_offset.
+        _per_coil = [self._n_beam_cc[i] + self._n_beam_cf[i] for i in range(n_base)]
+        self._beam_offsets = tuple(int(sum(_per_coil[:i])) for i in range(n_base))
+        self._wrap_beam_offset = int(sum(_per_coil))
+        _n_wrap = self._n_beam_cc[n_base] if stellsym else 0
+        self._n_beams_total = self._wrap_beam_offset + _n_wrap
         self._k_lin = float(beam_options['k_lin'])
         self._k_tor = float(beam_options['k_tor'])
 
         self.cross_section_fn = cross_section_fn
         self.attachment_fn = attachment_fn
-        # Keys in support_dofs whose values are shaped (n_base, n_beams_per_coil);
-        # _clamp_weights_for_spec slices [coil, local_beam] before passing to
+        # Keys in support_dofs holding per-group lists of per-beam scalars;
+        # _clamp_weights_for_spec slices [group, local_beam] before passing to
         # attachment_fn so each call receives a scalar, not the full array.
         self._cross_section_dof_keys = tuple(cross_section_dof_keys)
 
-        # Per-coil: which local base-coil index is the CC-beam end target,
-        # and which symmetry transform to apply to its geometry.
-        # 'none'   -> no transform (i < n_base - 1)
-        # 'flip'   -> stellsym flip (i == n_base-1, stellsym=True)
-        # 'rotate' -> rotate by 2π/nfp about z (i == n_base-1, stellsym=False)
-        self._end_coil_local_idx, self._end_coil_transform = \
-            self._build_end_coil_map()
+        # Wraparound symmetry transforms.  Every transform is a *proper*
+        # rotation (det = +1): the stellarator flip diag(1,-1,-1) is a C2
+        # rotation about x, so displacements, forces, torques and rotation
+        # DOFs all transform by the same 3x3 matrix Q (no pseudovector
+        # sign cases).  'flip'/'flip_half' are involutions (Q @ Q = I).
+        _flip_Q = np.diag([1.0, -1.0, -1.0])
+        _c = math.cos(2.0 * math.pi / nfp)
+        _s = math.sin(2.0 * math.pi / nfp)
+        _rot_Q = np.array([[_c, -_s, 0.0],
+                           [_s,  _c, 0.0],
+                           [0.0, 0.0, 1.0]])
+        self._tfm_Q = {
+            'none':      np.eye(3),
+            'flip':      _flip_Q,            # stellsym about phi = 0
+            'flip_half': _rot_Q @ _flip_Q,   # stellsym about phi = pi/nfp
+            'rotate':    _rot_Q,             # next field period
+        }
+
+        # CC group topology: (start_coil, end_coil, transform_tag) per group.
+        self._cc_groups = self._build_cc_groups()
 
         # Pre-build the static COO index arrays (I and J are loop-invariant).
         self._coo_I, self._coo_J = self._build_static_ij()
@@ -227,23 +297,64 @@ class SupportBeams(Support):
     # Static topology helpers (called once at construction)
     # ============================================================================
 
-    def _build_end_coil_map(self):
-        """Build per-coil CC-beam endpoint target index and transform tag."""
-        idx = []
-        transform = []
-        for i in range(self.n_base):
-            if i < self.n_base - 1:
-                idx.append(i + 1)
-                transform.append('none')
-            else:
-                # Last coil wraps around
-                if self.stellsym:
-                    idx.append(self.n_base - 1)
-                    transform.append('flip')
-                else:
-                    idx.append(0)
-                    transform.append('rotate')
-        return idx, transform
+    @staticmethod
+    def _check_beam_counts(value, n_entries: int, name: str) -> tuple:
+        """Broadcast/length-check a beam count integer/tuple. 
+        
+        This function broadcasts a beam count if it is an integer. If 
+        it is a tuple/list, this function makes sure that contains
+        ``n_entries`` entries.
+
+        Parameters
+        ----------
+        value : int or sequence of int
+            A scalar (broadcast to every entry) or a length-``n_entries``
+            sequence.
+        n_entries : int
+            Number of entries (``n_base`` for CF beams; the number of CC
+            groups — ``n_base + 1`` when ``stellsym=True`` — for CC beams).
+        name : str
+            Option name, used only in error messages.
+
+        Returns
+        -------
+        tuple of int, length ``n_entries``
+        """
+        if np.ndim(value) == 0:
+            return tuple(int(value) for _ in range(n_entries))
+        seq = list(value)
+        if len(seq) != n_entries:
+            note = (
+                " (n_beam_cc has one entry per CC group: n_base + 1 when "
+                "stellsym=True — the extra last entry is the coil-0 phi=0 "
+                "wrap group — else n_base)"
+            ) if name == 'n_beam_cc' else ""
+            raise ValueError(
+                f"beam_options['{name}'] must be an int or a "
+                f"length-{n_entries} sequence; got length {len(seq)}{note}."
+            )
+        return tuple(int(v) for v in seq)
+
+    def _build_cc_groups(self) -> tuple:
+        """Build the CC-beam group topology.
+
+        Returns a tuple of ``(start_coil, end_coil, transform_tag)`` triples,
+        one per CC group:
+
+        * groups ``i < n_base - 1``: ``(i, i+1, 'none')``.
+        * group ``n_base - 1``: last coil wraps — ``(n-1, n-1, 'flip_half')``
+          when ``stellsym`` (reflection about ``phi = pi/nfp``), else
+          ``(n-1, 0, 'rotate')`` (next field period).
+        * group ``n_base`` (``stellsym`` only): ``(0, 0, 'flip')`` — coil 0
+          to its ``phi = 0`` stellarator image.
+        """
+        groups = [(i, i + 1, 'none') for i in range(self.n_base - 1)]
+        if self.stellsym:
+            groups.append((self.n_base - 1, self.n_base - 1, 'flip_half'))
+            groups.append((0, 0, 'flip'))
+        else:
+            groups.append((self.n_base - 1, 0, 'rotate'))
+        return tuple(groups)
 
     def _build_static_ij(self):
         """Build flat COO row/column index arrays (static — no traced values).
@@ -289,12 +400,34 @@ class SupportBeams(Support):
 
     @property
     def n_beam_cc(self):
+        """Per-group coil-coil beam counts, length-``n_groups_cc`` tuple of int."""
         return self._n_beam_cc 
         
     @property
     def n_beam_cf(self):
+        """Per-coil coil-foundation beam counts, length-``n_base`` tuple of int."""
         return self._n_beam_cf
-        
+
+    @property
+    def n_groups_cc(self):
+        """Number of CC beam groups: ``n_base + 1`` when stellsym else ``n_base``."""
+        return self._n_groups_cc
+
+    @property
+    def cc_groups(self):
+        """CC group topology: tuple of ``(start_coil, end_coil, transform)``."""
+        return self._cc_groups
+
+    @property
+    def beam_offsets(self):
+        """Cumulative global-beam offset per coil, length-``n_base`` tuple of int."""
+        return self._beam_offsets
+
+    @property
+    def wrap_beam_offset(self):
+        """Global beam index where the stellsym wrap group (group ``n_base``) starts."""
+        return self._wrap_beam_offset
+
     @property
     def k_lin(self):
         return self._k_lin 
@@ -309,11 +442,18 @@ class SupportBeams(Support):
         
     @property
     def n_beams_per_coil(self):
-        return self.n_beam_cc + self.n_beam_cf
+        """Per-coil total beam counts (cc group i + cf coil i), length-``n_base``.
+
+        Excludes the stellsym wrap group (group ``n_base``), whose beams are
+        appended after all per-coil blocks.
+        """
+        return tuple(
+            self._n_beam_cc[i] + self._n_beam_cf[i] for i in range(self.n_base)
+        )
         
     @property
     def n_beams_total(self):
-        return self.n_base * self.n_beams_per_coil
+        return self._n_beams_total
         
     @property
     def n_support_dofs(self):
@@ -377,29 +517,26 @@ class SupportBeams(Support):
     ) -> jax.Array:
         """Apply (or invert) the wraparound symmetry transform.
 
+        Every transform is a proper rotation ``Q`` (see ``_tfm_Q``), so the
+        same map applies to points, displacements, forces, torques and
+        rotation DOFs alike.
+
         Parameters
         ----------
         pts : jax.Array, shape ``(..., 3)``
         transform : str
-            One of ``'none'``, ``'flip'``, ``'rotate'``.
+            One of ``'none'``, ``'flip'``, ``'flip_half'``, ``'rotate'``.
         inverse : bool
-            When ``True``, apply the *inverse* of the named transform.
-            ``'none'`` and ``'flip'`` are self-inverse; ``'rotate'`` uses
-            ``−2π/nfp`` instead of ``+2π/nfp``.
+            When ``True``, apply ``Q^T`` (the inverse rotation).
 
         Returns
         -------
         jax.Array, same shape as ``pts``
         """
-        if transform == 'none':
-            return pts
-        elif transform == 'flip':
-            return _flip_points(pts)   # self-inverse
-        else:  # 'rotate'
-            angle = 2.0 * math.pi / self.nfp
-            if inverse:
-                angle = -angle
-            return _rotate_points_z(pts, angle)
+        Q = self._tfm_Q[transform]
+        if inverse:
+            return pts @ Q          # row-vector form of Q^T @ p
+        return pts @ Q.T            # row-vector form of Q @ p
 
     def _beam_geometry(
         self,
@@ -433,32 +570,31 @@ class SupportBeams(Support):
         * ``'t_coil_end'``  : (N_beams, 3) — coil tangent at node-2 for CC beams;
           zero vector for CF beams (foundation side has no coil tangent).
         """
-        phis_start_cc = support_dofs['phis_start_cc']       # (n_base, n_beam_cc)
-        phis_end_cc   = support_dofs['phis_end_cc']         # (n_base, n_beam_cc)
-        phis_start_cf = support_dofs['phis_start_cf']       # (n_base, n_beam_cf)
-        x_foundation = support_dofs['x_foundation']       # (n_base, n_beam_cf, 3)
+        phis_start_cc = support_dofs['phis_start_cc']       # list[g] -> (n_beam_cc[g],)
+        phis_end_cc   = support_dofs['phis_end_cc']         # list[g] -> (n_beam_cc[g],)
+        phis_start_cf = support_dofs['phis_start_cf']       # list[i] -> (n_beam_cf[i],)
+        x_foundation = support_dofs['x_foundation']       # list[i] -> (n_beam_cf[i], 3)
 
         x_start_list, x_end_list = [], []
         t_coil_start_list, t_coil_end_list = [], []
 
-        for i, curve_i in enumerate(curves):
-            end_idx = self._end_coil_local_idx[i]
-            end_tfm = self._end_coil_transform[i]
-            curve_end = curves[end_idx]
+        def append_cc_group(g):
+            """Append the CC beams of group ``g`` in local-beam order."""
+            start_idx, end_idx, end_tfm = self._cc_groups[g]
+            curve_s = curves[start_idx]
+            curve_e = curves[end_idx]
+            for j in range(self.n_beam_cc[g]):
+                phi_s = phis_start_cc[g][j]
+                phi_e = phis_end_cc[g][j]
 
-            # ── CC beams for coil i ──────────────────────────────────────────
-            for j in range(self.n_beam_cc):
-                phi_s = phis_start_cc[i, j]
-                phi_e = phis_end_cc[i, j]
-
-                x_s = curve_i.gamma_eval(phi_s)        # (3,)
-                x_e_raw = curve_end.gamma_eval(phi_e)  # (3,) — may need transform
+                x_s = curve_s.gamma_eval(phi_s)        # (3,)
+                x_e_raw = curve_e.gamma_eval(phi_e)    # (3,) — may need transform
                 x_e = self._apply_end_transform(x_e_raw, end_tfm)
 
                 # Coil tangent vectors at the attachment phis
-                t_cs_raw = curve_i.gamma_eval(phi_s, diff_order=1)         # (3,)
+                t_cs_raw = curve_s.gamma_eval(phi_s, diff_order=1)         # (3,)
                 t_cs = t_cs_raw / (jnp.linalg.norm(t_cs_raw) + 1e-300)
-                t_ce_raw = curve_end.gamma_eval(phi_e, diff_order=1)       # (3,)
+                t_ce_raw = curve_e.gamma_eval(phi_e, diff_order=1)         # (3,)
                 t_ce_raw = self._apply_end_transform(t_ce_raw, end_tfm)
                 t_ce = t_ce_raw / (jnp.linalg.norm(t_ce_raw) + 1e-300)
 
@@ -467,11 +603,15 @@ class SupportBeams(Support):
                 t_coil_start_list.append(t_cs)
                 t_coil_end_list.append(t_ce)
 
+        for i, curve_i in enumerate(curves):
+            # ── CC beams of group i (start coil = i) ─────────────────────────
+            append_cc_group(i)
+
             # ── CF beams for coil i ──────────────────────────────────────────
-            for j in range(self.n_beam_cf):
-                phi_s = phis_start_cf[i, j]
+            for j in range(self.n_beam_cf[i]):
+                phi_s = phis_start_cf[i][j]
                 x_s = curve_i.gamma_eval(phi_s)        # (3,)
-                x_e = x_foundation[i, j]               # (3,) — traced support DOF
+                x_e = x_foundation[i][j]               # (3,) — traced support DOF
 
                 t_cs_raw = curve_i.gamma_eval(phi_s, diff_order=1)
                 t_cs = t_cs_raw / (jnp.linalg.norm(t_cs_raw) + 1e-300)
@@ -481,6 +621,10 @@ class SupportBeams(Support):
                 t_coil_start_list.append(t_cs)
                 # CF: no coil tangent at foundation side → zero placeholder
                 t_coil_end_list.append(jnp.zeros(3))
+
+        # ── Stellsym wrap group: coil 0 -> its phi = 0 image ─────────────────
+        if self.stellsym:
+            append_cc_group(self.n_base)
 
         x_start = jnp.stack(x_start_list, axis=0)         # (N, 3)
         x_end   = jnp.stack(x_end_list,   axis=0)         # (N, 3)
@@ -528,19 +672,23 @@ class SupportBeams(Support):
         jax.Array, shape ``(N_beams, 3, 3)``
             Column-major: ``Gamma[b] = [x_local | y_local | z_local]``.
         """
-        theta_cc = support_dofs['thetas_orientation_cc']  # (n_base, n_beam_cc)
-        theta_cf = support_dofs['thetas_orientation_cf']  # (n_base, n_beam_cf)
+        theta_cc = support_dofs['thetas_orientation_cc']  # list[g] -> (n_beam_cc[g],)
+        theta_cf = support_dofs['thetas_orientation_cf']  # list[i] -> (n_beam_cf[i],)
 
         t_beam = geom['t_beam']           # (N, 3)
         t_coil = geom['t_coil_start']     # (N, 3)
 
-        # Flatten theta angles in the same beam ordering (cc first, then cf)
+        # Flatten theta angles in the same beam ordering (per coil: cc group i
+        # then cf coil i; stellsym wrap group appended last).
         theta_list = []
         for i in range(self.n_base):
-            for j in range(self.n_beam_cc):
-                theta_list.append(theta_cc[i, j])
-            for j in range(self.n_beam_cf):
-                theta_list.append(theta_cf[i, j])
+            for j in range(self.n_beam_cc[i]):
+                theta_list.append(theta_cc[i][j])
+            for j in range(self.n_beam_cf[i]):
+                theta_list.append(theta_cf[i][j])
+        if self.stellsym:
+            for j in range(self.n_beam_cc[self.n_base]):
+                theta_list.append(theta_cc[self.n_base][j])
         thetas = jnp.stack(theta_list, axis=0)  # (N,)
 
         def single_dcm(t_b, t_c, theta):
@@ -585,6 +733,9 @@ class SupportBeams(Support):
         * ``'b'``         : flat beam index.
         * ``'node_side'`` : ``0`` (node-1) or ``1`` (node-2).
         * ``'coil'``      : index of the base coil this endpoint couples to.
+        * ``'coil_origin'``: group index into the per-group support-dofs
+          lists (CC group index, or coil index for CF beams).
+        * ``'j_local'``   : local beam index within that group's list entry.
         * ``'x_ep'``      : ``(3,)`` endpoint position in the frame where
           ``coil`` surface points live (after symmetry transform when required).
         * ``'gamma3'``    : ``(3, 3)`` DCM for this beam
@@ -592,8 +743,8 @@ class SupportBeams(Support):
         * ``'sign_x'``    : ``True`` at node-1 (beam extends toward
           ``+x_local``); ``False`` at node-2.
         * ``'tfm'``       : symmetry transform tag ``'none'`` / ``'flip'`` /
-          ``'rotate'`` — applied to surface points before computing moment
-          arms.  Always ``'none'`` for node-1.
+          ``'flip_half'`` / ``'rotate'`` — applied to surface points before
+          computing moment arms.  Always ``'none'`` for node-1.
 
         Parameters
         ----------
@@ -607,32 +758,43 @@ class SupportBeams(Support):
         list of dicts, one per coil-touching endpoint.
         """
         specs = []
-        b = 0
-        for i in range(self.n_base):
-            end_idx = self._end_coil_local_idx[i]
-            end_tfm = self._end_coil_transform[i]
 
-            for j in range(self.n_beam_cc):
+        def append_cc_group(g, b):
+            """Append both endpoint specs of every CC beam in group ``g``."""
+            start_idx, end_idx, end_tfm = self._cc_groups[g]
+            for j in range(self.n_beam_cc[g]):
                 g3 = gamma3[b]
                 specs.append({
-                    'b': b, 'node_side': 0, 'coil': i,
+                    'b': b, 'coil_origin': g, 'j_local': j,
+                    'node_side': 0, 'coil': start_idx,
                     'x_ep': geom['x_start'][b], 'gamma3': g3,
                     'sign_x': True, 'tfm': 'none',
                 })
                 specs.append({
-                    'b': b, 'node_side': 1, 'coil': end_idx,
+                    'b': b, 'coil_origin': g, 'j_local': j,
+                    'node_side': 1, 'coil': end_idx,
                     'x_ep': geom['x_end'][b], 'gamma3': g3,
                     'sign_x': False, 'tfm': end_tfm,
                 })
                 b += 1
+            return b
 
-            for j in range(self.n_beam_cf):
+        b = 0
+        for i in range(self.n_base):
+            b = append_cc_group(i, b)
+
+            for j in range(self.n_beam_cf[i]):
+                j_local = self.n_beam_cc[i] + j
                 specs.append({
-                    'b': b, 'node_side': 0, 'coil': i,
+                    'b': b, 'coil_origin': i, 'j_local': j_local,
+                    'node_side': 0, 'coil': i,
                     'x_ep': geom['x_start'][b], 'gamma3': gamma3[b],
                     'sign_x': True, 'tfm': 'none',
                 })
                 b += 1
+
+        if self.stellsym:
+            append_cc_group(self.n_base, b)
 
         return specs
 
@@ -665,14 +827,17 @@ class SupportBeams(Support):
         surf_tfm = self._apply_end_transform(surf_pts, spec['tfm'])
         r_k      = surf_tfm - spec['x_ep'][None, :]
         pts_beam = r_k @ spec['gamma3']
-        # Slice per-beam cross-section scalars out of (n_base, n_beams_per_coil) arrays
-        # so attachment_fn receives the scalar for this specific beam.
+        # Slice this beam's cross-section scalar out of the ragged per-group
+        # lists so attachment_fn receives the scalar for this specific beam.
+        # The cross-section is indexed by the beam's originating *group*
+        # ('coil_origin'; the node-2 CC endpoint couples to a different coil
+        # than it originates from).
         if self._cross_section_dof_keys:
-            i = spec['coil']
-            j = spec['b'] % self.n_beams_per_coil
+            i = spec['coil_origin']
+            j = spec['j_local']
             beam_dofs = {
                 **support_dofs,
-                **{k: support_dofs[k][i, j] for k in self._cross_section_dof_keys},
+                **{k: support_dofs[k][i][j] for k in self._cross_section_dof_keys},
             }
         else:
             beam_dofs = support_dofs
@@ -789,7 +954,11 @@ class SupportBeams(Support):
         K_local: jax.Array,
         Gamma_3: jax.Array,
     ) -> jax.Array:
-        """Rotate local stiffness to global frame: ``Γ_12^T K_local Γ_12``.
+        """Rotate local stiffness to global frame: ``Γ_12 K_local Γ_12^T``.
+
+        ``Gamma_3`` holds the local axes as *columns*, so local coordinates
+        of a global vector are ``v_loc = Γ^T v_glob`` and the congruence is
+        ``K_glob = Γ K_local Γ^T``.
 
         Parameters
         ----------
@@ -803,7 +972,7 @@ class SupportBeams(Support):
         """
         def rotate_one(K_loc, g3):
             G12 = _gamma_12(g3)       # (12, 12)
-            return G12.T @ K_loc @ G12
+            return G12 @ K_loc @ G12.T
 
         return jax.vmap(rotate_one)(K_local, Gamma_3)
 
@@ -858,6 +1027,214 @@ class SupportBeams(Support):
                 self, coil_idx, surface_pts, curves_jax, dofs
             )
         return w_total
+
+    def plot_support(
+        self,
+        fem,
+        *,
+        base_curves_dofs: list[jax.Array] | None = None,
+        base_support_dofs: dict | None = None,
+        ax=None,
+        s: float = 0.1,
+        cmap: str = "viridis",
+        color="C0",
+        simple_mode: bool = False,
+        beam_color="k",
+        beam_lw: float = 1.5,
+        **kwargs,
+    ):
+        """Scatter coil nodes by Winkler weight and overlay the support beams.
+
+        Extends :meth:`Support.plot_support` by drawing every base-coil beam
+        (coil-coil and coil-foundation) as a straight line segment between its
+        two endpoints on the same axes.  No stellarator reflections or
+        field-period rotations are added; only the base-coil beams returned by
+        :meth:`_beam_geometry` are plotted.
+
+        Parameters
+        ----------
+        fem : coil_fem.CoilFEM
+            The FEM container owning this support (forwarded to
+            :meth:`Support.plot_support`).
+        base_curves_dofs : list[jax.Array] or None
+            DOF vectors used to evaluate current surface positions.  ``None``
+            uses the initial DOFs from ``fem.base_curves_jax``.
+        base_support_dofs : dict or None
+            Per-coil support parameters.  Beams are drawn only when this is
+            provided (the beam geometry needs the attachment phis and
+            ``x_foundation``); ``None`` yields the scatter-only axes.
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None
+            Existing 3-D axes to draw on.  ``None`` (default) creates new axes.
+        s : float
+            Marker size for the scatter (default ``0.1``).
+        cmap : str
+            Colormap name for the support weights (default ``"viridis"``).
+        color : color-like
+            Marker colour used only when ``simple_mode`` is ``True``.
+        simple_mode : bool
+            Forwarded to :meth:`Support.plot_support`.
+        beam_color : color-like
+            Colour of the beam line segments (default ``"k"``).
+        beam_lw : float
+            Line width of the beam segments (default ``1.5``).
+        **kwargs
+            Extra keyword arguments forwarded to :meth:`ax.scatter`.
+
+        Returns
+        -------
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D
+            The 3-D axes used for the plot.
+        """
+        ax = super().plot_support(
+            fem,
+            base_curves_dofs=base_curves_dofs,
+            base_support_dofs=base_support_dofs,
+            ax=ax,
+            s=s,
+            cmap=cmap,
+            color=color,
+            simple_mode=simple_mode,
+            **kwargs,
+        )
+
+        if base_support_dofs is None:
+            return ax
+
+        import numpy as onp
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+        if base_curves_dofs is None:
+            base_curves_dofs = [c.dofs for c in fem.base_curves_jax]
+
+        curves_jax = [
+            CurveXYZFourierJAX(c.quadpoints, base_curves_dofs[i], c.order)
+            for i, c in enumerate(fem.base_curves_jax)
+        ]
+        geom = self._beam_geometry(curves_jax, base_support_dofs)
+        x_s = onp.asarray(geom['x_start'], dtype=onp.float64)  # (N, 3)
+        x_e = onp.asarray(geom['x_end'],   dtype=onp.float64)  # (N, 3)
+
+        segments = onp.stack([x_s, x_e], axis=1)               # (N, 2, 3)
+        ax.add_collection3d(
+            Line3DCollection(segments, colors=beam_color, linewidths=beam_lw)
+        )
+        return ax
+
+    def save_support_vtu(
+        self,
+        fem,
+        out_dir: str = ".",
+        *,
+        prefix: str = "coil",
+        base_curves_dofs: list[jax.Array] | None = None,
+        base_support_dofs: dict | None = None,
+    ) -> list[str]:
+        """Export support weights, full mesh, and the beam network as VTU files.
+
+        Extends :meth:`Support.save_support_vtu` (per-coil weight meshes) by
+        also writing, when ``base_support_dofs`` is provided:
+
+        * ``{out_dir}/{prefix}_beams.vtu`` — VTU file containing every base-coil
+          beam as a ``"line"`` cell.  Each line connects the two beam endpoints
+          (``x_start`` / ``x_end`` from :meth:`_beam_geometry`).  Cell data
+          fields:
+
+          - ``beam_type`` — ``0`` for coil-coil (CC), ``1`` for coil-foundation (CF).
+          - ``beam_length`` — rest-state beam length in metres.
+          - ``coil_index`` — index of the originating base coil (0-based).
+
+        No stellarator reflections or field-period rotations are added; only
+        the base-coil beams are written.
+
+        Parameters
+        ----------
+        fem : coil_fem.CoilFEM
+            The FEM container owning this support.
+        out_dir : str
+            Output directory.  Created if it does not exist.
+        prefix : str
+            File-name prefix (default ``"coil"``).
+        base_curves_dofs : list[jax.Array] or None
+            DOF vectors used to evaluate current surface positions.  ``None``
+            uses the initial DOFs from ``fem.base_curves_jax``.
+        base_support_dofs : dict or None
+            Per-coil support parameters.  Beams are written only when this is
+            provided (the beam geometry needs the attachment phis and
+            ``x_foundation``).
+
+        Returns
+        -------
+        list[str]
+            Paths of all files written, in order.
+        """
+        written = super().save_support_vtu(
+            fem, out_dir, prefix=prefix,
+            base_curves_dofs=base_curves_dofs,
+            base_support_dofs=base_support_dofs,
+        )
+        if base_support_dofs is None:
+            return written
+
+        import os
+        import numpy as onp
+        import meshio
+
+        n_base = len(fem.base_curves_jax)
+        if base_curves_dofs is None:
+            base_curves_dofs = [c.dofs for c in fem.base_curves_jax]
+
+        curves_jax = [
+            CurveXYZFourierJAX(c.quadpoints, base_curves_dofs[i], c.order)
+            for i, c in enumerate(fem.base_curves_jax)
+        ]
+        geom = self._beam_geometry(curves_jax, base_support_dofs)
+
+        x_s = onp.asarray(geom['x_start'], dtype=onp.float64)  # (N, 3)
+        x_e = onp.asarray(geom['x_end'],   dtype=onp.float64)  # (N, 3)
+        L   = onp.asarray(geom['L'],        dtype=onp.float64)  # (N,)
+        n_beams = x_s.shape[0]
+
+        # Build point array: first half = node-1 (start), second = node-2 (end).
+        pts_beams = onp.concatenate([x_s, x_e], axis=0)        # (2N, 3)
+        conn = onp.column_stack([                               # (N, 2)
+            onp.arange(n_beams),
+            onp.arange(n_beams, 2 * n_beams),
+        ]).astype(onp.int32)
+
+        # Cell labels: beam_type (CC=0, CF=1) and originating coil index.
+        # Beams are ordered coil-major, cc-then-cf, with per-coil counts;
+        # the stellsym wrap group (originating at coil 0) is appended last.
+        coil_idx_arr = onp.concatenate([
+            onp.full(self.n_beam_cc[i] + self.n_beam_cf[i], i, dtype=onp.int32)
+            for i in range(n_base)
+        ]) if n_base else onp.zeros(0, dtype=onp.int32)
+        beam_type = onp.concatenate([
+            onp.concatenate([
+                onp.zeros(self.n_beam_cc[i], dtype=onp.int32),
+                onp.ones(self.n_beam_cf[i], dtype=onp.int32),
+            ])
+            for i in range(n_base)
+        ]) if n_base else onp.zeros(0, dtype=onp.int32)
+        if self.stellsym:
+            n_wrap = self.n_beam_cc[n_base]
+            coil_idx_arr = onp.concatenate(
+                [coil_idx_arr, onp.zeros(n_wrap, dtype=onp.int32)])
+            beam_type = onp.concatenate(
+                [beam_type, onp.zeros(n_wrap, dtype=onp.int32)])
+
+        beam_path = os.path.join(out_dir, f"{prefix}_beams.vtu")
+        meshio.Mesh(
+            points=pts_beams,
+            cells=[("line", conn)],
+            cell_data={
+                "beam_type":   [beam_type],
+                "beam_length": [L],
+                "coil_index":  [coil_idx_arr],
+            },
+        ).write(beam_path)
+        written.append(beam_path)
+
+        return written
 
     def compute_attach(
         self,
@@ -959,14 +1336,23 @@ class SupportBeams(Support):
         ``K_cs`` (row = coil translation DOF of node ``k``,
         col = beam endpoint DOF of beam ``b``):
 
-        * Translation block: ``-k_{\\text{lin}} w_k^b I_3``
-        * Rotation block:    ``+k_{\\text{lin}} w_k^b [r_k^b]×``
+        * Translation block: ``-k_{\\text{lin}} w_k^b Q^{-1}``
+        * Rotation block:    ``+k_{\\text{lin}} w_k^b Q^{-1} [r_k^b]×``
           (arising from ``θ × r = -[r]× θ``, sign folded)
 
         ``K_sc`` (row = beam endpoint DOF, col = coil translation DOF):
 
-        * Beam translation, coil translation: ``-k_{\\text{lin}} w_k^b I_3``
-        * Beam rotation, coil translation:    ``+k_{\\text{tor}} w_k^b [r_k^b]×``
+        * Beam translation, coil translation: ``-k_{\\text{lin}} w_k^b Q``
+        * Beam rotation, coil translation:    ``-k_{\\text{tor}} w_k^b [r_k^b]× Q``
+          (mesh column of ``τ = k_tor Σ w r × (u_att − u_mesh)``, the
+          transpose-free counterpart of the ``+k_tor Σ w [r]×`` endpoint
+          columns in ``K_ss``)
+
+        where ``Q`` is the endpoint's symmetry transform (identity for
+        untransformed endpoints).  For a ghost endpoint the beam couples to
+        the *image* mesh (``u_image = Q u_coil``), and the coil rows carry
+        the mirrored partner-beam force (the ``Q^{-1}``-image of the ghost
+        interaction) — see the class docstring.
 
         Parameters
         ----------
@@ -1006,6 +1392,15 @@ class SupportBeams(Support):
 
             w_k, r_k = self._clamp_weights_for_spec(spec, surf_pts, support_dofs)
 
+            # Symmetry transform of this endpoint (proper rotation).  For a
+            # ghost endpoint the spring couples the beam node to the *image*
+            # mesh (u_image = Q u_coil), and the mirrored partner beam's
+            # force on the real coil is the Q^-1-image of the ghost
+            # interaction; both effects enter as Q / Q^-1 factors on the
+            # 3x3 coupling blocks.  Q = I reproduces the untransformed case.
+            Q    = self._tfm_Q[spec['tfm']]     # (3, 3) static
+            Qinv = Q.T
+
             t_off = 6 * node_side          # translation DOF within beam (0 or 6)
             r_off = 6 * node_side + 3      # rotation DOF within beam (3 or 9)
 
@@ -1020,15 +1415,17 @@ class SupportBeams(Support):
                 r      = r_k[k]
                 skew_r = _skew(r)
 
+                blk_t = (-self.k_lin * w) * Qinv             # (3, 3)
+                blk_r = ( self.k_lin * w) * (Qinv @ skew_r)  # (3, 3)
                 for d1 in range(3):
                     coil_dof = coil_dof_base + d1
-                    I_cs_list.append(coil_dof)
-                    J_cs_list.append(beam_trans_global_base + d1)
-                    V_cs_list.append(-self.k_lin * w)
                     for d2 in range(3):
                         I_cs_list.append(coil_dof)
+                        J_cs_list.append(beam_trans_global_base + d2)
+                        V_cs_list.append(blk_t[d1, d2])
+                        I_cs_list.append(coil_dof)
                         J_cs_list.append(beam_rot_global_base + d2)
-                        V_cs_list.append(self.k_lin * w * skew_r[d1, d2])
+                        V_cs_list.append(blk_r[d1, d2])
 
             # ── K_sc: beam rows, coil cols ──────────────────────────────────
             for k in range(n_surf):
@@ -1038,16 +1435,17 @@ class SupportBeams(Support):
                 r      = r_k[k]
                 skew_r = _skew(r)
 
+                blk_t = (-self.k_lin * w) * Q               # (3, 3)
+                blk_r = (-self.k_tor * w) * (skew_r @ Q)    # (3, 3)
                 for d2 in range(3):
-                    coil_dof       = coil_dof_base + d2
-                    beam_trans_dof = beam_trans_global_base + d2
-                    I_sc_list.append(beam_trans_dof)
-                    J_sc_list.append(coil_dof)
-                    V_sc_list.append(-self.k_lin * w)
+                    coil_dof = coil_dof_base + d2
                     for d1 in range(3):
+                        I_sc_list.append(beam_trans_global_base + d1)
+                        J_sc_list.append(coil_dof)
+                        V_sc_list.append(blk_t[d1, d2])
                         I_sc_list.append(beam_rot_global_base + d1)
                         J_sc_list.append(coil_dof)
-                        V_sc_list.append(self.k_tor * w * skew_r[d1, d2])
+                        V_sc_list.append(blk_r[d1, d2])
 
         if not I_cs_list:
             empty_i = jnp.zeros(0, dtype=jnp.int32)
@@ -1087,6 +1485,8 @@ class SupportBeams(Support):
         * ``'r'``           — moment-arm array ``(n_surf, 3)`` or ``(3,)``.
         * ``'node_side'``   — ``0`` or ``1``.
         * ``'coil'``        — base-coil index (absent for foundation entries).
+        * ``'tfm'``         — symmetry transform tag (absent for foundation
+          entries).
         * ``'is_foundation'``— present and ``True`` for CF node-2 entries.
 
         Parameters
@@ -1116,14 +1516,15 @@ class SupportBeams(Support):
                 'w': w_k, 'r': r_k,
                 'node_side': spec['node_side'],
                 'coil': spec['coil'],
+                'tfm': spec['tfm'],
             })
 
         # Append foundation entries for CF beams (node-2 side, no clamp)
         for i in range(self.n_base):
-            for j in range(self.n_beam_cf):
-                b      = i * self.n_beams_per_coil + self.n_beam_cc + j
-                x_ep   = geom['x_end'][b]                  # = x_foundation[i, j]
-                r_fnd  = x_foundation[i, j] - x_ep         # ~zero at rest
+            for j in range(self.n_beam_cf[i]):
+                b      = self._beam_offsets[i] + self.n_beam_cc[i] + j
+                x_ep   = geom['x_end'][b]                  # = x_foundation[i][j]
+                r_fnd  = x_foundation[i][j] - x_ep         # ~zero at rest
                 beam_eps[b].append({
                     'w': 1.0, 'r': r_fnd,
                     'node_side': 1, 'is_foundation': True,
@@ -1142,21 +1543,33 @@ class SupportBeams(Support):
         coil-side and cross-DOF terms belong to the future ``coupling_terms()``
         method.
 
-        For each endpoint ``e`` at node ``n`` (local DOFs ``6n:6n+3`` for
-        translation, ``6n+3:6n+6`` for rotation):
+        The spring couples the *attach* displacement
+        ``u_att,i = u_ep + θ × r_i`` to the mesh: force
+        ``F = k_lin Σ_i w_i (u_att,i − u_mesh,i)`` and torque
+        ``τ = k_tor Σ_i w_i r_i × (u_att,i − u_mesh,i)``.  For each endpoint
+        at node ``n`` (local DOFs ``6n:6n+3`` translation, ``6n+3:6n+6``
+        rotation) this yields four blocks:
 
-        * **Translation–translation** (from linear spring,
-          `F = k_lin * w * (u_endpoint - u_mesh)`)::
+        * **Translation–translation**::
 
-              K[3n:3n+3, 3n:3n+3] += (Σ_i w_i) * k_lin * I_3
+              K[t, t] += (Σ_i w_i) * k_lin * I_3
 
-        * **Torque–translation** (from `τ = k_tor * w * (u_endpoint - u_mesh) × r`,
-          asymmetric)::
+        * **Translation–rotation** (from ``θ × r = -[r]× θ``)::
 
-              K[3n+3:3n+6, 3n:3n+3] += k_tor * Σ_i (w_i * [r_i]×)
+              K[t, r] += -k_lin * Σ_i (w_i * [r_i]×)
 
-          NOTE: asymmetric K from user-specified torque law; K_ss is not
-          symmetric.  A future cuDSS monolithic path must use mtype_id=0.
+        * **Torque–translation**::
+
+              K[r, t] += k_tor * Σ_i (w_i * [r_i]×)
+
+        * **Torque–rotation** (from ``r × (θ × r)``; positive semidefinite —
+          this is what pins the beam's axial-torsion rigid-body mode)::
+
+              K[r, r] += -k_tor * Σ_i (w_i * [r_i]× [r_i]×)
+
+        NOTE: unless ``k_tor == k_lin`` the torque rows are not the
+        transpose of the translation rows, so K_ss is not symmetric.  A
+        future cuDSS monolithic path must use mtype_id=0.
 
         For CF foundation side, ``w`` is scalar 1.0 and ``r`` is a single
         ``(3,)`` vector.
@@ -1187,20 +1600,32 @@ class SupportBeams(Support):
                     # Foundation side: scalar w=1, single moment arm r (3,)
                     w_sum = 1.0
                     skew_sum = _skew(r)        # (3, 3)
+                    skew2_sum = skew_sum @ skew_sum
                 else:
                     # Coil side: w is (n_surf,), r is (n_surf, 3)
                     w_sum = jnp.sum(w)         # scalar
-                    # Weighted sum of skew matrices: Σ w_i [r_i]×
-                    skew_sum = jnp.einsum('n,nij->ij', w,
-                                          jax.vmap(_skew)(r))  # (3, 3)
+                    skews = jax.vmap(_skew)(r)                       # (n, 3, 3)
+                    # Weighted sums: Σ w_i [r_i]× and Σ w_i [r_i]×[r_i]×
+                    skew_sum  = jnp.einsum('n,nij->ij', w, skews)    # (3, 3)
+                    skew2_sum = jnp.einsum('n,nij->ij', w,
+                                           skews @ skews)            # (3, 3)
 
                 # Translation–translation: (Σ w_i) * k_lin * I_3
                 K_tt = (self.k_lin * w_sum) * jnp.eye(3)
                 K = K.at[t_off:t_off+3, t_off:t_off+3].add(K_tt)
 
-                # Torque–translation: k_tor * Σ w_i [r_i]×  (asymmetric)
+                # Translation–rotation: -k_lin * Σ w_i [r_i]×  (θ × r term)
+                K_tr = -self.k_lin * skew_sum  # (3, 3)
+                K = K.at[t_off:t_off+3, r_off:r_off+3].add(K_tr)
+
+                # Torque–translation: k_tor * Σ w_i [r_i]×
                 K_rt = self.k_tor * skew_sum   # (3, 3)
                 K = K.at[r_off:r_off+3, t_off:t_off+3].add(K_rt)
+
+                # Torque–rotation: -k_tor * Σ w_i [r_i]×[r_i]×  (PSD; pins
+                # the axial-torsion rigid-body mode of the isolated beam)
+                K_rr = -self.k_tor * skew2_sum  # (3, 3)
+                K = K.at[r_off:r_off+3, r_off:r_off+3].add(K_rr)
 
             K_spring_list.append(K)
 
@@ -1275,12 +1700,15 @@ class SupportBeams(Support):
         geom = self._beam_geometry(curves, support_dofs)
 
         # 3. Cross-section properties from user callback.
+        #    The callback is elementwise, so with ragged per-group inputs it
+        #    returns per-group lists; concatenate them in beam order
+        #    (coil-major cc-then-cf, stellsym wrap group last) to get flat
+        #    (N_beams,) arrays.
         A_all, Iy_all, Iz_all, J_all = self.cross_section_fn(support_dofs)
-        # Flatten from (n_base, n_beams_per_coil) to (N_beams,).
-        A  = A_all.reshape(-1)
-        Iy = Iy_all.reshape(-1)
-        Iz = Iz_all.reshape(-1)
-        Jj = J_all.reshape(-1)
+        A  = jnp.concatenate([jnp.atleast_1d(a) for a in A_all])
+        Iy = jnp.concatenate([jnp.atleast_1d(a) for a in Iy_all])
+        Iz = jnp.concatenate([jnp.atleast_1d(a) for a in Iz_all])
+        Jj = jnp.concatenate([jnp.atleast_1d(a) for a in J_all])
 
         # 4. Bisymmetric beam stiffness in local frame (Eq. 4.34).
         K_local = self._local_stiffness(A, Iy, Iz, Jj, geom['L'])
@@ -1346,13 +1774,24 @@ class SupportBeams(Support):
                     # unless x_foundation has drifted — handled by K_ss * u_s = f).
                     pass
                 else:
-                    # Coil side: f += k_lin * Σ w_i u_mesh_i  (force target)
+                    # Coil side: mesh-displacement force/torque targets,
+                    # equal to -K_sc @ u_mesh blockwise (see coupling_terms).
+                    # Ghost endpoints couple to the *image* mesh, so the
+                    # per-node displacement is Q u_mesh (Q = I when 'none').
                     if u_mesh_by_coil is not None:
-                        w          = ep['w']               # (n_surf,)
-                        coil_for_ep = ep['coil']
-                        u_mesh     = u_mesh_by_coil[coil_for_ep]   # (n_surf, 3)
-                        f_trans    = self.k_lin * jnp.einsum('n,nd->d', w, u_mesh)
+                        w      = ep['w']                           # (n_surf,)
+                        r      = ep['r']                           # (n_surf, 3)
+                        Q      = self._tfm_Q[ep['tfm']]            # (3, 3)
+                        u_mesh = u_mesh_by_coil[ep['coil']]        # (n_surf, 3)
+                        um     = u_mesh @ Q.T                      # Q u_mesh per node
+                        # f_t += k_lin * Σ w_i (Q u_mesh_i)
+                        f_trans = self.k_lin * jnp.einsum('n,nd->d', w, um)
                         f = f.at[dof_base + t_off: dof_base + t_off + 3].add(f_trans)
+                        # f_r += k_tor * Σ w_i (r_i × (Q u_mesh_i)) — matches
+                        # the -k_tor w [r]× Q columns of K_sc.
+                        f_rot = self.k_tor * jnp.einsum(
+                            'n,nd->d', w, jnp.cross(r, um))
+                        f = f.at[dof_base + r_off: dof_base + r_off + 3].add(f_rot)
 
         return f
 
