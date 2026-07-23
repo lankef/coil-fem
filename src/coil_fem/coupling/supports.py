@@ -264,6 +264,196 @@ class Support:
         curve_i = curves_jax[coil_idx] if curves_jax is not None else None
         return fn(surface_pts, curve_i, dofs)
 
+    def plot_support(
+        self,
+        fem,
+        *,
+        base_curves_dofs: list[jax.Array] | None = None,
+        base_support_dofs: dict | None = None,
+        ax=None,
+        s: float = 0.1,
+        cmap: str = "viridis",
+        color="C0",
+        simple_mode: bool = False,
+        **kwargs,
+    ):
+        """Scatter-plot the mesh nodes of every base coil coloured by Winkler weight.
+
+        Parameters
+        ----------
+        fem : coil_fem.CoilFEM
+            The FEM container owning this support.  Supplies the per-coil
+            meshes, pipelines, base curves, and the Winkler-weight helper.
+        base_curves_dofs : list[jax.Array] or None
+            DOF vectors used to evaluate current surface positions.  ``None``
+            uses the initial DOFs from ``fem.base_curves_jax``.
+        base_support_dofs : dict or None
+            Per-coil support parameters for the support functions.  ``None``
+            (default) uses the support parameters supplied at construction.
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None
+            Existing 3-D axes to draw on.  ``None`` (default) creates a new
+            figure and 3-D axes.
+        s : float
+            Marker size for the scatter (default ``0.1``).
+        cmap : str
+            Matplotlib colormap name for the support weights (default
+            ``"viridis"``).  Ignored when ``simple_mode`` is ``True``.
+        color : color-like
+            Single marker colour used only when ``simple_mode`` is ``True``
+            (default ``"C0"``).
+        simple_mode : bool
+            When ``True``, disable the colormap and colorbar: every point is
+            drawn in a single ``color`` and the support weight (guaranteed in
+            ``[0, 1]``) is used as each point's **alpha**, so fully supported
+            nodes are opaque and free nodes are invisible.
+        **kwargs
+            Extra keyword arguments forwarded to :meth:`ax.scatter`
+            (e.g. ``marker``, ``facecolors``, ``edgecolors``).
+
+        Returns
+        -------
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D
+            The 3-D axes used for the plot.  The parent figure is available as
+            ``ax.get_figure()``.
+        """
+        import numpy as onp
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import to_rgb
+
+        n_base = len(fem.base_curves_jax)
+        if base_curves_dofs is None:
+            base_curves_dofs = [c.dofs for c in fem.base_curves_jax]
+
+        if ax is None:
+            _, ax = plt.subplots(subplot_kw={"projection": "3d"})
+        fig = ax.get_figure()
+
+        sc = None
+        for i in range(n_base):
+            pts_i  = fem.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
+            pts_np = onp.asarray(pts_i, dtype=onp.float64)
+            n_nodes = pts_np.shape[0]
+
+            surf_idx = onp.asarray(fem.pipelines[i].surface_node_indices, dtype=onp.int32)
+            weights_surf = onp.asarray(
+                fem._compute_support_weights(i, pts_i, base_curves_dofs, base_support_dofs),
+                dtype=onp.float64,
+            )
+            weight_full = onp.zeros(n_nodes, dtype=onp.float64)
+            weight_full[surf_idx] = weights_surf
+
+            if simple_mode:
+                # No colormap/colorbar: encode weight as per-point alpha.
+                # Build an explicit (n_nodes, 4) RGBA array so per-point
+                # transparency survives even for hollow markers.
+                rgba = onp.empty((n_nodes, 4), dtype=onp.float64)
+                rgba[:, :3] = to_rgb(color)
+                rgba[:, 3] = onp.clip(weight_full, 0.0, 1.0)
+                # Route the per-point colour to the edges for hollow markers
+                # (``facecolors="none"``) and to the faces otherwise, avoiding
+                # the ``c``-vs-``facecolors`` precedence conflict.
+                scatter_kw = dict(kwargs)
+                if str(scatter_kw.get("facecolors")) == "none":
+                    scatter_kw.setdefault("edgecolors", rgba)
+                else:
+                    scatter_kw.setdefault("facecolors", rgba)
+                ax.scatter(
+                    pts_np[:, 0], pts_np[:, 1], pts_np[:, 2],
+                    s=s, **scatter_kw,
+                )
+            else:
+                sc = ax.scatter(
+                    pts_np[:, 0], pts_np[:, 1], pts_np[:, 2],
+                    s=s, c=weight_full, cmap=cmap, vmin=0.0, vmax=1.0,
+                    **kwargs,
+                )
+        if sc is not None and not simple_mode:
+            fig.colorbar(sc, ax=ax, label="support weight")
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_zlabel("z [m]")
+        return ax
+
+    def save_support_vtu(
+        self,
+        fem,
+        out_dir: str = ".",
+        *,
+        prefix: str = "coil",
+        base_curves_dofs: list[jax.Array] | None = None,
+        base_support_dofs: dict | None = None,
+    ) -> list[str]:
+        """Export Winkler support weights and full mesh as VTU files.
+
+        For each base coil ``i``, writes:
+
+        * ``{out_dir}/{prefix}{i:02d}_support.vtu`` — full tetrahedral mesh with:
+
+          - point field ``support_weights`` in ``[0, 1]``; ``1`` = fully
+            supported, ``0`` = free.
+          - point field ``spring_k_Npm3`` — effective Winkler spring stiffness
+            ``winkler_k × support_weight`` in N/m³.
+
+        Open in ParaView; use *Filters → Threshold* on ``support_weights`` or
+        ``spring_k_Npm3`` to isolate the clamped region.
+
+        Parameters
+        ----------
+        fem : coil_fem.CoilFEM
+            The FEM container owning this support.  Supplies the per-coil
+            meshes, pipelines, base curves, Winkler stiffness, and the VTU
+            writer helper.
+        out_dir : str
+            Output directory.  Created if it does not exist.
+        prefix : str
+            File-name prefix (default ``"coil"``).
+        base_curves_dofs : list[jax.Array] or None
+            DOF vectors used to evaluate current surface positions.  ``None``
+            uses the initial DOFs from ``fem.base_curves_jax``.
+        base_support_dofs : dict or None
+            Per-coil support parameters for the support functions.
+
+        Returns
+        -------
+        list[str]
+            Paths of all files written, in order.
+        """
+        import os
+        import numpy as onp
+
+        if base_curves_dofs is None:
+            base_curves_dofs = [c.dofs for c in fem.base_curves_jax]
+
+        winkler_k = float(fem.problem_options['winkler_k'])
+
+        os.makedirs(out_dir, exist_ok=True)
+        written: list[str] = []
+
+        for i, coil_mesh in enumerate(fem.meshes):
+            pts_i  = fem.meshes[i].mesh_points_from_dofs(base_curves_dofs[i])
+            pts_np = onp.asarray(pts_i, dtype=onp.float64)
+            n_nodes = pts_np.shape[0]
+
+            surf_idx = onp.asarray(fem.pipelines[i].surface_node_indices, dtype=onp.int32)
+            weights_surf = onp.asarray(
+                fem._compute_support_weights(i, pts_i, base_curves_dofs, base_support_dofs),
+                dtype=onp.float64,
+            )
+            weight_full = onp.zeros(n_nodes, dtype=onp.float64)
+            weight_full[surf_idx] = weights_surf
+
+            mesh_path = os.path.join(out_dir, f"{prefix}{i:02d}_support.vtu")
+            fem._write_coil_vtu(
+                mesh_path, coil_mesh, pts_np,
+                point_data={
+                    "support_weights":   weight_full,
+                    "spring_k_Npm3":    weight_full * winkler_k,
+                },
+            )
+            written.append(mesh_path)
+
+        return written
+
     def coo(self):
         """Return the support stiffness matrix in COO (coordinate) format. For
         monolithic mode.

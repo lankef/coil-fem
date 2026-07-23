@@ -224,7 +224,7 @@ The coupling between coil FEM and support structures is split across three layer
 
 Key constructor arguments (all static; set once at construction):
 
-- `n_beam_cc`, `n_beam_cf` — beams per coil (coil-coil and coil-foundation).
+- `n_beam_cc`, `n_beam_cf` — beam counts. CC beams have one entry per CC *group*: `n_base + 1` when `stellsym=True` (the extra last entry is the coil-0 `phi = 0` wrap group), else `n_base`. CF beams have one entry per base coil.
 - `E`, `nu` — Young's modulus and Poisson's ratio.
 - `cross_section_fn(support_dofs) -> (A, Iy, Iz, J)` — cross-section properties.
 - `clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights` — selects coil surface nodes for coupling.
@@ -234,10 +234,10 @@ Key constructor arguments (all static; set once at construction):
 
 Optimisable quantities live in `support_dofs` (passed at solve time, never stored):
 
-- `phis_start_cc[n_base, n_beam_cc]`, `phis_end_cc[n_base, n_beam_cc]` — attachment angles for CC beams.
-- `phis_start_cf[n_base, n_beam_cf]` — attachment angles for CF beams.
-- `x_foundation[n_base, n_beam_cf, 3]` — foundation anchor positions for CF beams.
-- `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam.
+- `phis_start_cc`, `phis_end_cc` — attachment angles for CC beams: per-group lists, entry `g` of shape `(n_beam_cc[g],)` (`n_base + 1` entries when `stellsym=True`, else `n_base`).
+- `phis_start_cf` — attachment angles for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i],)`.
+- `x_foundation` — foundation anchor positions for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i], 3)`.
+- `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam (same per-group / per-coil list layout as the attachment angles).
 
 ### Solver drivers (`coupling/drivers.py`)
 
