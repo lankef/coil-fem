@@ -58,11 +58,11 @@ def _clamp_spheres_weights(
     jax.Array, shape (n_nodes,)
     """
     gamma_support = curve_jax.gamma_eval(phis_i)            # (n_clamp, 3)
-    distances_sq = jnp.sum(
+    d_sq = jnp.sum(
         (surface_points[:, None, :] - gamma_support[None, :, :]) ** 2,
         axis=-1,
     )                                                        # (n_nodes, n_clamp)
-    w = clamp_sigmoid(distances_sq, r_clamp=r_clamp, sigmoid_eps=sigmoid_eps)
+    w = clamp_sigmoid(d_sq, r_clamp, sigmoid_eps)
     return jnp.sum(w, axis=-1)
 
 
@@ -91,11 +91,11 @@ def _topbottom_weights(
 
     w_top = clamp_sigmoid(
         jnp.sum((surface_points - top) ** 2, axis=-1),
-        r_clamp=r_clamp, sigmoid_eps=sigmoid_eps,
+        r_clamp, sigmoid_eps,
     )
     w_bottom = clamp_sigmoid(
         jnp.sum((surface_points - bottom) ** 2, axis=-1),
-        r_clamp=r_clamp, sigmoid_eps=sigmoid_eps,
+        r_clamp, sigmoid_eps,
     )
     return w_top + w_bottom
 

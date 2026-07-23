@@ -345,6 +345,9 @@ class CoilSupportBeams(CoilSupport):
             Translational spring stiffness [N/m²].
         k_tor : float
             Torsional spring stiffness [N·m/m²].
+        sigmoid_eps : float
+            Sigmoid function widths of attachment points. Default is 0.1.
+        and additional options needed by attachment_fn.
     phis_start_cc : array-like or None
         Initial start-attachment angles for CC beams, shape
         ``(n_base, n_beam_cc)``.
@@ -411,20 +414,27 @@ class CoilSupportBeams(CoilSupport):
         ]
         n_base = len(base_coils)
 
-        # ── Load beam options ─────────────────────────────────────────────────
-        n_beam_cc = beam_options['n_beam_cc']
-        n_beam_cf = beam_options['n_beam_cf']
-        missing_beam_options = [k for k in _REQUIRED_BEAM_OPTIONS if k not in beam_options]
+        # ── Cross-section presets ─────────────────────────────────────────────
+        # The default cross section is solid circle
+        cross_section_type = beam_options.get('cross_section_type', 'solid_circle')
+        # The default type of attachment is direct 
+        # (selecting only exterior nodes inside the beam volume)
+        attachment_type = beam_options.get('attachment_type', 'direct')
+        cross_section_fn = fetch_attr(cross_section_type, cross_section_fns)
+        cross_section_dof_keys = fetch_attr(cross_section_type + '_dof_keys', cross_section_fns)
+        cross_section_option_keys = fetch_attr(cross_section_type + '_option_keys', cross_section_fns)
+
+        # ── Load the remaining beam options ───────────────────────────────────
+        # Default sigmoid function weight
+        beam_options.setdefault('sigmoid_eps', 0.1)  
+        missing_beam_options = [k for k in _REQUIRED_BEAM_OPTIONS + cross_section_option_keys if k not in beam_options]
         if missing_beam_options:
             raise ValueError(
                 f"beam_options must contain {missing_beam_options}."
             )
-        cross_section_type = beam_options.get('cross_section_type', 'solid_circle')
-        attachment_type = beam_options.get('attachment_type', 'direct')
+        n_beam_cc = beam_options['n_beam_cc']
+        n_beam_cf = beam_options['n_beam_cf']
 
-        # ── Cross-section preset ──────────────────────────────────────────────
-        cross_section_fn = fetch_attr(cross_section_type, cross_section_fns)
-        cross_section_fn_keys = fetch_attr(cross_section_type + '_keys', cross_section_fns)
 
         # ── Build initial support_dofs_jax with defaults ──────────────────────
         _uniform_cc = jnp.broadcast_to(
@@ -472,10 +482,10 @@ class CoilSupportBeams(CoilSupport):
         if kwargs is None:
             raise AttributeError(
                 "The cross section shape requires initial values of "
-                f"'{cross_section_fn_keys}' as keyword arguments for "
+                f"'{cross_section_dof_keys}' as keyword arguments for "
                 "CoilSupportBeams. No keyword arguments are detected."
             )
-        for k in cross_section_fn_keys:
+        for k in cross_section_dof_keys:
             if k in kwargs:
                 support_dofs_jax[k] = jnp.broadcast_to(
                     jnp.asarray(kwargs[k], dtype=float),
@@ -526,14 +536,14 @@ class CoilSupportBeams(CoilSupport):
             beam_options=beam_options,
             base_curves_jax=base_curves_jax,
             cross_section_fn=cross_section_fn,
-            cross_section_fn_keys=cross_section_fn_keys,
+            cross_section_dof_keys=cross_section_dof_keys,
             attachment_fn=attachment_fn,
             fixed_clamp_fns=fixed_clamp_fns,
         )
 
         # ── Compute boolean fixed_mask from fixed_dof_names ───────────────────
         if fixed_dof_names is None:
-            fixed_dof_names = list(cross_section_fn_keys) + \
+            fixed_dof_names = list(cross_section_dof_keys) + \
                 ['thetas_orientation_cc', 'thetas_orientation_cf']
 
         fixed_dof_names = list(fixed_dof_names)
