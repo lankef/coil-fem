@@ -191,7 +191,7 @@ class SupportBeams(Support):
         base_curves_jax: list[CurveXYZFourierJAX],
         cross_section_fn: Callable,
         attachment_fn: Callable,
-        cross_section_fn_keys: tuple = (),
+        cross_section_dof_keys: tuple = (),
         fixed_clamp_fns=None,
     ):
         super().__init__(fixed_clamp_fns=fixed_clamp_fns)
@@ -210,7 +210,7 @@ class SupportBeams(Support):
         # Keys in support_dofs whose values are shaped (n_base, n_beams_per_coil);
         # _clamp_weights_for_spec slices [coil, local_beam] before passing to
         # attachment_fn so each call receives a scalar, not the full array.
-        self._cross_section_fn_keys = tuple(cross_section_fn_keys)
+        self._cross_section_dof_keys = tuple(cross_section_dof_keys)
 
         # Per-coil: which local base-coil index is the CC-beam end target,
         # and which symmetry transform to apply to its geometry.
@@ -667,12 +667,12 @@ class SupportBeams(Support):
         pts_beam = r_k @ spec['gamma3']
         # Slice per-beam cross-section scalars out of (n_base, n_beams_per_coil) arrays
         # so attachment_fn receives the scalar for this specific beam.
-        if self._cross_section_fn_keys:
+        if self._cross_section_dof_keys:
             i = spec['coil']
             j = spec['b'] % self.n_beams_per_coil
             beam_dofs = {
                 **support_dofs,
-                **{k: support_dofs[k][i, j] for k in self._cross_section_fn_keys},
+                **{k: support_dofs[k][i, j] for k in self._cross_section_dof_keys},
             }
         else:
             beam_dofs = support_dofs

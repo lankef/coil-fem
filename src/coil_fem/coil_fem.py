@@ -1265,7 +1265,17 @@ class CoilFEM:
                     s=s, c=weight_full, cmap=cmap, vmin=0.0, vmax=1.0,
                     **kwargs,
                 )
-
+            # self.support.plot_support(
+            #     *,
+            #     base_curves_dofs: list[jax.Array] | None = None,
+            #     base_support_dofs: dict | None = None,
+            #     ax=ax,
+            #     s=s,
+            #     cmap=cmap,
+            #     color=color,
+            #     simple_mode=simple_mode,
+            #     **kwargs,
+            # )
         if sc is not None and not simple_mode:
             fig.colorbar(sc, ax=ax, label="support weight")
         ax.set_xlabel("x [m]")

@@ -10,7 +10,7 @@ attribute of :class:`~coil_fem.simsopt.CoilSupportBeams` ad
 
 The geometric parameters are read from ``support_dofs`` by key, so they can
 live alongside the attachment-angle DOFs and be treated as optimizable
-variables by simsopt. Each function must be accompanied by a ``func_name_keys``
+variables by simsopt. Each function must be accompanied by a ``func_name_dof_keys``
 to store the required keys in support_dofs.
 
 Conventions (matching ``docs/theory/bisymbeam.rst``)
@@ -47,7 +47,7 @@ def bool_to_sign(a):
 # Solid circle
 # ============================================================================
 
-solid_circle_keys = ('r_beam',)
+solid_circle_dof_keys = ('r_beam',)
 solid_circle_option_keys = ('sigmoid_eps',)
 
 def solid_circle(support_dofs: dict):
@@ -92,21 +92,36 @@ def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, constants):
         bool_to_sign(sign_x) * pts_x >= 0,
         1, 0
     )
-    distance_sq = pts_y**2 + pts_z**2
+    d_sq = pts_y**2 + pts_z**2
     return in_correct_direction * clamp_sigmoid(
-        distance_sq=distance_sq,
-        r_attachment=dofs['r_beam'], 
+        d_sq=d_sq,
+        r=dofs['r_beam'], 
         sigmoid_eps=constants['sigmoid_eps'],
     )
     
 
 # ============================================================================
-# Solid rectangle
+# Solid rectangle and square
 # ============================================================================
 
 
-solid_rectangle_keys = ('w1_beam', 'w2_beam',)
+solid_rectangle_dof_keys = ('w1_beam', 'w2_beam',)
 solid_rectangle_option_keys = ('sigmoid_eps',)
+
+def _rectangle_helper(w_1, w_2):
+    A  = w1 * w2
+    Iy = w2 * w1 ** 3 / 12.0        # governs w (z-deflection)
+    Iz = w1 * w2 ** 3 / 12.0        # governs v (y-deflection)
+
+    # Roark/Pilkey torsion constant (JAX-differentiable)
+    a_rect = jnp.maximum(w1, w2)
+    c_rect = jnp.minimum(w1, w2)
+    ratio  = c_rect / a_rect       # ≤ 1
+    J = a_rect * c_rect ** 3 * (
+        1.0 / 3.0
+        - 0.21 * ratio * (1.0 - ratio ** 4 / 12.0)
+    )
+    return A, Iy, Iz, J
     
 def solid_rectangle(support_dofs : dict):
     """Cross-section function for a solid rectangular section.
@@ -144,27 +159,45 @@ def solid_rectangle(support_dofs : dict):
     """
     w1 = support_dofs['w1_beam']    # z-extent
     w2 = support_dofs['w2_beam']   # y-extent
+    return _rectangle_helper(w_1, w_2)
 
-    A  = w1 * w2
-    Iy = w2 * w1 ** 3 / 12.0        # governs w (z-deflection)
-    Iz = w1 * w2 ** 3 / 12.0        # governs v (y-deflection)
+    
 
-    # Roark/Pilkey torsion constant (JAX-differentiable)
-    a_rect = jnp.maximum(w1, w2)
-    c_rect = jnp.minimum(w1, w2)
-    ratio  = c_rect / a_rect       # ≤ 1
-    J = a_rect * c_rect ** 3 * (
-        1.0 / 3.0
-        - 0.21 * ratio * (1.0 - ratio ** 4 / 12.0)
-    )
-    return A, Iy, Iz, J
+# ============================================================================
+# Solid square
+# ============================================================================
+
+
+solid_square_dof_keys = ('w_beam',)
+solid_square_option_keys = solid_rectangle_option_keys
+    
+def solid_square(support_dofs : dict):
+    """Cross-section function for a solid rectangular section.
+
+    Solid rectangle but with equal edge lengths.
+    
+    Parameters
+    ----------
+    support_dofs : dict
+        Must contain the entry 'w1_beam' and 'w2_beam' the z and y widths :math:`w_1` and 
+        :math:`w_2`.
+
+    Returns
+    -------
+    ``(A, Iy, Iz, J)`` 
+        Each output has the same shape as ``support_dofs[radius_key]``.
+
+    
+    """
+    w = support_dofs['w_beam']
+    return _rectangle_helper(w, w)
 
 
 # ============================================================================
 # Hollow circle (annular section)
 # ============================================================================
 
-hollow_circle_keys = ('r_1_beam', 'r_1_beam',)
+hollow_circle_dof_keys = ('r_1_beam', 'r_1_beam',)
 hollow_circle_option_keys = ('sigmoid_eps',)
     
 def hollow_circle(support_dofs: dict) -> Callable:
