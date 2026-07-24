@@ -28,9 +28,14 @@ Three findings are worth acting on before anything cosmetic:
    FEM solves it exists to coordinate.** A forward-only 2-coil objective takes
    29 s, of which roughly 20 s is eager beam assembly that jits down to under
    a millisecond. **[measured]**
-3. **The block Gauss–Seidel loop silently exhausts `max_iters`** on a
-   perfectly ordinary 2-coil beam network and returns the unconverged state
-   with no warning. **[measured]**
+3. **The block Gauss–Seidel loop never reaches a fixed point** on a 2-coil
+   beam network, and returns the unconverged state with no warning. The
+   iteration marches along a single direction with eigenvalue 1.0000044 —
+   a marginal mode of the coupled operator — and the residual is flat from
+   sweep ~7 onward. This is insensitive to coil shape, to attachment
+   locality, and to both spring stiffnesses, so it is structural rather
+   than a tuning problem, and the same near-singular `K_ss` (condition
+   number 9.1 × 10⁹) also feeds the monolithic cuDSS path. **[measured]**
 
 Beyond that, roughly 600 lines across the package have no caller anywhere in
 `src/`, `tests/`, `examples/`, or `docs/`, the von Mises stress kernel is
@@ -42,7 +47,8 @@ Priority ordering:
 | Priority | Item | Where |
 |---|---|---|
 | P0 | Staggered gradient is broken; the IFT `custom_vjp` is dead | [A1](#a1--jaxgrad-through-solve_staggered-raises) |
-| P0 | BG-S loop exhausts `max_iters` without warning | [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) |
+| P0 | Coupled system has a marginal mode; BG-S never converges and says nothing | [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) |
+| P0 | `K_ss` is near-singular (cond 9.1e9) and feeds the monolithic path too | [A2c](#a2c--the-support-stiffness-block-is-near-singular) |
 | P0 | `hollow_circle` / `solid_rectangle` / `solid_square` presets cannot be used | [A4](#a4--three-of-the-four-cross-section-presets-are-unusable) |
 | P1 | JIT the beam side and the body-force block | [4a](#4a-jit-the-beam-side-biggest-single-win-on-cpu), [4c](#4c-jit-_body_force_at_quads) |
 | P1 | `cudss_mtype_id` has two different defaults for the same key | [A5](#a5--cudss_mtype_id-has-two-conflicting-defaults) |
@@ -120,8 +126,7 @@ Two honest options:
 
 ### A2 — Block Gauss–Seidel does not converge, and says nothing
 
-**[measured]** On a 2-coil, 6-beam network with a 288-node mesh per coil, the
-loop runs all 100 sweeps:
+**[measured]** On a 2-coil, 4-beam network the loop runs all 100 sweeps:
 
 ```
 BG-S sweeps: 100   J = 0.36798387349276307
@@ -129,14 +134,160 @@ BG-S sweeps: 100   J = 0.36798387349276307
 
 `_run_iterations` breaks on `res < atol` and otherwise falls out of the `for`
 loop and returns whatever it has. There is no warning, no diagnostic, and
-`result['diagnostics']` is hard-coded to `{}`
-(`drivers.py:424`). A caller has no way to know the answer is not a fixed
-point.
+`result['diagnostics']` is hard-coded to `{}` (`drivers.py:424`). A caller has
+no way to know the answer is not a fixed point.
 
-At minimum, emit a warning with the final residual and populate
-`diagnostics` with `{'iterations', 'residual', 'converged'}`. Note that this
-also means every staggered solve currently pays the full 100 sweeps, which is
-why the timing in [Rule 4](#rule-4--jit-opportunities) looks the way it does.
+The reporting gap is the easy half to fix: emit a warning with the final
+residual and populate `diagnostics` with
+`{'iterations', 'residual', 'converged'}`. The harder half is why it does not
+converge.
+
+#### A2a — It is not the coil geometry, the clamp, or the stiffness
+
+The first run used the repo's own fixtures: `_make_curves` from
+`tests/test_beam_networks.py`, which is **coplanar circles** of radius 1.0 and
+1.1 in the *xz*-plane, and `_uniform_clamp_fn`, which returns weight 1.0 at
+*every* surface quadrature point — so each of the three beam endpoints touching
+coil 0 clamps its entire 0.74 m² surface (300 % of the coil area in aggregate).
+That is a soft configuration in one sense and a pathological one in another, so
+I re-ran it across the axes that normally govern block Gauss–Seidel
+convergence. **[measured]**, all with `max_iters = 100`:
+
+| Coil shape | Attachment | `k_lin` | Sweeps | Residual `max|T(u)−u|` |
+|---|---|---:|---:|---|
+| Coplanar circles R = 1.0, 1.1 | uniform, 300 % of area | 1e8 | 100 | 9.7e-6 → 1.19e-5, flat from k≈7 |
+| Coplanar circles R = 1.0, 1.1 | sigmoid ball r = 0.06, 9.4 % of area | 1e8 | 100 | 9.5e-4 → 3.34e-4, flat from k≈7 |
+| Coplanar circles R = 1.0, 1.1 | sigmoid ball r = 0.06 | 1e5 | 100 | 9.5e-1 → 3.39e-1, flat from k≈7 |
+| Offset, non-coplanar circles (Δy = 0.45) | sigmoid ball r = 0.06 | 1e8 | 100 | 2.113e-2 → 2.119e-2, never decreases |
+
+So it is not caused by the coil shape (the non-coplanar case is *worse* — the
+residual never decreases at all), not by the whole-surface clamp in the
+fixture, and not by the coupling stiffness (the residual scales exactly as
+`1/k_lin` while the iteration behaviour is identical). Non-planar,
+randomly-perturbed order-3 coils were also tried but did not complete within
+the review budget; see [A2d](#a2d--higher-order-curves-are-pathologically-slow).
+
+This is the opposite of the usual expectation that irregular coil shapes
+destabilise the partitioned scheme. It already fails on two concentric
+circles, which is about the most benign geometry available.
+
+#### A2b — The iteration marches along a mode with eigenvalue 1.0000044
+
+Instrumenting the sweep (recording `u_s` on the way into `compute_attach` and
+on the way out of `support.solve`) shows the signature clearly. Offset-circle
+case, `k_lin = 1e8`, `k_tor = 1e4`: **[measured]**
+
+```
+   k    omega_effective   ||T(u)-u||     ||u_s||
+   0         1.000000     3.378882e-02   0.000000e+00
+   1         0.100000     3.451686e-02   3.378882e-02
+   ...
+  14         0.100000     3.456616e-02   7.852101e-02
+  15         0.100000     3.456624e-02   8.196935e-02
+  16         0.180800     3.456606e-02   8.541803e-02
+  ...
+  20         2.000000     3.453636e-02   1.772595e-01
+  21         2.000000     3.451431e-02   2.462480e-01
+  22         0.100000     3.452460e-02   3.151921e-01
+  ...
+  28         0.100000     3.452555e-02   3.358820e-01
+
+cos angle between successive late increments: 0.999999989
+ratio of successive late increment norms:     1.000004660
+```
+
+Three things to read off this:
+
+- `‖T(u) − u‖` is constant to three digits for 29 sweeps. It never decays.
+- `‖u_s‖` grows with a per-sweep increment that is constant to four digits, and
+  the increment *direction* is fixed: successive increments have
+  `cos = 0.999999989` with a norm ratio of `1.0000047`.
+- The effective relaxation factor sits on the clamp floor `0.1` most of the
+  time, with excursions to the ceiling `2.0`.
+
+A fixed direction reproduced with ratio ≈ 1 means the BG-S map `T(u) = Au + b`
+has an eigenvalue of essentially exactly 1 (marginally above it), and the
+residual has a component in that eigenspace. There is therefore no fixed point
+to converge to along that direction, and the iteration translates along it
+forever. Aitken cannot rescue this: for a unit eigenvalue no scalar `ω`
+produces a correction in that direction, and the clamp
+
+```333:333:src/coil_fem/coupling/drivers.py
+                    omega = max(0.1, min(2.0, omega))
+```
+
+separately forbids the strong under-relaxation (`ω ≪ 0.1`) that a marginally
+stable coupling would need even if the mode were merely stiff rather than
+singular. That clamp is worth revisiting on its own merits.
+
+Raising `k_tor` from `1e4` to `1e8` (equal to `k_lin`) left the growth ratio
+unchanged at `1.000004428` to nine digits, so the mode is not a
+torsional-spring deficiency either.
+
+#### A2c — The support stiffness block is near-singular
+
+Assembling `K_ss` directly for the same configuration and taking its SVD
+**[measured]**:
+
+```
+K_ss (48x48) singular values: max 1.543e+08  min 1.696e-02  cond 9.097e+09
+K_ss asymmetry ||K-K^T||/||K|| = 1.249e-03
+```
+
+A condition number of 9 × 10⁹ on a 48 × 48 matrix is consistent with the
+marginal mode above and has two direct consequences:
+
+1. `SupportBeams.solve` densifies this block and factors it with
+   `lineax.LU()` (`beam_network.py:2024-2037`), losing roughly 10 of 16
+   digits.
+2. The **same** `K_ss` values go into the merged monolithic matrix via
+   `make_merged_solve` — so this is not confined to the staggered path that
+   the philosophy deprioritises. It sits in the cuDSS path too.
+
+Two structural candidates worth checking first, in the order I would check
+them. I did not isolate the mode, so these are leads rather than conclusions:
+
+- **The CF foundation endpoint provides no rotational grounding.**
+  `_endpoint_weights_and_r` sets `r_fnd = x_foundation[i][j] - geom['x_end'][b]`
+  where `geom['x_end'][b]` *is* `x_foundation[i][j]` (the code says so at
+  `beam_network.py:1704`), so `r_fnd ≡ 0`, hence `skew_sum = skew2_sum = 0`,
+  hence `K_tr = K_rt = K_rr = 0` at the foundation node. The foundation
+  contributes translational stiffness only, and `_assemble_rhs` explicitly
+  does nothing for it (`pass`, `beam_network.py:1952`). The foundation-side
+  rotation DOFs are then restrained only through the bare beam's own bending
+  and torsion.
+- **A units mismatch between the coil side and the foundation side.** After the
+  working-tree JxW change, every coil-side endpoint contributes
+  `K_tt += k_lin · Σ(w · JxW) · I₃` — an *area*-weighted sum — while the
+  foundation endpoint still contributes `K_tt += k_lin · 1.0 · I₃` with a
+  dimensionless `w_sum = 1.0` (`beam_network.py:1778-1781`). With
+  `k_lin = 1e8` N/m³ the coil side is `≈ 7 × 10⁶` N/m and the foundation side
+  is `10⁸` N/m — 14× stiffer, for no physical reason. The JxW change updated
+  the coil branch and left the foundation branch alone.
+
+A cheap diagnostic that would have surfaced this: `merged_solve` already gets
+the matrix inertia back from cuDSS and throws it away
+(`sol_flat, _inertia = solver_K(f_merged, csr_values)`, `drivers.py:559`).
+Surfacing it, or asserting on `min(svd(K_ss))` in a test, would catch a
+zero-energy mode at assembly time instead of as a silent non-convergence 100
+sweeps later.
+
+#### A2d — Higher-order curves are pathologically slow
+
+Also **[measured]**, and unexplained: with everything else held fixed, swapping
+the order-1 circles for randomly perturbed order-3 curves takes a case that
+runs in 3–8 s to over 10 minutes without completing (three separate attempts,
+including one at 20 minutes). The same happened for order-2 perturbations. The
+per-sweep work should not depend on the Fourier order — the curve is evaluated
+once per objective call, not once per sweep — so the likely culprits are
+distorted or inverted tetrahedra making the umfpack solve pathological, or
+repeated re-lowering of the RMF `lax.scan` that
+`framed_curve_jax.py:226-238` warns about. Worth reproducing and profiling,
+because randomly-shaped coils are the realistic optimisation input.
+
+Note that non-convergence also means every staggered solve currently pays the
+full 100 sweeps, which is why the timing in
+[Rule 4](#rule-4--jit-opportunities) looks the way it does.
 
 ### A3 — The returned solutions do not correspond to the returned `u_s`
 
@@ -663,8 +814,8 @@ fallback for anything non-linear.
 
 ### Measurements
 
-**[measured]** CPU backend, 2 coils × 768 TET4 cells (288 nodes each), 6 beams,
-mean of 3 runs after warm-up:
+**[measured]** CPU backend, 2 coils × 768 TET4 cells (288 nodes each),
+12 beams, mean of 3 runs after warm-up:
 
 | Block | Eager | Jitted | Speed-up |
 |---|---:|---:|---:|
@@ -948,35 +1099,46 @@ ancestor of `coil_fem.py`). Worth deleting from the working tree.
 
 ## Suggested sequencing
 
-1. **Unblock correctness.** [A1](#a1--jaxgrad-through-solve_staggered-raises)
-   (decide: forward-only or `lax.while_loop` + real `custom_vjp`),
-   [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing),
+1. **Find the marginal mode.** [A2c](#a2c--the-support-stiffness-block-is-near-singular)
+   is the one finding that affects the priority cuDSS path as much as the
+   staggered one, and everything downstream of it (BG-S convergence, the
+   accuracy of the dense `K_ss` LU, the conditioning of the merged matrix) is
+   contingent on it. Check the two leads — CF foundation rotational grounding
+   and the coil-side/foundation-side units mismatch — then add an assertion on
+   `min(svd(K_ss))` (or surface the cuDSS inertia) so a zero-energy mode fails
+   loudly at assembly.
+2. **Unblock the rest of correctness.**
+   [A1](#a1--jaxgrad-through-solve_staggered-raises) (decide: forward-only or
+   `lax.while_loop` + real `custom_vjp`),
+   [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) (report
+   non-convergence; revisit the `ω ≥ 0.1` clamp),
    [A4](#a4--three-of-the-four-cross-section-presets-are-unusable),
    [A5](#a5--cudss_mtype_id-has-two-conflicting-defaults),
    [A6](#a6--mutable-default-arguments-are-mutated-in-place). Add a regression
    test that takes `jax.grad` through a *real* `SupportBeams`, not a constant
-   mock.
-2. **Delete.** Everything in [1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs),
+   mock, and one that asserts BG-S actually converges rather than only that it
+   returns.
+3. **Delete.** Everything in [1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs),
    [1b](#1b-placeholder-implementations-that-the-architecture-no-longer-uses),
    [1d](#1d-single-use-wrappers-that-add-a-hop-without-adding-meaning), and the
    unused imports in [3d](#3d-unused-imports-and-locals-pyflakes). This shrinks
    the surface everything else has to be checked against.
-3. **Unify.** One constitutive kernel
+4. **Unify.** One constitutive kernel
    ([2a](#2a-von-mises--cauchy-stress-written-three-times)), one Rodrigues,
    one set of symmetry transforms
    ([2b](#2b-rotation-and-symmetry-primitives-written-twice)), one
    `curves_from_dofs` ([2e](#2e-curves_jax-rebuilt-in-eight-places)), one FE
    and surface geometry cache
    ([2d](#2d-fe-geometry-recomputed-three-times-per-coil-per-evaluation)).
-4. **Vectorise then JIT.** [4b](#4b-replace-per-endpoint-python-loops-with-vmap)
+5. **Vectorise then JIT.** [4b](#4b-replace-per-endpoint-python-loops-with-vmap)
    first (it shrinks what has to be compiled), then
    [4a](#4a-jit-the-beam-side-biggest-single-win-on-cpu),
    [4c](#4c-jit-_body_force_at_quads), [4d](#4d-jit-the-metric-block-in-objective),
    [4e](#4e-structure-objective-as-three-stages).
-5. **Priority-path polish.** [4g](#4g-halve-the-monolithic-backward-assembly)
+6. **Priority-path polish.** [4g](#4g-halve-the-monolithic-backward-assembly)
    and [4f](#4f-biot_savart-materialises-an-n_src-n_targets-3-intermediate),
    which are the two items that matter most for large cuDSS/monolithic runs.
-6. **Boundaries and docs.** [Philosophy 2](#philosophy-2--support-must-be-independent-of-coilfem),
+7. **Boundaries and docs.** [Philosophy 2](#philosophy-2--support-must-be-independent-of-coilfem),
    then reconcile AGENTS.md and `docs/developers/support_structure.rst`.
 
 ---
@@ -987,18 +1149,56 @@ All timings and error reproductions were produced in the `rod` conda
 environment (`jax 0.6.2`, `jax_enable_x64=True`) with `JAX_PLATFORMS=cpu`,
 using the fixtures from `tests/test_beam_networks.py`.
 
-Configuration for the timing table: `n_base=2`, `n_beam_cc=3`, `n_beam_cf=3`,
-`nfp=2`, `stellsym=False`, curves with `N=32` quadpoints, mesh
+### Coil geometry used
+
+This matters for [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing),
+so it is spelled out. All coils are `CurveXYZFourierJAX` objects:
+
+- **Coplanar circles** (`_make_curves` from `tests/test_beam_networks.py`):
+  order-1, radius `1.0 + 0.1·i`, lying in the *xz*-plane with `y ≡ 0`, so the
+  two coils are concentric and coplanar.
+- **Offset non-coplanar circles**: the same, with the second coil translated to
+  `y = 0.45` so the CC beam is neither radial nor in-plane.
+- **Randomly perturbed coils**: order-2 and order-3, built by adding
+  `amp · R · N(0, 1)` (`amp = 0.05`–`0.08`) to every sine and cosine
+  coefficient of every coordinate above mode 1, plus an out-of-plane `y` mode-1
+  term. These runs did not complete; see
+  [A2d](#a2d--higher-order-curves-are-pathologically-slow).
+
+Attachment functions: either `_uniform_clamp_fn` from the test fixture (weight
+1.0 at every surface quadrature point) or a localised sigmoid ball,
+`clamp_sigmoid(d_sq=‖x_beam_frame‖², r=0.06, sigmoid_eps=0.3)`, which clamps
+9.4 % of the coil-0 surface area. Cross-sections came from
+`_constant_section_fn()` (`A = 1e-4`, `Iy = Iz = 1e-8`, `J = 2e-8`), and
+support DOFs from `_make_support_dofs` (CC attachment at `φ = 0.1` on both
+ends, CF at `φ = 0.6`, foundation anchors offset `+0.5` in *x*).
+
+### Configurations
+
+Timing table: `n_base=2`, `n_beam_cc=3`, `n_beam_cf=3`, `nfp=2`,
+`stellsym=False`, `N=32` quadpoints, mesh
 `{'shape': 'rect', 'w1': 0.05, 'w2': 0.05, 'n_grid_1': 2, 'n_grid_2': 2}`
 (288 nodes / 768 TET4 cells per coil), `winkler_k=1e8`, `solver='umfpack'`,
 `coupling='staggered'`. Each entry is the mean of 3 calls after one warm-up
 call, with `jax.block_until_ready` before and after timing.
 
-Configuration for the sweep count and the gradient failure: the same, with
-`n_beam_cc=1`, `n_beam_cf=1`, `N=8`, and a 1×1 cross-section grid, so the run
-completes in ~20 s.
+Sweep count and gradient failure: the same, with `n_beam_cc=1`,
+`n_beam_cf=1`, `N=8`, and a 1×1 cross-section grid, so the run completes in
+~20 s.
 
-Reproduction sketch (the scratch scripts were not kept):
+Convergence study: `n_beam_cc=1`, `n_beam_cf=1`, `N=16`, mesh
+`{'w1': 0.03, 'w2': 0.03, 'n_grid_1': 1, 'n_grid_2': 1}`, `k_tor=1e4` unless
+noted, `k_lin ∈ {1e5, 1e8}`. Residuals were recovered by wrapping
+`support.compute_attach` (to capture the incoming `u_s`) and `support.solve`
+(to capture the outgoing `T(u_s)`); the effective `ω` was recovered as
+`⟨u_{k+1} − u_k, Δ_k⟩ / ‖Δ_k‖²`. Runs with a capped sweep budget used
+`functools.partial(solve_staggered, options={'max_iters': N})` monkeypatched
+over `coil_fem.coil_fem.solve_staggered`, since `CoilFEM` does not expose
+`options` ([1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs)).
+
+### Reproduction sketches
+
+The scratch scripts were not kept.
 
 ```python
 # gradient failure
@@ -1013,4 +1213,11 @@ orig = support.solve
 support.solve = lambda inp: (calls.__setitem__(0, calls[0] + 1), orig(inp))[1]
 fem.objective(cdofs, idofs, sdofs, metrics=('strain_energy',))
 print(calls[0])                           # 100  (== max_iters)
+
+# near-singular K_ss
+geom = sb.geometry(curves_jax, sdofs)
+I, J, V, n = sb.coo(curves_jax, sdofs, surf_quad_pts, geom=geom, jxw_by_coil=jxw)
+K = np.zeros((n, n)); np.add.at(K, (np.asarray(I), np.asarray(J)), np.asarray(V))
+s = np.linalg.svd(K, compute_uv=False)
+print(n, s[0], s[-1], s[0] / s[-1])       # 48  1.543e+08  1.696e-02  9.097e+09
 ```
