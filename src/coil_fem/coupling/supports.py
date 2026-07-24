@@ -37,14 +37,17 @@ class Support:
     Parameters
     ----------
     fixed_clamp_fns : callable or list[callable] or None
-        Function(s) returning per-surface-node weights in ``[0, 1]``::
+        Function(s) returning per-point weights in ``[0, 1]``::
 
             fixed_clamp_fn(
-                surface_pts : jax.Array,          # (n_surface_nodes, 3)
+                surface_pts : jax.Array,          # (N, 3) — any point cloud
                 curve_jax   : CurveXYZFourierJAX,
                 dofs_slice  : dict | None,        # per-coil slice, or None
-            ) -> jax.Array                        # (n_surface_nodes,)
+            ) -> jax.Array                        # (N,)
 
+        During solves ``surface_pts`` are the surface **quadrature** points
+        ``(n_surface_quads, 3)`` of the coil mesh.  For visualisation the
+        function may be called with surface node positions instead.
         ``dofs_slice`` is the per-coil slice of the full dofs dict (each leaf
         indexed at ``coil_idx``), or ``None`` when no optimisation dofs are
         available.  A single callable is broadcast to every coil.  A list
@@ -127,8 +130,10 @@ class Support:
         ----------
         coil_idx : int
             Index of the base coil (0-based).
-        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
-            Current positions of the coil surface nodes.
+        surface_pts : jax.Array, shape ``(N, 3)``
+            Query points.  During solves these are the surface quadrature
+            points ``(n_surface_quads, 3)``; for visualisation they may be
+            surface node positions.  The callable is shape-agnostic.
         curves_jax : list[CurveXYZFourierJAX]
             Differentiable centreline curves for **all** base coils.  The full
             list is required so that beam-network supports can evaluate the
@@ -142,8 +147,8 @@ class Support:
 
         Returns
         -------
-        jax.Array, shape ``(n_surface_nodes,)``
-            Winkler weight in ``[0, 1]`` for each surface node.
+        jax.Array, shape ``(N,)``
+            Winkler weight in ``[0, 1]`` for each query point.
         """
         if self._fixed_clamp_fns is None:
             return jnp.ones(surface_pts.shape[0])
@@ -237,7 +242,7 @@ class Support:
 
             surf_idx = onp.asarray(fem.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
-                fem._compute_support_weights(i, pts_i, curves_jax, base_support_dofs),
+                fem._compute_support_weights(i, pts_i, curves_jax, base_support_dofs, at='nodes'),
                 dtype=onp.float64,
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
@@ -344,7 +349,7 @@ class Support:
 
             surf_idx = onp.asarray(fem.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
-                fem._compute_support_weights(i, pts_i, curves_jax, base_support_dofs),
+                fem._compute_support_weights(i, pts_i, curves_jax, base_support_dofs, at='nodes'),
                 dtype=onp.float64,
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
@@ -427,16 +432,16 @@ class Support:
         dofs,
         state: dict,
     ) -> jax.Array:
-        """Per-surface-node target displacement for the shifted Winkler spring.
+        """Per-query-point target displacement for the shifted Winkler spring.
 
         In the staggered coupling scheme, the coil-side Winkler spring is shifted
-        so that the spring force on coil surface node ``k`` is
+        so that the spring force at each surface quad point ``q`` is
 
         .. math::
 
-            f_k = k_{\\text{lin}} \\cdot w_k \\cdot (u_{\\text{attach},k} - u_k)
+            f_q = k_{\\text{lin}} \\cdot w_q \\cdot (u_{\\text{attach},q} - u_q)
 
-        where :math:`u_{\\text{attach},k}` is the attachment displacement returned
+        where :math:`u_{\\text{attach},q}` is the attachment displacement returned
         here.  For an uncoupled (grounded) support this is always zero, which
         recovers the standard Winkler spring.
 
@@ -444,8 +449,8 @@ class Support:
         ----------
         coil_idx : int
             Index of the base coil (0-based).
-        surface_pts : jax.Array, shape ``(n_surface_nodes, 3)``
-            Current positions of the coil surface nodes.
+        surface_pts : jax.Array, shape ``(N, 3)``
+            Query points; during solves these are surface quadrature points.
         curves_jax : list[CurveXYZFourierJAX]
             Differentiable centreline curves for all base coils.
         dofs : dict or None
@@ -456,8 +461,8 @@ class Support:
 
         Returns
         -------
-        jax.Array, shape ``(n_surface_nodes, 3)``
-            Attachment displacement at each surface node.  Default: zeros.
+        jax.Array, shape ``(N, 3)``
+            Attachment displacement at each query point.  Default: zeros.
         """
         return jnp.zeros((surface_pts.shape[0], 3), dtype=surface_pts.dtype)
 
@@ -489,6 +494,7 @@ class Support:
         curves_jax: list,
         support_dofs: dict,
         surface_pts_by_coil: list,
+        surf_interp_by_coil=None,
         geom: dict | None = None,
     ) -> tuple:
         """Traced V arrays for K_cs and K_sc coupling blocks.
@@ -498,6 +504,11 @@ class Support:
         curves_jax : list[CurveXYZFourierJAX]
         support_dofs : dict
         surface_pts_by_coil : list[jax.Array]
+            Surface query points.  Subclasses may receive surface quadrature
+            points ``(n_sq_i, 3)`` when ``surf_interp_by_coil`` is provided.
+        surf_interp_by_coil : list or None
+            Per-coil interpolation maps for folding quad-point weights back to
+            per-node DOF quantities (ignored for the uncoupled base support).
         geom : dict or None
             Pre-computed beam geometry (ignored for the uncoupled base support).
 

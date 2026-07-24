@@ -242,14 +242,15 @@ Key constructor arguments (all static; set once at construction):
 - `n_beam_cc`, `n_beam_cf` — beam counts. CC beams have one entry per CC *group*: `n_base + 1` when `stellsym=True` (the extra last entry is the coil-0 `phi = 0` wrap group), else `n_base`. CF beams have one entry per base coil.
 - `E`, `nu` — Young's modulus and Poisson's ratio.
 - `cross_section_fn(support_dofs) -> (A, Iy, Iz, J)` — cross-section properties.
-- `clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights` — selects coil surface nodes for coupling.
-  - `surface_pts_beam_frame`: `(n_surf, 3)` — surface points in the beam's local frame, origin at the endpoint, computed as `(pts − x_endpoint) @ Gamma_3` (column 0 is the true beam tangent).
-  - `sign_x`: `True` at the node-1 end (beam extends toward `+x_local`), `False` at node-2.
+- `clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights` — selects coil surface points for coupling.
+ - `surface_pts_beam_frame`: `(N, 3)` — query points in the beam's local frame, origin at the endpoint, computed as `(pts − x_endpoint) @ Gamma_3` (column 0 is the true beam tangent).  During solves, `pts` are surface **quadrature** points `(n_surface_quads, 3)`; during visualisation they may be surface node positions.
+ - `sign_x`: `True` at the node-1 end (beam extends toward `+x_local`), `False` at node-2.
 - `k_lin`, `k_tor` — translational and torsional spring stiffness for endpoint-to-mesh coupling.
 
 Optimisable quantities live in `support_dofs` (passed at solve time, never stored):
 
 - `phis_start_cc`, `phis_end_cc` — attachment angles for CC beams: per-group lists, entry `g` of shape `(n_beam_cc[g],)` (`n_base + 1` entries when `stellsym=True`, else `n_base`).
+- **Note:** `support_weights` and `support_attach` in `params` are per-surface **quad** point (`(n_surface_quads,)` and `(n_surface_quads, 3)`), not per surface node.  Obtain them via `pipeline.surface_quad_points(pts)` → `support.compute_weights` / `compute_attach`.
 - `phis_start_cf` — attachment angles for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i],)`.
 - `x_foundation` — foundation anchor positions for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i], 3)`.
 - `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam (same per-group / per-coil list layout as the attachment angles).

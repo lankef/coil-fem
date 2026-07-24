@@ -815,8 +815,8 @@ class CoilFEM:
           shape ``(n_nodes, 3)``.
         * ``'von_mises'``     -- list of ``(n_cells, n_quads)`` von Mises arrays.
         * ``'mesh_points'``   -- list of updated ``(n_nodes, 3)`` node arrays.
-        * ``'support_weights'`` -- list of ``(n_surface_nodes,)`` Winkler weight
-          arrays per coil.
+        * ``'support_weights'`` -- list of ``(n_surface_quads,)`` Winkler weight
+          arrays per coil (one entry per surface quadrature point).
         * ``'f_vol'``         -- list of ``(n_cells, n_quads, 3)`` body force
           density arrays [N/m^3] per coil.
         * ``'B_self'``        -- list of ``(n_cells, n_quads, 3)`` self-field
@@ -1086,28 +1086,33 @@ class CoilFEM:
         support_dofs: dict | None,
         *,
         geom: dict | None = None,
+        at: str = 'quads',
     ) -> jax.Array:
-        """Compute per-surface-node Winkler weights for coil ``coil_idx``.
+        """Compute Winkler weights for coil ``coil_idx`` at surface quad or node points.
 
         Parameters
         ----------
         pts_i : (n_nodes, 3) traced
         curves_jax : list[CurveXYZFourierJAX]
-            Differentiable centreline curves for **all** base coils (needed so
-            that beam-network supports can evaluate the true beam tangent using
-            both endpoint curves).  The caller is responsible for constructing
-            this list once and reusing it across coils.
+            Differentiable centreline curves for **all** base coils.
         support_dofs : dict or None
-            Full merged support-dofs dict for the coil set (as returned by
-            :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).  Passed
-            directly to :meth:`~coil_fem.coupling.Support.compute_weights`;
-            the support object is responsible for slicing out per-coil data.
+            Full merged support-dofs dict for the coil set.  Passed directly to
+            :meth:`~coil_fem.coupling.Support.compute_weights`.
         geom : dict or None
             Pre-computed beam geometry from
-            :meth:`~coil_fem.coupling.Support.geometry`.  Passed through to
-            avoid redundant recomputation when available.
+            :meth:`~coil_fem.coupling.Support.geometry`.
+        at : ``'quads'`` or ``'nodes'``
+            Point set at which to evaluate the weight function.  ``'quads'``
+            (default) returns a ``(n_surface_quads,)`` array for use as
+            ``params['support_weights']``.  ``'nodes'`` returns a
+            ``(n_surface_nodes,)`` array, used only for per-node visualisation
+            (plotting and VTU export).
         """
-        surf_pts = pts_i[self.pipelines[coil_idx].surface_node_indices]
+        pipeline = self.pipelines[coil_idx]
+        if at == 'nodes':
+            surf_pts = pts_i[pipeline.surface_node_indices]
+        else:
+            surf_pts = pipeline.surface_quad_points(pts_i)
         kw = {'geom': geom} if geom is not None else {}
         return self.support.compute_weights(coil_idx, surf_pts, curves_jax, support_dofs, **kw)
 
@@ -1522,7 +1527,7 @@ class CoilFEM:
                 self.pipelines[i].surface_node_indices, dtype=onp.int32
             )
             weights_surf = onp.asarray(
-                self._compute_support_weights(i, pts_i, curves_jax, base_support_dofs),
+                self._compute_support_weights(i, pts_i, curves_jax, base_support_dofs, at='nodes'),
                 dtype=onp.float64,
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)

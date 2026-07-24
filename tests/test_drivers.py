@@ -151,7 +151,7 @@ def test_monolithic_raises_on_cpu():
             jnp.zeros((pipeline.problem.num_cells, n_quads, 3))
         ],
         'weights_by_coil':     [
-            jnp.ones(pipeline.surface_node_indices.shape[0])
+            jnp.ones(pipeline.n_surface_quads)
         ],
         'curves_by_coil':      [_make_circle(N=4)],
         'base_curves_dofs':    [_make_circle(N=4).dofs],
@@ -299,13 +299,13 @@ def test_staggered_fixed_point_trivial():
     pts      = pipeline.mesh.mesh_points_from_dofs(_make_circle(N=4).dofs)
     n_cells  = pipeline.problem.num_cells
     n_quads  = pipeline.problem.fes[0].num_quads
-    n_surf   = pipeline.surface_node_indices.shape[0]
+    n_sq     = pipeline.n_surface_quads
     curve    = _make_circle(N=4)
 
     params = {
         'mesh_points_by_coil': [pts],
         'body_force_by_coil':  [jnp.zeros((n_cells, n_quads, 3))],
-        'weights_by_coil':     [jnp.ones(n_surf)],
+        'weights_by_coil':     [jnp.ones(n_sq)],
         'curves_by_coil':      [curve],
         'base_curves_dofs':    [curve.dofs],
         'support_dofs':        {},
