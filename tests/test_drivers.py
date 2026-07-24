@@ -24,7 +24,7 @@ jax.config.update("jax_enable_x64", True)
 from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
 from coil_fem.meshing import CoilMesh
 from coil_fem.pipelines import ElasticPipeline
-from coil_fem.coupling import Support, solve_staggered, solve_monolithic
+from coil_fem.coupling import Support, solve_staggered, solve_monolithic, MonolithicStatic
 from coil_fem.coil_fem import CoilFEM
 
 
@@ -88,6 +88,9 @@ class _TrivialCoupledSupport(Support):
     is_coupled = True
     n_support_dofs = 1
     k_lin = 1e9
+    # Static K_ss pattern (1×1 diagonal), required by build_monolithic_static.
+    _coo_I = np.zeros(1, dtype=np.int32)
+    _coo_J = np.zeros(1, dtype=np.int32)
 
     @property
     def is_coupled(self):
@@ -107,7 +110,7 @@ class _TrivialCoupledSupport(Support):
 
     def coupling_terms(
         self,
-        base_curves_dofs,
+        curves_jax,
         support_dofs,
         surface_pts_by_coil,
         coil_dof_offsets,
@@ -121,7 +124,7 @@ class _TrivialCoupledSupport(Support):
             'I_sc': empty_i, 'J_sc': empty_i, 'V_sc': empty,
         }
 
-    def coo(self, base_curves_dofs, support_dofs, surface_pts_by_coil):
+    def coo(self, curves_jax, support_dofs, surface_pts_by_coil):
         n = self.n_support_dofs
         I = jnp.zeros(n, dtype=jnp.int32)
         J = jnp.zeros(n, dtype=jnp.int32)
@@ -154,8 +157,19 @@ def test_monolithic_raises_on_cpu():
         'base_curves_dofs':    [_make_circle(N=4).dofs],
         'support_dofs':        {},
     }
+    static = MonolithicStatic(
+        coil_dof_offsets=(0,), support_dof_offset=48, n_total_dofs=50,
+        n_dofs_per_coil=(48,), n_s=2, has_cs=False, has_sc=False,
+        surface_node_indices_by_coil=(pipeline.surface_node_indices,),
+        curve_qps=(_make_circle(N=4).quadpoints,),
+        curve_orders=(1,),
+        I_cs_pat=None, J_cs_pat=None, I_sc_pat=None, J_sc_pat=None,
+        indptr=None, indices=None, coo_to_csr=None, nnz_csr=0,
+        coo_to_csr_T=None, nnz_csr_T=None,
+        solver_K=None, solver_KT=None, merged_solve=None,
+    )
     with pytest.raises(NotImplementedError, match="cudss"):
-        solve_monolithic([pipeline], support, params)
+        solve_monolithic([pipeline], support, params, static)
 
 
 # ============================================================================
@@ -217,7 +231,7 @@ def test_coilfem_dispatch_calls_monolithic(monkeypatch):
     """CoilFEM._solve_all should call solve_monolithic when coupling='monolithic'."""
     calls = []
 
-    def mock_monolithic(pipelines, support, params, *, options=None):
+    def mock_monolithic(pipelines, support, params, static):
         calls.append('monolithic')
         n = len(pipelines)
         n_nodes = pipelines[0].problem.num_total_dofs_all_vars // 3

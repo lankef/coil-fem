@@ -80,6 +80,11 @@ def _uniform_clamp_fn(surface_pts_beam_frame, dofs, sign_x, constants):
     return jnp.ones(surface_pts_beam_frame.shape[0])
 
 
+def _make_curves(n_base: int, N: int = 8) -> list:
+    """Build the canonical test base-coil curves (circles of increasing radius)."""
+    return [_make_circle(N=N, R=1.0 + 0.1 * i) for i in range(n_base)]
+
+
 def _make_support_beams(
     n_base: int = 2,
     n_beam_cc: int = 1,
@@ -89,7 +94,6 @@ def _make_support_beams(
     fixed_clamp_fns=None,
 ) -> SupportBeams:
     """Build a minimal SupportBeams instance for testing."""
-    curves = [_make_circle(N=8, R=1.0 + 0.1 * i) for i in range(n_base)]
     beam_options = {
         'n_beam_cc': n_beam_cc,
         'n_beam_cf': n_beam_cf,
@@ -102,7 +106,7 @@ def _make_support_beams(
         nfp=nfp,
         stellsym=stellsym,
         beam_options=beam_options,
-        base_curves_jax=curves,
+        n_base=n_base,
         cross_section_fn=_constant_section_fn(),
         attachment_fn=_uniform_clamp_fn,
         fixed_clamp_fns=fixed_clamp_fns,
@@ -198,12 +202,12 @@ def test_support_beams_dof_count():
 def test_support_beams_coo_shapes():
     """coo() returns (I, J, V, n) with consistent shapes."""
     n_base, n_cc, n_cf = 2, 1, 1
-    sb   = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
-    dofs = [c.dofs for c in sb.base_curves_jax]
-    sdofs = _make_support_dofs(n_base, n_cc, n_cf)
-    surf  = _make_surface_pts(n_base)
+    sb     = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
+    surf   = _make_surface_pts(n_base)
 
-    I, J, V, n_dofs = sb.coo(dofs, sdofs, surface_pts_by_coil=surf)
+    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf)
 
     n_beams = n_base * (n_cc + n_cf)
     expected_nnz = n_beams * 144   # 12 * 12 per beam
@@ -232,12 +236,12 @@ def test_support_beams_coo_diagonal_dominance():
     through the attach-point moment arms.
     """
     n_base, n_cc, n_cf = 2, 1, 1
-    sb    = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
-    dofs  = [c.dofs for c in sb.base_curves_jax]
-    sdofs = _make_support_dofs(n_base, n_cc, n_cf)
-    surf  = _make_surface_pts(n_base)
+    sb     = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
+    surf   = _make_surface_pts(n_base)
 
-    I, J, V, n_dofs = sb.coo(dofs, sdofs, surface_pts_by_coil=surf)
+    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf)
 
     # Reconstruct the dense block-diagonal matrix
     K = np.zeros((n_dofs, n_dofs))
@@ -260,13 +264,13 @@ def test_support_beams_coo_diagonal_dominance():
 def test_support_beams_solve_zero_rhs_yields_zero():
     """With u_mesh_by_coil=None the RHS is zero → u_s should be ≈ 0."""
     n_base, n_cc, n_cf = 2, 1, 1
-    sb    = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
-    dofs  = [c.dofs for c in sb.base_curves_jax]
-    sdofs = _make_support_dofs(n_base, n_cc, n_cf)
-    surf  = _make_surface_pts(n_base)
+    sb     = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
+    surf   = _make_surface_pts(n_base)
 
     result = sb.solve({
-        'base_curves_dofs':    dofs,
+        'curves_jax':          curves,
         'support_dofs':        sdofs,
         'surface_pts_by_coil': surf,
         'u_mesh_by_coil':      None,
@@ -286,9 +290,9 @@ def test_support_beams_solve_zero_rhs_yields_zero():
 def test_support_beams_grad_through_x_foundation():
     """jax.grad w.r.t. x_foundation through solve() is nonzero and finite."""
     n_base, n_cc, n_cf = 2, 1, 1
-    sb    = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
-    dofs  = [c.dofs for c in sb.base_curves_jax]
-    surf  = _make_surface_pts(n_base)
+    sb     = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
+    curves = _make_curves(n_base)
+    surf   = _make_surface_pts(n_base)
 
     # Give nonzero coil displacements so that x_foundation shift matters
     u_mesh = [jnp.ones((s.shape[0], 3)) * 1e-3 for s in surf]
@@ -297,7 +301,7 @@ def test_support_beams_grad_through_x_foundation():
         sdofs = _make_support_dofs(n_base, n_cc, n_cf)
         sdofs = {**sdofs, 'x_foundation': x_found}
         result = sb.solve({
-            'base_curves_dofs':    dofs,
+            'curves_jax':          curves,
             'support_dofs':        sdofs,
             'surface_pts_by_coil': surf,
             'u_mesh_by_coil':      u_mesh,
@@ -327,7 +331,7 @@ def test_support_beams_compute_weights_passthrough():
         return jnp.full(surface_pts.shape[0], 0.5)
 
     sb     = _make_support_beams(n_base=2, fixed_clamp_fns=half_fn)
-    curves = sb.base_curves_jax          # list[CurveXYZFourierJAX]
+    curves = _make_curves(2)
     surf   = jnp.ones((n_surf, 3))
 
     w = sb.compute_weights(0, surf, curves, None)
@@ -403,9 +407,9 @@ def test_support_beams_transform_matrices_and_reflection_planes():
 
     # Boundary-group beam endpoints land on the transformed curves:
     # group n_base-1 -> flip_half(coil n-1), group n_base -> flip(coil 0).
-    sdofs = _make_support_dofs(n_base, 1, 1, stellsym=True)
-    curves = sb.base_curves_jax
-    geom = sb._beam_geometry(curves, sdofs)
+    sdofs  = _make_support_dofs(n_base, 1, 1, stellsym=True)
+    curves = _make_curves(n_base)
+    geom   = sb._beam_geometry(curves, sdofs)
 
     phi_e = sdofs['phis_end_cc'][n_base - 1][0]
     x_e_expected = Q_half @ np.asarray(curves[n_base - 1].gamma_eval(phi_e))
@@ -425,13 +429,13 @@ def test_support_beams_transform_matrices_and_reflection_planes():
 def test_support_beams_bare_beam_rank():
     """Without springs the bare beam block has rank 6 (rank-deficient)."""
     n_base, n_cc, n_cf = 1, 1, 0
-    sb    = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf,
-                                 nfp=2, stellsym=False)
-    dofs  = [c.dofs for c in sb.base_curves_jax]
-    sdofs = _make_support_dofs(n_base, n_cc, n_cf)
+    sb     = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf,
+                                  nfp=2, stellsym=False)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
 
     # Pass surface_pts_by_coil=None → bare beam, no spring regularisation
-    I, J, V, n_dofs = sb.coo(dofs, sdofs, surface_pts_by_coil=None)
+    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=None)
 
     K = np.zeros((n_dofs, n_dofs))
     np.add.at(K, (np.asarray(I), np.asarray(J)), np.asarray(V))
@@ -462,7 +466,7 @@ def test_support_beams_end_side_gradient():
         d = jnp.sqrt(jnp.sum(surface_pts_beam_frame ** 2, axis=1) + 1e-8)
         return jax.nn.sigmoid(1.0 - d)
 
-    base_curves = [_make_circle(N=8, R=1.0 + 0.1 * i) for i in range(n_base)]
+    base_curves = _make_curves(n_base)
     sb = SupportBeams(
         nfp=nfp,
         stellsym=False,
@@ -474,7 +478,7 @@ def test_support_beams_end_side_gradient():
             'k_lin': 1e8,
             'k_tor': 1e4,
         },
-        base_curves_jax=base_curves,
+        n_base=n_base,
         cross_section_fn=_constant_section_fn(),
         attachment_fn=sigmoid_clamp_fn,
     )
@@ -530,15 +534,15 @@ def test_support_beams_ragged_counts_and_offsets():
 def test_support_beams_ragged_coo_shapes():
     """coo() sizing and index bounds hold for ragged per-coil counts."""
     n_base = 3
-    sb    = _make_support_beams(
+    sb     = _make_support_beams(
         n_base=n_base, n_beam_cc=_RAGGED_CC, n_beam_cf=_RAGGED_CF,
         nfp=2, stellsym=False,
     )
-    dofs  = [c.dofs for c in sb.base_curves_jax]
-    sdofs = _make_support_dofs(n_base, _RAGGED_CC, _RAGGED_CF)
-    surf  = _make_surface_pts(n_base)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, _RAGGED_CC, _RAGGED_CF)
+    surf   = _make_surface_pts(n_base)
 
-    I, J, V, n_dofs = sb.coo(dofs, sdofs, surface_pts_by_coil=surf)
+    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf)
 
     n_beams = sum(_RAGGED_CC[i] + _RAGGED_CF[i] for i in range(n_base))
     expected_nnz = n_beams * 144
@@ -558,16 +562,16 @@ def test_support_beams_ragged_coo_shapes():
 def test_support_beams_ragged_solve_zero_rhs_yields_zero():
     """Zero RHS -> zero solution, even with ragged per-coil counts."""
     n_base = 3
-    sb    = _make_support_beams(
+    sb     = _make_support_beams(
         n_base=n_base, n_beam_cc=_RAGGED_CC, n_beam_cf=_RAGGED_CF,
         nfp=2, stellsym=False,
     )
-    dofs  = [c.dofs for c in sb.base_curves_jax]
-    sdofs = _make_support_dofs(n_base, _RAGGED_CC, _RAGGED_CF)
-    surf  = _make_surface_pts(n_base)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, _RAGGED_CC, _RAGGED_CF)
+    surf   = _make_surface_pts(n_base)
 
     result = sb.solve({
-        'base_curves_dofs':    dofs,
+        'curves_jax':          curves,
         'support_dofs':        sdofs,
         'surface_pts_by_coil': surf,
         'u_mesh_by_coil':      None,
@@ -580,13 +584,13 @@ def test_support_beams_ragged_solve_zero_rhs_yields_zero():
 def test_support_beams_ragged_coupling_terms_bounds():
     """coupling_terms() off-diagonal indices stay within the merged system."""
     n_base = 3
-    sb    = _make_support_beams(
+    sb     = _make_support_beams(
         n_base=n_base, n_beam_cc=_RAGGED_CC, n_beam_cf=_RAGGED_CF,
         nfp=2, stellsym=False,
     )
-    dofs  = [c.dofs for c in sb.base_curves_jax]
-    sdofs = _make_support_dofs(n_base, _RAGGED_CC, _RAGGED_CF)
-    surf  = _make_surface_pts(n_base, n_surf=6)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, _RAGGED_CC, _RAGGED_CF)
+    surf   = _make_surface_pts(n_base, n_surf=6)
 
     # Minimal merged-system layout: 3 DOFs per surface node, coils packed first.
     n_surf = surf[0].shape[0]
@@ -595,7 +599,7 @@ def test_support_beams_ragged_coupling_terms_bounds():
     surf_idx = [np.arange(n_surf, dtype=np.int32) for _ in range(n_base)]
 
     terms = sb.coupling_terms(
-        dofs, sdofs, surf, coil_dof_offsets, support_dof_offset, surf_idx,
+        curves, sdofs, surf, coil_dof_offsets, support_dof_offset, surf_idx,
     )
     n_total = support_dof_offset + sb.n_support_dofs
     for key in ('I_cs', 'J_cs', 'I_sc', 'J_sc'):
@@ -635,10 +639,10 @@ def test_support_beams_rhs_matches_coupling_terms():
     rows of both assembly paths against each other.
     """
     n_base, nfp = 2, 3
-    sb    = _make_support_beams(n_base=n_base, nfp=nfp, stellsym=True)
-    dofs  = [c.dofs for c in sb.base_curves_jax]
-    sdofs = _make_support_dofs(n_base, 1, 1, stellsym=True)
-    surf  = _make_surface_pts(n_base, n_surf=6)
+    sb     = _make_support_beams(n_base=n_base, nfp=nfp, stellsym=True)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, 1, 1, stellsym=True)
+    surf   = _make_surface_pts(n_base, n_surf=6)
     n_surf = surf[0].shape[0]
 
     rng    = np.random.default_rng(42)
@@ -651,7 +655,7 @@ def test_support_beams_rhs_matches_coupling_terms():
     surf_idx = [np.arange(n_surf, dtype=np.int32) for _ in range(n_base)]
 
     terms = sb.coupling_terms(
-        dofs, sdofs, surf, coil_dof_offsets, support_dof_offset, surf_idx,
+        curves, sdofs, surf, coil_dof_offsets, support_dof_offset, surf_idx,
     )
 
     # Dense K_sc: rows = support DOFs, cols = coil DOFs.
@@ -668,11 +672,10 @@ def test_support_beams_rhs_matches_coupling_terms():
     f_expected = -K_sc @ u_c
 
     # RHS from the standalone-solve path.
-    curves  = sb._reconstruct_curves(dofs)
-    geom    = sb._beam_geometry(curves, sdofs)
-    gamma3  = sb._direction_cosine_matrices(geom, sdofs)
-    beps    = sb._endpoint_weights_and_r(curves, geom, gamma3, sdofs, surf)
-    f_rhs   = np.asarray(sb._assemble_rhs(geom, beps, u_mesh))
+    geom   = sb._beam_geometry(curves, sdofs)
+    gamma3 = sb._direction_cosine_matrices(geom, sdofs)
+    beps   = sb._endpoint_weights_and_r(curves, geom, gamma3, sdofs, surf)
+    f_rhs  = np.asarray(sb._assemble_rhs(geom, beps, u_mesh))
 
     assert f_rhs.shape == (n_s,)
     assert np.allclose(f_rhs, f_expected, rtol=1e-10, atol=1e-14), (
@@ -713,7 +716,7 @@ def test_support_beams_stellsym_vs_explicit_expansion():
     sb_sym = SupportBeams(
         nfp=nfp, stellsym=True,
         beam_options={**beam_common, 'n_beam_cc': [1, 1], 'n_beam_cf': [1]},
-        base_curves_jax=[c0],
+        n_base=1,
         cross_section_fn=_constant_section_fn(),
         attachment_fn=const_w,
     )
@@ -737,7 +740,7 @@ def test_support_beams_stellsym_vs_explicit_expansion():
     sb_exp = SupportBeams(
         nfp=nfp, stellsym=False,
         beam_options={**beam_common, 'n_beam_cc': [2, 2], 'n_beam_cf': [1, 1]},
-        base_curves_jax=[c0, c1],
+        n_base=2,
         cross_section_fn=_constant_section_fn(),
         attachment_fn=const_w,
     )
@@ -764,13 +767,13 @@ def test_support_beams_stellsym_vs_explicit_expansion():
     u1    = jnp.asarray(np.asarray(u0) @ Q_half.T)
 
     u_sym = np.asarray(sb_sym.solve({
-        'base_curves_dofs':    [dofs0],
+        'curves_jax':          [c0],
         'support_dofs':        sdofs_sym,
         'surface_pts_by_coil': [surf0],
         'u_mesh_by_coil':      [u0],
     })['u_s'])
     u_exp = np.asarray(sb_exp.solve({
-        'base_curves_dofs':    [dofs0, dofs1],
+        'curves_jax':          [c0, c1],
         'support_dofs':        sdofs_exp,
         'surface_pts_by_coil': [surf0, surf1],
         'u_mesh_by_coil':      [u0, u1],

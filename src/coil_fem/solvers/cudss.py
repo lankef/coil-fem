@@ -294,6 +294,11 @@ class CuDSSNewtonSolver:
         Relative residual tolerance for Newton convergence.
     max_iter : int
         Maximum Newton iterations.
+    linear : bool
+        When ``True``, skip the Newton iteration loop and solve in a single
+        assemble-and-solve step with no host synchronisation.  Use this when
+        the problem is known to be linear (e.g. :class:`LinearElasticity3D`),
+        which always converges in exactly one Newton step.  Default ``False``.
     """
 
     def __init__(
@@ -306,11 +311,13 @@ class CuDSSNewtonSolver:
         tol: float = 1e-6,
         rel_tol: float = 1e-8,
         max_iter: int = 50,
+        linear: bool = False,
     ):
         self.problem = problem
         self.tol = tol
         self.rel_tol = rel_tol
         self.max_iter = max_iter
+        self.linear = linear
 
         n = problem.num_total_dofs_all_vars
         self.n = n
@@ -412,17 +419,19 @@ class CuDSSNewtonSolver:
         ``problem.newton_update`` (which fills ``problem.V_jax``) to
         compute the residual and Jacobian.
 
+        When ``self.linear`` is ``True``, the iteration loop is skipped and
+        the problem is solved in a single assemble-and-solve step with no
+        host synchronisation.
+
         Returns
         -------
         sol_list : list[jnp.ndarray]
             JAX-FEM solution list; ``sol_list[0]`` has shape (n_nodes, vec).
         """
         problem = self.problem
-        logger.debug("CuDSSNewtonSolver: starting Newton loop")
         start = time.time()
 
         problem.set_params(params)
-
         dofs = jnp.zeros(self.n)
 
         def _get_res_and_update(dofs):
@@ -432,6 +441,20 @@ class CuDSSNewtonSolver:
             res_vec_bc = apply_bc_vec(res_vec, dofs, problem)
             return res_vec_bc
 
+        if self.linear:
+            # Single-shot path: one assembly + one solve, no host sync.
+            # Linear problems converge in exactly one Newton step, so the
+            # post-step residual check is skipped entirely.
+            logger.debug("CuDSSNewtonSolver: linear fast path (single solve)")
+            res_vec_bc = _get_res_and_update(dofs)
+            dofs = self.solve_step(-res_vec_bc, dofs)
+            logger.info(
+                f"CuDSSNewtonSolver: linear solve finished in "
+                f"{time.time()-start:.2f}s"
+            )
+            return problem.unflatten_fn_sol_list(dofs)
+
+        logger.debug("CuDSSNewtonSolver: starting Newton loop")
         res_vec_bc = _get_res_and_update(dofs)
         res_val = float(jnp.linalg.norm(res_vec_bc))
         res_val_initial = res_val
@@ -525,6 +548,7 @@ def cudss_ad_wrapper(
     tol: float = 1e-6,
     rel_tol: float = 1e-8,
     max_iter: int = 50,
+    linear: bool = False,
 ):
     """Drop-in replacement for ``jax_fem.solver.ad_wrapper`` using cuDSS.
 
@@ -546,7 +570,11 @@ def cudss_ad_wrapper(
     mview_id : int
         cuDSS matrix view: 0=full, 1=lower triangle. Default 0.
     tol, rel_tol, max_iter :
-        Newton convergence parameters.
+        Newton convergence parameters (ignored when ``linear=True``).
+    linear : bool
+        Forwarded to :class:`CuDSSNewtonSolver`.  Set to ``True`` when the
+        problem is linear (e.g. :class:`~coil_fem.problems.LinearElasticity3D`)
+        to skip the iteration loop and avoid host synchronisation.
 
     Returns
     -------
@@ -561,6 +589,7 @@ def cudss_ad_wrapper(
         tol=tol,
         rel_tol=rel_tol,
         max_iter=max_iter,
+        linear=linear,
     )
 
     @jax.custom_vjp

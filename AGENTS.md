@@ -180,6 +180,21 @@ Do **not** use `# ── Title ──────`, `# --- Title ---`, `# ---- #
 - `__init__.py` re-exports `CoilFEM`, `biot_savart`, `B_self_quadrature`, `lorentz_body_force`. Other modules are imported by explicit submodule path (e.g. `from coil_fem.meshing import rectangle_sweep`, `from coil_fem.geo import CurveXYZFourierJAX`).
 - simsopt interop lives in `coil_fem.simsopt` — keep pure-JAX code simsopt-free where possible.
 
+### Static vs. traced container convention
+
+Two kinds of data bundles appear in this codebase; use the correct container for each.
+
+**Traced bundles** (vary per optimisation step, flow through JAX autodiff):
+- Use plain `dict` or `NamedTuple`.  Both are JAX pytrees.
+- Example: `geom` dict returned by `SupportBeams.geometry(curves_jax, support_dofs)` contains endpoint positions, lengths, and DCMs — all traced arrays.
+- Example: `support_dofs` passed to solvers and metrics.
+
+**Static bundles** (fixed at construction, never traced):
+- Use `@dataclasses.dataclass(frozen=True, eq=False)`.  The `eq=False` flag prevents JAX from treating the dataclass as a pytree leaf during hashing; the `frozen=True` flag enforces immutability.
+- Example: `MonolithicStatic` in `coupling/drivers.py` — holds CSR patterns, cuDSS solver handles, and the pre-built `merged_solve` callable.
+- **Never store traced JAX arrays on `self`.**  Traced values must always be passed as arguments so that JAX's tracing and autodiff machinery can see them.
+- `CoilFEM.build_monolithic_static(solver)` is the canonical construction entry point for the monolithic static bundle; it is called once at `__init__` when `coupling == 'monolithic'` and `support.is_coupled`.
+
 ## Build and Packaging
 
 - **Build system:** Hatchling (`pyproject.toml`).

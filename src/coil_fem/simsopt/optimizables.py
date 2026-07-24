@@ -26,8 +26,79 @@ import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from ..presets import cross_section_fns
-from ..utils import fetch_attr
-from ..coupling import Support, SupportBeams, make_clamp_fn, make_topbottom_fn
+from ..utils import fetch_attr, clamp_sigmoid
+from ..coupling import Support, SupportBeams
+
+
+# ============================================================================
+# Clamp weight helpers (shape-specific, used by CoilSupportFixed/TopBottom)
+# ============================================================================
+
+def _clamp_spheres_weights(
+    surface_points: jax.Array,
+    curve_jax,
+    phis_i: jax.Array,
+    r_clamp: float,
+    sigmoid_eps: float,
+) -> jax.Array:
+    """Smooth-union Winkler weight for a set of sphere clamps on one coil.
+
+    Parameters
+    ----------
+    surface_points : jax.Array, shape (n_nodes, 3)
+    curve_jax : CurveXYZFourierJAX
+    phis_i : jax.Array, shape (n_clamp,)
+        Arc-length locations of the clamps (values in [0, 1]).
+    r_clamp : float
+        Sphere radius [m].
+    sigmoid_eps : float
+        Sharpness of the clamp boundary.
+
+    Returns
+    -------
+    jax.Array, shape (n_nodes,)
+    """
+    gamma_support = curve_jax.gamma_eval(phis_i)            # (n_clamp, 3)
+    d_sq = jnp.sum(
+        (surface_points[:, None, :] - gamma_support[None, :, :]) ** 2,
+        axis=-1,
+    )                                                        # (n_nodes, n_clamp)
+    w = clamp_sigmoid(d_sq, r_clamp, sigmoid_eps)
+    return jnp.sum(w, axis=-1)
+
+
+def _topbottom_weights(
+    surface_points: jax.Array,
+    curve_jax,
+    r_clamp: float,
+    sigmoid_eps: float,
+) -> jax.Array:
+    """Winkler weight from soft spheres at the coil's topmost and bottommost points.
+
+    Parameters
+    ----------
+    surface_points : jax.Array, shape (n_nodes, 3)
+    curve_jax : CurveXYZFourierJAX
+    r_clamp : float
+    sigmoid_eps : float
+
+    Returns
+    -------
+    jax.Array, shape (n_nodes,)
+    """
+    gamma  = curve_jax.gamma()
+    top    = gamma[jnp.argmax(gamma[:, 2])]
+    bottom = gamma[jnp.argmin(gamma[:, 2])]
+
+    w_top = clamp_sigmoid(
+        jnp.sum((surface_points - top) ** 2, axis=-1),
+        r_clamp, sigmoid_eps,
+    )
+    w_bottom = clamp_sigmoid(
+        jnp.sum((surface_points - bottom) ** 2, axis=-1),
+        r_clamp, sigmoid_eps,
+    )
+    return w_top + w_bottom
 
 try:
     from simsopt._core.optimizable import Optimizable
@@ -225,16 +296,12 @@ class CoilSupportFixed(CoilSupport):
 
         phis_arr = _broadcast_phis(phis, n_coils, n_clamp)
 
-        # Build one closure per coil so Support.compute_weights can dispatch
-        # correctly even when the phis come from the simsopt DOF store.
-        fns = [
-            make_clamp_fn(i, r_clamp, sigmoid_eps, phis_arr[i])
-            for i in range(n_coils)
-        ]
+        self._r_clamp = float(r_clamp)
+        self._sig_eps  = float(sigmoid_eps)
 
         super().__init__(
             base_coils, nfp, stellsym,
-            support=Support(fixed_clamp_fns=fns),
+            support=Support(fixed_clamp_fns=self._clamp_fn),
             support_dofs_jax={'phis': phis_arr},
             constants={
                 'r_clamp': float(r_clamp),
@@ -242,6 +309,15 @@ class CoilSupportFixed(CoilSupport):
             },
             names=names,
             dofs=dofs,
+        )
+
+    def _clamp_fn(self, surface_pts, curve_jax, dofs_slice):
+        """Winkler weight for one coil; dispatched by Support.compute_weights."""
+        if not dofs_slice:
+            return jnp.zeros(surface_pts.shape[0])
+        return _clamp_spheres_weights(
+            surface_pts, curve_jax, dofs_slice['phis'],
+            self._r_clamp, self._sig_eps,
         )
 
 
@@ -283,9 +359,12 @@ class CoilSupportTopBottom(CoilSupport):
             raise KeyError("fixed_clamp_options must contain 'r_clamp'.")
         sigmoid_eps = fixed_clamp_options.get('sigmoid_eps', 0.1)
 
+        self._r_clamp = float(r_clamp)
+        self._sig_eps  = float(sigmoid_eps)
+
         super().__init__(
             base_coils, nfp, stellsym,
-            support=Support(fixed_clamp_fns=make_topbottom_fn(float(r_clamp), float(sigmoid_eps))),
+            support=Support(fixed_clamp_fns=self._clamp_fn),
             support_dofs_jax={},
             constants={
                 'r_clamp': float(r_clamp),
@@ -293,6 +372,10 @@ class CoilSupportTopBottom(CoilSupport):
             },
             dofs=dofs,
         )
+
+    def _clamp_fn(self, surface_pts, curve_jax, dofs_slice):
+        """Winkler weight at the coil's topmost and bottommost points."""
+        return _topbottom_weights(surface_pts, curve_jax, self._r_clamp, self._sig_eps)
 
 
 _REQUIRED_BEAM_OPTIONS = (
@@ -431,6 +514,13 @@ class CoilSupportBeams(CoilSupport):
         cross_section_dof_keys = fetch_attr(cross_section_type + '_dof_keys', cross_section_fns)
         cross_section_option_keys = fetch_attr(cross_section_type + '_option_keys', cross_section_fns)
 
+        # ── Attachment function preset ─────────────────────────────────────────
+        if attachment_type == 'direct':
+            attachment_fn = fetch_attr(cross_section_type + '_attachment', cross_section_fns)
+        elif attachment_type == 'wrap':
+            attachment_fn = cross_section_fns.wrap_attachment
+            cross_section_option_keys += cross_section_fns.wrap_option_keys
+
         # ── Load the remaining beam options ───────────────────────────────────
         # Default sigmoid function weight
         beam_options.setdefault('sigmoid_eps', 0.1)  
@@ -439,11 +529,6 @@ class CoilSupportBeams(CoilSupport):
             raise ValueError(
                 f"beam_options must contain {missing_beam_options}."
             )
-        # ── Attachment function preset ─────────────────────────────────────────
-        if attachment_type == 'direct':
-            attachment_fn = fetch_attr(cross_section_type + '_attachment', cross_section_fns)
-        elif attachment_type == 'wrap':
-            attachment_fn = fetch_attr('wrap_attachment', cross_section_fns)
 
         # ── Optional fixed-sphere Winkler clamps ──────────────────────────────
         # Resolved before SupportBeams construction because fixed_clamp_fns is
@@ -451,6 +536,8 @@ class CoilSupportBeams(CoilSupport):
         # (disabled-clamp branch) needs n_beam_cf, so it is
         # deferred until after SupportBeams has checked the counts below.
         phis_arr = None
+        self._r_clamp = None
+        self._sig_eps  = None
         if fixed_clamp_options.get('enabled', False):
             try:
                 r_clamp = fixed_clamp_options['r_clamp']
@@ -463,10 +550,9 @@ class CoilSupportBeams(CoilSupport):
 
             phis_arr = _broadcast_phis(phis, n_base, n_clamp)
 
-            fixed_clamp_fns = [
-                make_clamp_fn(i, r_clamp, sigmoid_eps, phis_arr[i])
-                for i in range(n_base)
-            ]
+            self._r_clamp = float(r_clamp)
+            self._sig_eps  = float(sigmoid_eps)
+            fixed_clamp_fns = self._clamp_fn
         else:
             fixed_clamp_fns = None
 
@@ -478,7 +564,7 @@ class CoilSupportBeams(CoilSupport):
             nfp=nfp,
             stellsym=stellsym,
             beam_options=beam_options,
-            base_curves_jax=base_curves_jax,
+            n_base=n_base,
             cross_section_fn=cross_section_fn,
             cross_section_dof_keys=cross_section_dof_keys,
             attachment_fn=attachment_fn,
@@ -532,7 +618,6 @@ class CoilSupportBeams(CoilSupport):
                 phi_init = jnp.linspace(a, b, c, endpoint=False) + half_interval
                 if cc_end and i >= len(counts)-2:
                     phi_init = 1 - phi_init
-                print('phi_init', i, phi_init)
                 out.append(phi_init)
             return out
 
@@ -686,4 +771,13 @@ class CoilSupportBeams(CoilSupport):
             names=names,
             fixed=np.array(fixed_mask),
             dofs=dofs,
+        )
+
+    def _clamp_fn(self, surface_pts, curve_jax, dofs_slice):
+        """Winkler weight for one coil; dispatched by Support.compute_weights."""
+        if not dofs_slice:
+            return jnp.zeros(surface_pts.shape[0])
+        return _clamp_spheres_weights(
+            surface_pts, curve_jax, dofs_slice['phis'],
+            self._r_clamp, self._sig_eps,
         )
