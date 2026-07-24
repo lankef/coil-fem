@@ -149,7 +149,7 @@ def solve_staggered(
         * ``'body_force_by_coil'``   : list[jax.Array]
           Body force at every quadrature point per coil.
         * ``'weights_by_coil'``      : list[jax.Array]
-          Per-surface-node Winkler weights per coil.
+          Per-surface-quad Winkler weights per coil, shape ``(n_sq_i,)``.
         * ``'curves_by_coil'``       : list[CurveXYZFourierJAX]
           Traced coil centreline objects (rebuilt from DOFs by the caller).
         * ``'support_dofs'``         : dict
@@ -209,7 +209,14 @@ def solve_staggered(
     support_dofs        = params['support_dofs']
 
     n_pipelines = len(pipelines)
-    surface_pts_by_coil = [
+
+    # Surface quad points: fed to compute_attach (FEM BC) and as u_mesh to beam solver.
+    surf_quad_pts_by_coil = [
+        pipelines[i].surface_quad_points(mesh_points_by_coil[i])
+        for i in range(n_pipelines)
+    ]
+    # Surface node points: fed to the beam solver for K_ss spring geometry.
+    surf_node_pts_by_coil = [
         mesh_points_by_coil[i][pipelines[i].surface_node_indices]
         for i in range(n_pipelines)
     ]
@@ -232,11 +239,11 @@ def solve_staggered(
         # Compute beam geometry once; pass to compute_attach and solve.
         geom = support.geometry(curves_by_coil, support_dofs)
 
-        # Coil FEM solves with shifted Winkler springs
+        # Coil FEM solves with shifted Winkler springs evaluated at quad points.
         u_mesh_by_coil = []
         for i, pipeline in enumerate(pipelines):
             u_attach_i = support.compute_attach(
-                i, surface_pts_by_coil[i], curves_by_coil, support_dofs, state,
+                i, surf_quad_pts_by_coil[i], curves_by_coil, support_dofs, state,
                 **({'geom': geom} if geom is not None else {}),
             )
             sol = pipeline.solve(
@@ -245,14 +252,14 @@ def solve_staggered(
                 weights_by_coil[i],
                 support_attach=u_attach_i,
             )
-            u_mesh_by_coil.append(sol['u'][pipeline.surface_node_indices])
+            u_mesh_by_coil.append(pipeline.u_at_surface_quads(sol['sol_list']))
 
-        # Support system solve
+        # Support system solve (beam side uses node pts for K_ss spring geometry).
         support_inputs = {
             'u_mesh_by_coil':      u_mesh_by_coil,
             'curves_jax':          curves_by_coil,
             'support_dofs':        support_dofs,
-            'surface_pts_by_coil': surface_pts_by_coil,
+            'surface_pts_by_coil': surf_quad_pts_by_coil,
         }
         if geom is not None:
             support_inputs['geom'] = geom
@@ -276,7 +283,7 @@ def solve_staggered(
         sol_list_by_coil = []
         for i, pipeline in enumerate(pipelines):
             u_attach_i = support.compute_attach(
-                i, surface_pts_by_coil[i], curves_by_coil, support_dofs, state,
+                i, surf_quad_pts_by_coil[i], curves_by_coil, support_dofs, state,
                 **({'geom': geom} if geom is not None else {}),
             )
             sol = pipeline.solve(
@@ -285,14 +292,14 @@ def solve_staggered(
                 weights_by_coil[i],
                 support_attach=u_attach_i,
             )
-            u_mesh_by_coil.append(sol['u'][pipeline.surface_node_indices])
+            u_mesh_by_coil.append(pipeline.u_at_surface_quads(sol['sol_list']))
             sol_list_by_coil.append(sol['sol_list'])
 
         support_inputs = {
             'u_mesh_by_coil':      u_mesh_by_coil,
             'curves_jax':          curves_by_coil,
             'support_dofs':        support_dofs,
-            'surface_pts_by_coil': surface_pts_by_coil,
+            'surface_pts_by_coil': surf_quad_pts_by_coil,
         }
         if geom is not None:
             support_inputs['geom'] = geom
@@ -474,12 +481,26 @@ def make_merged_solve(
 
     n_pipelines = len(pipelines)
 
+    # Static interp maps per coil for folding quad-pt weights back to node DOFs
+    # in coupling_values (K_cs / K_sc blocks).
+    surf_interp_by_coil = [
+        (
+            pipelines[i].problem._sel_face_sv,
+            pipelines[i].problem._surf_face_to_surf_node,
+            int(pipelines[i].problem._surf_unique_global_nodes.shape[0]),
+        )
+        for i in range(n_pipelines)
+    ]
+
+    # Static n_surface_quads per coil for zero-attach placeholder.
+    n_sq_by_coil = tuple(pipelines[i].n_surface_quads for i in range(n_pipelines))
+
     def _make_curves(bcd):
         return [_CurveJAX(curve_qps[i], bcd[i], curve_orders[i])
                 for i in range(n_pipelines)]
 
-    def _surf_pts(pts):
-        return [pts[i][pipelines[i].surface_node_indices]
+    def _surf_quad_pts(pts):
+        return [pipelines[i].surface_quad_points(pts[i])
                 for i in range(n_pipelines)]
 
     def _coil_params(i, pts, bf, wt):
@@ -488,14 +509,14 @@ def make_merged_solve(
             'body_force':      bf[i],
             'support_weights': wt[i],
             'support_attach':  jnp.zeros(
-                (pipelines[i].surface_node_indices.shape[0], 3),
+                (n_sq_by_coil[i], 3),
                 dtype=pts[i].dtype,
             ),
         }
 
     def _assemble_merged_values(bcd, sdofs, pts, bf, wt):
         """Assemble merged COO value vector V and RHS f."""
-        surf_pts = _surf_pts(pts)
+        surf_pts = _surf_quad_pts(pts)
         curves   = _make_curves(bcd)
         # Compute beam geometry once; reuse for coo and coupling_values.
         geom = support.geometry(curves, sdofs)
@@ -509,7 +530,11 @@ def make_merged_solve(
         _, _, V_ss, _ = support.coo(curves, sdofs, surf_pts, **geom_kw)
         V_blocks.append(V_ss)
         f_blocks.append(jnp.zeros(n_s, dtype=V_ss.dtype))
-        V_cs, V_sc = support.coupling_values(curves, sdofs, surf_pts, **geom_kw)
+        V_cs, V_sc = support.coupling_values(
+            curves, sdofs, surf_pts,
+            surf_interp_by_coil=surf_interp_by_coil,
+            **geom_kw,
+        )
         if has_cs:
             V_blocks.append(V_cs)
         if has_sc:
@@ -539,7 +564,7 @@ def make_merged_solve(
         lambda_flat, _inertia = solver_KT(g_flat, csr_values_T)
 
         def _merged_constraint(bcd_in, sdofs_in, pts_in, bf_in, wt_in):
-            s_pts  = _surf_pts(pts_in)
+            s_quad_pts = _surf_quad_pts(pts_in)
             curves = _make_curves(bcd_in)
             # Use the pre-computed geometry from the forward pass when the
             # inputs are the same (always the case here — we differentiate
@@ -559,12 +584,14 @@ def make_merged_solve(
                     pipeline.problem.internal_vars_surfaces,
                 )
                 residuals.append(jax.flatten_util.ravel_pytree(res_i)[0])
-            Iss, Jss, Vss, ns = support.coo(curves, sdofs_in, s_pts, **geom_kw)
+            Iss, Jss, Vss, ns = support.coo(curves, sdofs_in, s_quad_pts, **geom_kw)
             u_s = sol_flat[support_dof_offset:]
             r_s = jnp.zeros(ns, dtype=Vss.dtype).at[Iss].add(Vss * u_s[Jss])
             r_full = jnp.concatenate(residuals + [r_s])
             V_cs_in, V_sc_in = support.coupling_values(
-                curves, sdofs_in, s_pts, **geom_kw
+                curves, sdofs_in, s_quad_pts,
+                surf_interp_by_coil=surf_interp_by_coil,
+                **geom_kw,
             )
             if has_cs:
                 r_full = r_full.at[I_cs_jax].add(

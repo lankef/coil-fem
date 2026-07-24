@@ -102,12 +102,12 @@ def test_gpu_assembly_coo_linearity():
     problem = _gpu_problem(mesh)
 
     n_nodes = problem.fes[0].num_total_nodes
-    surf_n = problem.surface_node_global_indices.shape[0]
+    n_sq = problem.n_surface_quads
     params = {
         'points':          jnp.asarray(mesh.points),
         'body_force':      jnp.zeros((mesh.n_cells, mesh.n_quads, 3)),
-        'support_weights': jnp.ones(surf_n),
-        'support_attach':  jnp.zeros((surf_n, 3)),
+        'support_weights': jnp.ones(n_sq),
+        'support_attach':  jnp.zeros((n_sq, 3)),
     }
 
     problem.set_params(params)
@@ -197,12 +197,12 @@ def test_assemble_coo_requires_gpu_assembly():
     """assemble_coo raises on a CPU (gpu_assembly=False) pipeline."""
     mesh = _tiny_mesh()
     pipeline = _make_pipeline(mesh, solver='umfpack')
-    surf_n = pipeline.surface_node_indices.shape[0]
+    n_sq = pipeline.n_surface_quads
     params = {
         'points':          jnp.asarray(mesh.points),
         'body_force':      jnp.zeros((mesh.n_cells, mesh.n_quads, 3)),
-        'support_weights': jnp.ones(surf_n),
-        'support_attach':  jnp.zeros((surf_n, 3)),
+        'support_weights': jnp.ones(n_sq),
+        'support_attach':  jnp.zeros((n_sq, 3)),
     }
     with pytest.raises(NotImplementedError, match="gpu_assembly=True"):
         pipeline.assemble_coo(params)
@@ -275,7 +275,7 @@ def test_monolithic_matches_staggered():
 
     pts = [jnp.asarray(p.mesh.points) for p in pipelines]
     bf = [jnp.zeros((p.mesh.n_cells, p.mesh.n_quads, 3)) for p in pipelines]
-    wt = [jnp.ones(p.surface_node_indices.shape[0]) for p in pipelines]
+    wt = [jnp.ones(p.n_surface_quads) for p in pipelines]
     params = {
         'mesh_points_by_coil': pts,
         'body_force_by_coil':  bf,

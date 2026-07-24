@@ -76,6 +76,44 @@ class ElasticPipeline:
         self.surface_node_indices = self.problem.surface_node_global_indices
         self.problem_options = problem_options
 
+    @property
+    def n_surface_quads(self) -> int | None:
+        """Total number of surface quadrature points, or ``None`` if no Winkler BC."""
+        return self.problem.n_surface_quads
+
+    def surface_quad_points(self, points: jnp.ndarray) -> jnp.ndarray:
+        """Physical positions of all surface quadrature points.
+
+        Differentiable with respect to ``points``.
+
+        Parameters
+        ----------
+        points : jnp.ndarray, shape ``(n_nodes, 3)``
+
+        Returns
+        -------
+        jnp.ndarray, shape ``(n_surface_quads, 3)``
+        """
+        return self.problem.surface_quad_points(points)
+
+    def u_at_surface_quads(self, sol_list: list) -> jnp.ndarray:
+        """Interpolate coil displacement to surface quadrature points.
+
+        Maps the nodal displacement field ``sol_list[0]`` to the surface quad
+        points using the cached face shape-function values.
+
+        Parameters
+        ----------
+        sol_list : list[jnp.ndarray]
+            Raw ``fwd_pred`` output; ``sol_list[0]`` has shape ``(n_nodes, 3)``.
+
+        Returns
+        -------
+        jnp.ndarray, shape ``(n_surface_quads, 3)``
+        """
+        u_surf_nodes = sol_list[0][self.surface_node_indices]  # (n_surf_nodes, 3)
+        return self.problem.interp_surface_nodal_to_quads(u_surf_nodes)
+
     def solve(
         self,
         points: jnp.ndarray,
@@ -94,13 +132,15 @@ class ElasticPipeline:
             Current mesh node positions.
         body_force : jnp.ndarray, shape ``(n_cells, n_quads, 3)``
             Body force at every quadrature point.
-        support_weights : jnp.ndarray or None, shape ``(n_surface_nodes,)``
-            Per-surface-node Winkler weights in ``[0, 1]``.
-        support_attach : jnp.ndarray or None, shape ``(n_surface_nodes, 3)``
-            Per-surface-node attachment displacement ``u_attach`` for the
+        support_weights : jnp.ndarray or None, shape ``(n_surface_quads,)``
+            Per-surface-quad Winkler weights in ``[0, 1]``.  Obtain via
+            :meth:`surface_quad_points` → ``support.compute_weights``.
+        support_attach : jnp.ndarray or None, shape ``(n_surface_quads, 3)``
+            Per-surface-quad attachment displacement ``u_attach`` for the
             shifted Winkler spring.  When provided, the spring traction becomes
-            ``k(x) (u − u_attach)`` rather than ``k(x) u``, implementing
-            staggered coupling to a support structure.  Defaults to zeros.
+            ``k(x) (u − u_attach)`` rather than ``k(x) u``.  Obtain via
+            ``support.compute_attach`` called at surface quad points.
+            Defaults to zeros.
 
         Returns
         -------

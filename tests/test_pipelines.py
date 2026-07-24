@@ -69,9 +69,9 @@ def test_elastic_pipeline_uniform_material():
     # Zero body force (no Lorentz load in this smoke test)
     body_force = jnp.zeros((n_cells, n_quads, 3))
 
-    # Uniform unit Winkler weights (surface fully supported)
-    surf_n  = pipeline.surface_node_indices.shape[0]
-    weights = jnp.ones(surf_n)
+    # Uniform unit Winkler weights (surface fully supported), at quad points
+    n_sq    = pipeline.n_surface_quads
+    weights = jnp.ones(n_sq)
 
     result = pipeline.solve(points, body_force, weights)
 
