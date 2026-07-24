@@ -50,6 +50,9 @@ def build_fwd_pred(problem: LinearElasticity3D, problem_options: dict):
         ``'cudss_tol'``       : float, default ``1e-6``
         ``'cudss_rel_tol'``   : float, default ``1e-8``
         ``'cudss_max_iter'``  : int, default ``50``
+        ``'cudss_linear'``    : bool, default ``False`` — set to ``True`` for
+            linear problems to skip the Newton iteration loop and avoid host
+            synchronisation (single assemble + single solve).
 
     Returns
     -------
@@ -72,6 +75,7 @@ def build_fwd_pred(problem: LinearElasticity3D, problem_options: dict):
             tol=float(problem_options.get('cudss_tol', 1e-6)),
             rel_tol=float(problem_options.get('cudss_rel_tol', 1e-8)),
             max_iter=int(problem_options.get('cudss_max_iter', 50)),
+            linear=bool(problem_options.get('cudss_linear', False)),
         )
 
     solver_name     = problem_options.get('solver', 'umfpack')

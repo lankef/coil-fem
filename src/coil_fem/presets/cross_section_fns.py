@@ -6,7 +6,14 @@ attribute of :class:`~coil_fem.simsopt.CoilSupportBeams` ad
 
 .. code-block:: python
 
-    A, Iy, Iz, J = fn(support_dofs)  # each shape (n_base, n_beams_per_coil)
+    A, Iy, Iz, J = fn(support_dofs)  # each a per-group list of arrays
+
+``support_dofs`` values are ragged: a Python list with one entry per CC/CF
+group, each entry an array of per-beam values for that group (see
+:class:`~coil_fem.coupling.SupportBeams`).  These lists are valid JAX
+pytrees, so each function below maps its elementwise formula across groups
+via ``jax.tree_util.tree_map`` (see ``_map_groups``) rather than operating
+on a flat array directly.
 
 The geometric parameters are read from ``support_dofs`` by key, so they can
 live alongside the attachment-angle DOFs and be treated as optimizable
@@ -30,6 +37,7 @@ Local beam frame: x along the centroidal axis, y and z as cross-section axes.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import math
 
@@ -37,12 +45,54 @@ from ..utils import clamp_sigmoid
 from typing import Callable
 
 
-def bool_to_sign(a):
+def _bool_to_sign(a):
     if a:
         return 1
     else:
         return -1
 
+
+def _map_groups(fn, *ragged_args):
+    """Apply a per-group cross-section formula across ragged support_dofs entries.
+
+    ``support_dofs`` values are Python lists of per-group JAX arrays (one
+    entry per CC/CF group), which are themselves valid JAX pytrees (the list
+    is the container, each array is a leaf).  ``fn`` implements the
+    elementwise ``(A, Iy, Iz, J)`` formula for a single group's array; this
+    helper maps it across groups and transposes the per-group tuples back
+    into the four per-group lists expected by ``SupportBeams.coo``.
+
+    Parameters
+    ----------
+    fn : callable
+        ``fn(*leaf_arrays) -> (A, Iy, Iz, J)`` for one group.
+    *ragged_args : list of jax.Array
+        One or more per-group lists (all with the same length).
+
+    Returns
+    -------
+    tuple of list
+        ``(A, Iy, Iz, J)``, each a per-group list of arrays.
+    """
+    results = jax.tree_util.tree_map(fn, *ragged_args)
+    return tuple(list(x) for x in zip(*results))
+
+wrap_option_keys = ('r_attachment', 'sigmoid_eps',)
+def wrap_attachment(surface_pts_beam_frame, dofs, sign_x, beam_options):
+    """An attachment function that selects nodes within r_clamp from the centerline.
+
+    This ensures that the torque a beam receives is non-zero under low resolutions. 
+    """
+    pts_x = surface_pts_beam_frame[:, 0]
+    pts_y = surface_pts_beam_frame[:, 1]
+    pts_z = surface_pts_beam_frame[:, 2]
+
+    d_sq = pts_x**2 + pts_y**2 + pts_z**2
+    return clamp_sigmoid(
+        d_sq=d_sq,
+        r=beam_options['r_attachment'], 
+        sigmoid_eps=beam_options['sigmoid_eps'],
+    )
 # ============================================================================
 # Solid circle
 # ============================================================================
@@ -74,29 +124,32 @@ def solid_circle(support_dofs: dict):
     Returns
     -------
     ``(A, Iy, Iz, J)`` 
-        Each output has the same shape as ``support_dofs[radius_key]``.
+        Each output is a per-group list matching the structure of
+        ``support_dofs['r_beam']``.
 
     """
-    r = support_dofs['r_beam']
-    A  = jnp.pi * r ** 2
-    I  = jnp.pi * r ** 4 / 4.0
-    J  = jnp.pi * r ** 4 / 2.0
-    return A, I, I, J
+    def _single(r):
+        A = jnp.pi * r ** 2
+        I = jnp.pi * r ** 4 / 4.0
+        J = jnp.pi * r ** 4 / 2.0
+        return A, I, I, J
 
-def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, constants):
+    return _map_groups(_single, support_dofs['r_beam'])
+
+def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, beam_options):
     pts_x = surface_pts_beam_frame[:, 0]
     pts_y = surface_pts_beam_frame[:, 1]
     pts_z = surface_pts_beam_frame[:, 2]
     
     in_correct_direction = jnp.where(
-        bool_to_sign(sign_x) * pts_x >= 0,
+        _bool_to_sign(sign_x) * pts_x >= 0,
         1, 0
     )
     d_sq = pts_y**2 + pts_z**2
     return in_correct_direction * clamp_sigmoid(
         d_sq=d_sq,
         r=dofs['r_beam'], 
-        sigmoid_eps=constants['sigmoid_eps'],
+        sigmoid_eps=beam_options['sigmoid_eps'],
     )
     
 
@@ -108,7 +161,8 @@ def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, constants):
 solid_rectangle_dof_keys = ('w1_beam', 'w2_beam',)
 solid_rectangle_option_keys = ('sigmoid_eps',)
 
-def _rectangle_helper(w_1, w_2):
+def _rectangle_helper(w1, w2):
+    """Elementwise ``(A, Iy, Iz, J)`` formula for a single group's arrays."""
     A  = w1 * w2
     Iy = w2 * w1 ** 3 / 12.0        # governs w (z-deflection)
     Iz = w1 * w2 ** 3 / 12.0        # governs v (y-deflection)
@@ -153,13 +207,14 @@ def solid_rectangle(support_dofs : dict):
     Returns
     -------
     ``(A, Iy, Iz, J)`` 
-        Each output has the same shape as ``support_dofs[radius_key]``.
+        Each output is a per-group list matching the structure of
+        ``support_dofs['w1_beam']`` / ``support_dofs['w2_beam']``.
 
     
     """
     w1 = support_dofs['w1_beam']    # z-extent
     w2 = support_dofs['w2_beam']   # y-extent
-    return _rectangle_helper(w_1, w_2)
+    return _map_groups(_rectangle_helper, w1, w2)
 
     
 
@@ -185,19 +240,20 @@ def solid_square(support_dofs : dict):
     Returns
     -------
     ``(A, Iy, Iz, J)`` 
-        Each output has the same shape as ``support_dofs[radius_key]``.
+        Each output is a per-group list matching the structure of
+        ``support_dofs['w_beam']``.
 
     
     """
     w = support_dofs['w_beam']
-    return _rectangle_helper(w, w)
+    return _map_groups(_rectangle_helper, w, w)
 
 
 # ============================================================================
 # Hollow circle (annular section)
 # ============================================================================
 
-hollow_circle_dof_keys = ('r_1_beam', 'r_1_beam',)
+hollow_circle_dof_keys = ('r_1_beam', 'r_2_beam',)
 hollow_circle_option_keys = ('sigmoid_eps',)
     
 def hollow_circle(support_dofs: dict) -> Callable:
@@ -225,15 +281,18 @@ def hollow_circle(support_dofs: dict) -> Callable:
     Returns
     -------
     ``(A, Iy, Iz, J)`` 
-        Each output has the same shape as ``support_dofs[radius_key]``.
+        Each output is a per-group list matching the structure of
+        ``support_dofs['r_1_beam']`` / ``support_dofs['r_2_beam']``.
 
     """
-    r_o = jnp.maximum(support_dofs['r_1_beam'], support_dofs['r_2_beam'])
-    r_i = jnp.minimum(support_dofs['r_1_beam'], support_dofs['r_2_beam'])
+    def _single(r1, r2):
+        r_o = jnp.maximum(r1, r2)
+        r_i = jnp.minimum(r1, r2)
+        A = jnp.pi * (r_o ** 2 - r_i ** 2)
+        I = jnp.pi * (r_o ** 4 - r_i ** 4) / 4.0
+        J = jnp.pi * (r_o ** 4 - r_i ** 4) / 2.0
+        return A, I, I, J
 
-    A  = jnp.pi * (r_o ** 2 - r_i ** 2)
-    I  = jnp.pi * (r_o ** 4 - r_i ** 4) / 4.0
-    J  = jnp.pi * (r_o ** 4 - r_i ** 4) / 2.0
-    return A, I, I, J
+    return _map_groups(_single, support_dofs['r_1_beam'], support_dofs['r_2_beam'])
 
 hollow_circle_attachment = solid_circle_attachment

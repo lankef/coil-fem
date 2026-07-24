@@ -11,6 +11,7 @@ and any optimisable support DOFs (e.g. clamp locations).
 from __future__ import annotations
 
 from typing import Sequence
+import jax
 from jax import value_and_grad
 import numpy as np
 import jax.numpy as jnp
@@ -95,6 +96,8 @@ class CoilFEMObjective(Optimizable):
         material_options=None,
         problem_options=None,
         gravity_options=None,
+        physics_options=None,
+        coupling='monolithic',
         verbose: int = 0,
     ):
         if not _HAS_SIMSOPT:
@@ -146,11 +149,31 @@ class CoilFEMObjective(Optimizable):
             gravity_options=gravity_options,
             material_options=material_options,
             problem_options=problem_options,
+            physics_options=physics_options,
+            coupling=coupling,
             verbose=verbose,
         )
 
         self._metrics = tuple(metrics)
         self._metric_weights = list(metric_weights)
+
+        # On the cuDSS path the full value_and_grad computation is JIT-able:
+        # merged_solve is wrapped with custom_vjp (GPU FFI), set_params writes
+        # and reads happen within the same trace, and mesh shapes are fixed at
+        # construction.  Cache the compiled function so subsequent calls avoid
+        # re-tracing.  On the CPU/staggered path the Newton loop contains
+        # host syncs (float conversions) so JIT is not applied.
+        _use_jit = (
+            problem_options is not None
+            and problem_options.get('solver', 'umfpack') == 'cudss'
+        )
+        _vg = value_and_grad(self._weighted_J, argnums=(0, 1, 2))
+        if _use_jit:
+            self._jit_vg: object = jax.jit(_vg)
+            self._jit_J:  object = jax.jit(self._weighted_J)
+        else:
+            self._jit_vg = _vg
+            self._jit_J  = self._weighted_J
 
         # Caches invalidated via recompute_bell() when any DOFs change.
         self._needs_J: bool = True
@@ -197,7 +220,7 @@ class CoilFEMObjective(Optimizable):
         if not self._needs_J:
             return
         cdofs, idofs, sdofs = self._read_dofs()
-        self._J_cache = float(self._weighted_J(cdofs, idofs, sdofs))
+        self._J_cache = float(self._jit_J(cdofs, idofs, sdofs))
         self._needs_J = False
 
     def _compute_dJ(self):
@@ -206,9 +229,9 @@ class CoilFEMObjective(Optimizable):
             return
         cdofs, idofs, sdofs = self._read_dofs()
 
-        J_val, (grad_cdofs, grad_idofs, grad_sdofs) = value_and_grad(
-            self._weighted_J, argnums=(0, 1, 2)
-        )(cdofs, idofs, sdofs)
+        J_val, (grad_cdofs, grad_idofs, grad_sdofs) = self._jit_vg(
+            cdofs, idofs, sdofs
+        )
 
         self._J_cache = float(J_val)
         self._needs_J = False

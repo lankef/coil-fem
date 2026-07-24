@@ -145,7 +145,7 @@ class ElasticPipeline:
             the body-force + surface-traction load vector.
         """
         self.problem.set_params(params)
-        zero_sol = [jnp.zeros((self.problem.num_total_nodes, 3))]
+        zero_sol = [jnp.zeros((self.problem.fes[0].num_total_nodes, 3))]
         res = self.problem.compute_residual_vars(
             zero_sol, self.problem.internal_vars, self.problem.internal_vars_surfaces
         )
@@ -157,9 +157,9 @@ class ElasticPipeline:
         Calls :meth:`~coil_fem.problems.LinearElasticity3D.set_params` then
         triggers a device-side Jacobian assembly via
         :meth:`~coil_fem.problems.DeviceProblem.compute_newton_vars`, populating
-        ``problem.V_jax``.  Returns the static ``I_jax``, ``J_jax`` index
-        arrays together with the freshly assembled ``V_jax`` and the total DOF
-        count.
+        ``problem.V_jax``.  Returns the static ``problem.I`` / ``problem.J``
+        index arrays together with the freshly assembled ``problem.V_jax`` and
+        the total DOF count.
 
         Parameters
         ----------
@@ -169,7 +169,14 @@ class ElasticPipeline:
         Returns
         -------
         tuple
-            ``(I, J, V, n_dofs)``
+            ``(I, J, V, n_dofs, load)`` where ``I`` and ``J`` are the static
+            COO row/column index arrays (host ``numpy``, fixed by the mesh
+            topology and used only for building the CSR pattern), ``V`` is the
+            freshly assembled COO value array on the JAX device, and ``load``
+            is the flat load vector ``-R(0)`` on device.  The load is a
+            by-product of the same assembly pass (the residual at zero
+            displacement), so callers assembling a merged system need not run
+            a separate :meth:`solve_residual`.
 
         Raises
         ------
@@ -177,18 +184,19 @@ class ElasticPipeline:
             When the pipeline was not built with ``gpu_assembly=True``
             (i.e. ``problem_options={'solver': 'cudss'}`` was not set).
         """
-        if not hasattr(self.problem, 'I_jax'):
+        if not self.problem.gpu_assembly:
             raise NotImplementedError(
                 "ElasticPipeline.assemble_coo() requires gpu_assembly=True "
                 "(problem_options={'solver': 'cudss'})."
             )
         self.problem.set_params(params)
-        zero_sol = [jnp.zeros((self.problem.num_total_nodes, 3))]
-        self.problem.compute_newton_vars(
+        zero_sol = [jnp.zeros((self.problem.fes[0].num_total_nodes, 3))]
+        res = self.problem.compute_newton_vars(
             zero_sol, self.problem.internal_vars, self.problem.internal_vars_surfaces
         )
+        load = -jax.flatten_util.ravel_pytree(res)[0]
         n_dofs = self.problem.num_total_dofs_all_vars
-        return self.problem.I_jax, self.problem.J_jax, self.problem.V_jax, n_dofs
+        return self.problem.I, self.problem.J, self.problem.V_jax, n_dofs, load
 
     def attachment_displacement(self, sol_list: list) -> jnp.ndarray:
         """Extract displacement at coil surface (attachment) nodes.
@@ -213,8 +221,8 @@ class ElasticPipeline:
         Returns
         -------
         tuple
-            ``(I, J, V, n_dofs)`` — row indices, column indices, values, and
-            total number of DOFs.
+            ``(I, J, V, n_dofs)`` — static COO row/column indices (host
+            ``numpy``), device-side COO values, and total number of DOFs.
 
         Raises
         ------
@@ -222,13 +230,13 @@ class ElasticPipeline:
             When the problem was built without on-device assembly
             (``gpu_assembly=False``, i.e. the CPU / ``ad_wrapper`` path).
         """
-        if not hasattr(self.problem, 'I_jax'):
+        if not self.problem.gpu_assembly:
             raise NotImplementedError(
                 "ElasticPipeline.coo() requires gpu_assembly=True "
                 "(problem_options={'solver': 'cudss'})."
             )
         n_dofs = self.problem.num_total_dofs_all_vars
-        return self.problem.I_jax, self.problem.J_jax, self.problem.V_jax, n_dofs
+        return self.problem.I, self.problem.J, self.problem.V_jax, n_dofs
 
 
 class ThermoElasticPipeline(ElasticPipeline):

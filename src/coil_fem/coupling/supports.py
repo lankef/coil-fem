@@ -1,22 +1,11 @@
 """Concrete grounded support and the base class for all support models.
 
-Defines :class:`Support`, the simplest type of support structures. 
-The coils are fixed to stationary points in space via a number of 
-suspended clamps modelled using Robin/Winkler boundary conditions. 
-There is no inter-coil coupling in the linear elasticity problem.
-(:meth:`is_coupled` outputs ``False``) Which exterior node to fix 
-via the BC is decided by the ``fixed_clamp_fn`` callable. 
-
-Subclasses of :class:`Support` (e.g. :class:`~coil_fem.coupling.SupportBeams`)
-always preserves the support for Robin/Winkler BC, but introduces 
-more complex support structures that may introduce inter-coil coupling. 
-For example, if two coils are linked with a beam, then displacement both 
-coils are no-longer independent linear systems. 
-
-The moule also supply some factories for commonly used ``fixed_clamp_fn``.
-:func:`make_clamp_fn` and :func:`make_topbottom_fn` return 
-per-coil callable closures that can be passed directly as
-``fixed_clamp_fns`` to :class:`Support`.
+Defines :class:`Support`, the simplest type of support structure. Coils are
+fixed to stationary points in space via suspended clamps modelled with
+Robin/Winkler boundary conditions.  Which surface nodes are clamped is
+controlled by the optional ``fixed_clamp_fns`` callable(s) passed to
+:class:`Support`.  Subclasses (e.g. :class:`~coil_fem.coupling.SupportBeams`)
+extend the model with inter-coil coupling.
 """
 
 from __future__ import annotations
@@ -25,131 +14,6 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
-
-from ..utils import clamp_sigmoid
-
-
-# ============================================================================
-# Functional weight helpers
-# ============================================================================
-
-def _clamp_spheres_weights(
-    surface_points: jax.Array,
-    curve_jax,
-    phis_i: jax.Array,
-    r_clamp: float,
-    sigmoid_eps: float,
-) -> jax.Array:
-    """Smooth-union Winkler weight for a set of sphere clamps on one coil.
-
-    Parameters
-    ----------
-    surface_points : jax.Array, shape (n_nodes, 3)
-    curve_jax : CurveXYZFourierJAX
-    phis_i : jax.Array, shape (n_clamp,)
-        Arc-length locations of the clamps (values in [0, 1]).
-    r_clamp : float
-        Sphere radius [m].
-    sigmoid_eps : float
-        Sharpness of the clamp boundary.
-
-    Returns
-    -------
-    jax.Array, shape (n_nodes,)
-    """
-    gamma_support = curve_jax.gamma_eval(phis_i)            # (n_clamp, 3)
-    d_sq = jnp.sum(
-        (surface_points[:, None, :] - gamma_support[None, :, :]) ** 2,
-        axis=-1,
-    )                                                        # (n_nodes, n_clamp)
-    w = clamp_sigmoid(d_sq, r_clamp, sigmoid_eps)
-    return jnp.sum(w, axis=-1)
-
-
-def _topbottom_weights(
-    surface_points: jax.Array,
-    curve_jax,
-    r_clamp: float,
-    sigmoid_eps: float,
-) -> jax.Array:
-    """Winkler weight from soft spheres at the coil's topmost and bottommost points.
-
-    Parameters
-    ----------
-    surface_points : jax.Array, shape (n_nodes, 3)
-    curve_jax : CurveXYZFourierJAX
-    r_clamp : float
-    sigmoid_eps : float
-
-    Returns
-    -------
-    jax.Array, shape (n_nodes,)
-    """
-    gamma  = curve_jax.gamma()
-    top    = gamma[jnp.argmax(gamma[:, 2])]
-    bottom = gamma[jnp.argmin(gamma[:, 2])]
-
-    w_top = clamp_sigmoid(
-        jnp.sum((surface_points - top) ** 2, axis=-1),
-        r_clamp, sigmoid_eps,
-    )
-    w_bottom = clamp_sigmoid(
-        jnp.sum((surface_points - bottom) ** 2, axis=-1),
-        r_clamp, sigmoid_eps,
-    )
-    return w_top + w_bottom
-
-
-def make_clamp_fn(
-    coil_idx: int,
-    r_clamp: float,
-    sigmoid_eps: float,
-    phis_init: jax.Array,
-) -> Callable:
-    """Return a per-coil clamp weight callable for :class:`Support`.
-
-    The returned function has signature
-    ``fn(surface_pts, curve_jax, dofs) -> jax.Array`` as required by
-    :meth:`Support.compute_weights`.  When ``dofs`` is not ``None`` it slices
-    ``dofs['phis'][coil_idx]``; otherwise it falls back to ``phis_init``.
-
-    Parameters
-    ----------
-    coil_idx : int
-    r_clamp : float
-    sigmoid_eps : float
-    phis_init : jax.Array, shape (n_clamp,)
-        Fallback arc-length locations used when ``dofs`` is ``None``.
-
-    Returns
-    -------
-    Callable
-    """
-    def _fn(surface_pts, curve_jax, dofs):
-        phis_i = phis_init if dofs is None else dofs['phis'][coil_idx]
-        return _clamp_spheres_weights(surface_pts, curve_jax, phis_i, r_clamp, sigmoid_eps)
-    return _fn
-
-
-def make_topbottom_fn(r_clamp: float, sigmoid_eps: float) -> Callable:
-    """Return a top/bottom clamp weight callable for :class:`Support`.
-
-    The returned function has signature
-    ``fn(surface_pts, curve_jax, dofs) -> jax.Array`` and ignores ``dofs``
-    (the top/bottom support has no optimisable DOFs).
-
-    Parameters
-    ----------
-    r_clamp : float
-    sigmoid_eps : float
-
-    Returns
-    -------
-    Callable
-    """
-    def _fn(surface_pts, curve_jax, dofs):
-        return _topbottom_weights(surface_pts, curve_jax, r_clamp, sigmoid_eps)
-    return _fn
 
 
 class Support:
@@ -176,14 +40,16 @@ class Support:
         Function(s) returning per-surface-node weights in ``[0, 1]``::
 
             fixed_clamp_fn(
-                surface_pts: jax.Array,   # (n_surface_nodes, 3)
-                curve_jax: CurveXYZFourierJAX,
-                dofs: dict | None,
-            ) -> jax.Array                # (n_surface_nodes,)
+                surface_pts : jax.Array,          # (n_surface_nodes, 3)
+                curve_jax   : CurveXYZFourierJAX,
+                dofs_slice  : dict | None,        # per-coil slice, or None
+            ) -> jax.Array                        # (n_surface_nodes,)
 
-        A single callable is broadcast to every coil.  A list provides one
-        callable per base coil (heterogeneous support geometry).  ``None``
-        (default) returns uniform unit weights for all coils.
+        ``dofs_slice`` is the per-coil slice of the full dofs dict (each leaf
+        indexed at ``coil_idx``), or ``None`` when no optimisation dofs are
+        available.  A single callable is broadcast to every coil.  A list
+        provides one callable per base coil (heterogeneous support geometry).
+        ``None`` (default) returns uniform unit weights for all coils.
     """
 
     def __init__(
@@ -207,6 +73,29 @@ class Support:
     def solve(self, inputs: dict) -> dict:
         """No-op; returns empty state dict."""
         return {}
+
+    def geometry(self, curves_jax: list, support_dofs: dict) -> dict | None:
+        """Precomputed geometry bundle for this support; ``None`` for uncoupled supports.
+
+        Subclasses that benefit from single-pass geometry computation (e.g.
+        :class:`~coil_fem.coupling.SupportBeams`) override this method to
+        return a ``dict`` of traced arrays that can be threaded through
+        :meth:`compute_weights`, :meth:`compute_attach`, :meth:`coo`, and
+        :meth:`coupling_values` via their ``geom`` keyword argument, avoiding
+        redundant recomputation.
+
+        Parameters
+        ----------
+        curves_jax : list[CurveXYZFourierJAX]
+            Differentiable centreline curves for all base coils.
+        support_dofs : dict
+            Optimisable support parameters.
+
+        Returns
+        -------
+        dict or None
+        """
+        return None
 
     def displacement_at(self, state: dict, points: jax.Array) -> jax.Array:
         """Return zero displacement at every query point.
@@ -247,8 +136,9 @@ class Support:
         dofs : dict or None
             Optimisable support parameters for the full coil set (as
             returned by :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).
-            Subclasses are responsible for slicing out the per-coil entries.
-            ``None`` is equivalent to an empty dict.
+            Before calling ``fixed_clamp_fns``, each leaf is indexed at
+            ``coil_idx`` via :func:`jax.tree_util.tree_map`, so the callable
+            receives a per-coil slice.  ``None`` is passed through as-is.
 
         Returns
         -------
@@ -262,7 +152,11 @@ class Support:
         else:
             fn = self._fixed_clamp_fns
         curve_i = curves_jax[coil_idx] if curves_jax is not None else None
-        return fn(surface_pts, curve_i, dofs)
+        dofs_slice = (
+            jax.tree_util.tree_map(lambda x: x[coil_idx], dofs)
+            if dofs is not None else None
+        )
+        return fn(surface_pts, curve_i, dofs_slice)
 
     def plot_support(
         self,
@@ -320,9 +214,16 @@ class Support:
         import matplotlib.pyplot as plt
         from matplotlib.colors import to_rgb
 
+        from ..geo import CurveXYZFourierJAX as _CurveJAX
+
         n_base = len(fem.base_curves_jax)
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in fem.base_curves_jax]
+
+        curves_jax = [
+            _CurveJAX(base.quadpoints, d, base.order)
+            for base, d in zip(fem.base_curves_jax, base_curves_dofs)
+        ]
 
         if ax is None:
             _, ax = plt.subplots(subplot_kw={"projection": "3d"})
@@ -336,7 +237,7 @@ class Support:
 
             surf_idx = onp.asarray(fem.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
-                fem._compute_support_weights(i, pts_i, base_curves_dofs, base_support_dofs),
+                fem._compute_support_weights(i, pts_i, curves_jax, base_support_dofs),
                 dtype=onp.float64,
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
@@ -421,8 +322,15 @@ class Support:
         import os
         import numpy as onp
 
+        from ..geo import CurveXYZFourierJAX as _CurveJAX
+
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in fem.base_curves_jax]
+
+        curves_jax = [
+            _CurveJAX(base.quadpoints, d, base.order)
+            for base, d in zip(fem.base_curves_jax, base_curves_dofs)
+        ]
 
         winkler_k = float(fem.problem_options['winkler_k'])
 
@@ -436,7 +344,7 @@ class Support:
 
             surf_idx = onp.asarray(fem.pipelines[i].surface_node_indices, dtype=onp.int32)
             weights_surf = onp.asarray(
-                fem._compute_support_weights(i, pts_i, base_curves_dofs, base_support_dofs),
+                fem._compute_support_weights(i, pts_i, curves_jax, base_support_dofs),
                 dtype=onp.float64,
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
@@ -553,9 +461,55 @@ class Support:
         """
         return jnp.zeros((surface_pts.shape[0], 3), dtype=surface_pts.dtype)
 
+    def coupling_pattern(
+        self,
+        coil_dof_offsets: list[int],
+        support_dof_offset: int,
+        surface_node_indices_by_coil: list,
+    ) -> tuple:
+        """Static numpy I/J index arrays for K_cs and K_sc coupling blocks.
+
+        Parameters
+        ----------
+        coil_dof_offsets : list[int]
+        support_dof_offset : int
+        surface_node_indices_by_coil : list[np.ndarray]
+
+        Returns
+        -------
+        tuple of four np.ndarray (I_cs, J_cs, I_sc, J_sc), all empty for the
+        uncoupled base support.
+        """
+        import numpy as onp
+        empty = onp.zeros(0, dtype=onp.int32)
+        return empty, empty, empty, empty
+
+    def coupling_values(
+        self,
+        curves_jax: list,
+        support_dofs: dict,
+        surface_pts_by_coil: list,
+        geom: dict | None = None,
+    ) -> tuple:
+        """Traced V arrays for K_cs and K_sc coupling blocks.
+
+        Parameters
+        ----------
+        curves_jax : list[CurveXYZFourierJAX]
+        support_dofs : dict
+        surface_pts_by_coil : list[jax.Array]
+        geom : dict or None
+            Pre-computed beam geometry (ignored for the uncoupled base support).
+
+        Returns
+        -------
+        tuple (V_cs, V_sc) of empty jax.Arrays for the uncoupled base support.
+        """
+        return jnp.zeros(0), jnp.zeros(0)
+
     def coupling_terms(
         self,
-        base_curves_dofs,
+        curves_jax,
         support_dofs,
         surface_pts_by_coil: list,
         coil_dof_offsets: list[int],
@@ -579,21 +533,19 @@ class Support:
 
         Parameters
         ----------
-        base_curves_dofs : list[jax.Array]
-            Per-base-coil DOF vectors.
+        curves_jax : list[CurveXYZFourierJAX]
+            Traced base-coil centreline objects.
         support_dofs : dict
             Merged support-dofs dict for the whole coil set.
         surface_pts_by_coil : list[jax.Array]
             Per-coil surface node positions, shape ``(n_surf_i, 3)`` each.
         coil_dof_offsets : list[int]
             DOF offset of each coil in the merged system.
-            ``coil_dof_offsets[i]`` = where coil ``i``'s DOFs start.
         support_dof_offset : int
             DOF offset of the support block in the merged system.
         surface_node_indices_by_coil : list[np.ndarray]
-            Per-coil integer arrays ``[n_surf_i]`` mapping surface-node compact
-            index ``k`` → global mesh node index (used to locate DOFs in the
-            merged system).
+            Per-coil integer arrays mapping surface-node compact index →
+            global mesh node index.
 
         Returns
         -------

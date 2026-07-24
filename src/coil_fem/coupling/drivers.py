@@ -9,24 +9,106 @@ its own DOFs (``support.is_coupled == True``):
   gradients.  Works on all backends (CPU and GPU).
 * :func:`solve_monolithic` — cuDSS-only single merged-system sparse direct
   solve.  Raises :class:`NotImplementedError` when ``solver != 'cudss'``.
+* :class:`MonolithicStatic` — immutable bundle of all pattern-level and
+  solver-handle data built once at construction and reused every evaluation.
+* :func:`make_merged_solve` — factory that produces the ``custom_vjp``
+  merged-solve callable from a :class:`MonolithicStatic` bundle.
 
-Both functions take a shared ``params`` bundle (see individual docstrings) and
-return a ``dict`` with keys ``'sol_list_by_coil'``, ``'u_s'``, and
-``'diagnostics'``.
+Both driver functions take a shared ``params`` bundle (see individual
+docstrings) and return a ``dict`` with keys ``'sol_list_by_coil'``, ``'u_s'``,
+and ``'diagnostics'``.
 """
 
 from __future__ import annotations
 
-from functools import partial
-from typing import TYPE_CHECKING
+import dataclasses
+import warnings
+from typing import TYPE_CHECKING, Callable
 
+import numpy as onp
 import jax
+import jax.flatten_util
 import jax.numpy as jnp
 import jax.scipy.sparse.linalg
 
 if TYPE_CHECKING:
     from ..pipelines import ElasticPipeline
     from .supports import Support
+
+
+# ============================================================================
+# MonolithicStatic — pre-built pattern + solver bundle
+# ============================================================================
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class MonolithicStatic:
+    """Immutable bundle of static data for the monolithic merged-system solver.
+
+    Built once by :meth:`~coil_fem.CoilFEM.build_monolithic_static` and
+    consumed by :func:`solve_monolithic` on every evaluation.  All attributes
+    are host-side Python scalars or numpy/JAX arrays computed from the mesh
+    topology and the static beam connectivity — none depends on the traced DOF
+    values evaluated at each optimisation step.
+
+    The *cuDSS-only layer* (``solver_K``, ``solver_KT``, ``coo_to_csr_T``,
+    ``nnz_csr_T``) is populated only when ``solver == 'cudss'``; the fields are
+    ``None`` on other backends.
+
+    Attributes
+    ----------
+    coil_dof_offsets : tuple[int, ...]
+    support_dof_offset : int
+    n_total_dofs : int
+    n_dofs_per_coil : tuple[int, ...]
+    n_s : int
+        Number of support DOFs (``support.n_support_dofs``).
+    has_cs : bool
+        Whether the K_cs / K_sc coupling blocks are non-empty.
+    has_sc : bool
+        Whether the K_sc coupling block is non-empty.
+    surface_node_indices_by_coil : tuple[np.ndarray, ...]
+    indptr : jax.Array
+        CSR row pointer for the forward solve (on device).
+    indices : jax.Array
+        CSR column index for the forward solve (on device).
+    coo_to_csr : jax.Array
+        Scatter map from flat COO ``V`` vector to CSR values (forward solve).
+    nnz_csr : int
+    coo_to_csr_T : jax.Array or None
+        Scatter map for the transposed CSR (adjoint solve; cuDSS only).
+    nnz_csr_T : int or None
+    solver_K : object or None
+        ``CuDSSSolver`` handle for the forward system (cuDSS only).
+    solver_KT : object or None
+        ``CuDSSSolver`` handle for the transposed system (cuDSS only).
+    merged_solve : Callable or None
+        ``custom_vjp``-wrapped merged-solve closure (cuDSS only).  Signature::
+
+            merged_solve(bcd, sdofs, pts, bf, wt) -> sol_flat
+    """
+    coil_dof_offsets: tuple
+    support_dof_offset: int
+    n_total_dofs: int
+    n_dofs_per_coil: tuple
+    n_s: int
+    has_cs: bool
+    has_sc: bool
+    surface_node_indices_by_coil: tuple
+    curve_qps: tuple
+    curve_orders: tuple
+    I_cs_pat: object     # np.ndarray or None when has_cs=False
+    J_cs_pat: object
+    I_sc_pat: object     # np.ndarray or None when has_sc=False
+    J_sc_pat: object
+    indptr: object
+    indices: object
+    coo_to_csr: object
+    nnz_csr: int
+    coo_to_csr_T: object
+    nnz_csr_T: object
+    solver_K: object
+    solver_KT: object
+    merged_solve: object
 
 
 # ============================================================================
@@ -70,8 +152,6 @@ def solve_staggered(
           Per-surface-node Winkler weights per coil.
         * ``'curves_by_coil'``       : list[CurveXYZFourierJAX]
           Traced coil centreline objects (rebuilt from DOFs by the caller).
-        * ``'base_curves_dofs'``     : list[jax.Array]
-          Raw DOF vectors per base coil (for the support solve).
         * ``'support_dofs'``         : dict
           Optimisable support parameters.
     options : dict or None
@@ -126,7 +206,6 @@ def solve_staggered(
     body_force_by_coil  = params['body_force_by_coil']
     weights_by_coil     = params['weights_by_coil']
     curves_by_coil      = params['curves_by_coil']
-    base_curves_dofs    = params['base_curves_dofs']
     support_dofs        = params['support_dofs']
 
     n_pipelines = len(pipelines)
@@ -143,14 +222,22 @@ def solve_staggered(
 
     def _sweep(u_s: jax.Array) -> jax.Array:
         """One block Gauss-Seidel iteration; differentiable w.r.t. u_s and
-        closure variables (pts, bf, wt, base_curves_dofs, support_dofs)."""
+        closure variables (pts, bf, wt, curves_by_coil, support_dofs).
+
+        Returns only u_s_new (compact signature required by jax.vjp in the
+        IFT adjoint).  Use :func:`_sweep_full` when sol_list is also needed.
+        """
         state = {'u_s': u_s}
+
+        # Compute beam geometry once; pass to compute_attach and solve.
+        geom = support.geometry(curves_by_coil, support_dofs)
 
         # Coil FEM solves with shifted Winkler springs
         u_mesh_by_coil = []
         for i, pipeline in enumerate(pipelines):
             u_attach_i = support.compute_attach(
-                i, surface_pts_by_coil[i], curves_by_coil, support_dofs, state
+                i, surface_pts_by_coil[i], curves_by_coil, support_dofs, state,
+                **({'geom': geom} if geom is not None else {}),
             )
             sol = pipeline.solve(
                 mesh_points_by_coil[i],
@@ -163,24 +250,69 @@ def solve_staggered(
         # Support system solve
         support_inputs = {
             'u_mesh_by_coil':      u_mesh_by_coil,
-            'base_curves_dofs':    base_curves_dofs,
+            'curves_jax':          curves_by_coil,
             'support_dofs':        support_dofs,
             'surface_pts_by_coil': surface_pts_by_coil,
         }
+        if geom is not None:
+            support_inputs['geom'] = geom
         return support.solve(support_inputs)['u_s']
+
+    def _sweep_full(u_s: jax.Array):
+        """One BG-S iteration that also returns the per-coil solution lists.
+
+        Used by :func:`_run_iterations` to cache the final sweep's solutions,
+        avoiding a redundant recovery sweep after convergence.
+
+        Returns
+        -------
+        u_s_new : jax.Array, shape (n_s,)
+        sol_list_by_coil : list[list[jax.Array]]
+        """
+        state = {'u_s': u_s}
+        geom = support.geometry(curves_by_coil, support_dofs)
+
+        u_mesh_by_coil = []
+        sol_list_by_coil = []
+        for i, pipeline in enumerate(pipelines):
+            u_attach_i = support.compute_attach(
+                i, surface_pts_by_coil[i], curves_by_coil, support_dofs, state,
+                **({'geom': geom} if geom is not None else {}),
+            )
+            sol = pipeline.solve(
+                mesh_points_by_coil[i],
+                body_force_by_coil[i],
+                weights_by_coil[i],
+                support_attach=u_attach_i,
+            )
+            u_mesh_by_coil.append(sol['u'][pipeline.surface_node_indices])
+            sol_list_by_coil.append(sol['sol_list'])
+
+        support_inputs = {
+            'u_mesh_by_coil':      u_mesh_by_coil,
+            'curves_jax':          curves_by_coil,
+            'support_dofs':        support_dofs,
+            'surface_pts_by_coil': surface_pts_by_coil,
+        }
+        if geom is not None:
+            support_inputs['geom'] = geom
+        u_s_new = support.solve(support_inputs)['u_s']
+        return u_s_new, sol_list_by_coil
 
     # ------------------------------------------------------------------
     # Forward solver — Python loop + Aitken (concrete, not traced)
     # ------------------------------------------------------------------
 
-    def _run_iterations(u_s0: jax.Array) -> jax.Array:
+    def _run_iterations(u_s0: jax.Array):
+        """BG-S loop; returns ``(u_s_converged, sol_list_by_coil)``."""
         u_s        = u_s0
         omega      = 1.0
         delta_prev = None
+        last_sol_list = None
 
         for k in range(max_iters):
-            delta = _sweep(u_s)
-            delta = delta - u_s          # f(u_s) = T(u_s) - u_s
+            u_s_new, sol_list = _sweep_full(u_s)
+            delta = u_s_new - u_s          # f(u_s) = T(u_s) - u_s
             res   = float(jnp.max(jnp.abs(delta)))
 
             if use_aitken and k > 0 and delta_prev is not None:
@@ -193,12 +325,13 @@ def solve_staggered(
                     omega = max(0.1, min(2.0, omega))
 
             u_s = u_s + omega * delta
+            last_sol_list = sol_list
 
             if res < atol:
                 break
             delta_prev = delta
 
-        return u_s
+        return u_s, last_sol_list
 
     # ------------------------------------------------------------------
     # IFT-based custom_vjp for correct gradients
@@ -245,14 +378,13 @@ def solve_staggered(
             Gradient of the loss w.r.t. the initial u_s (= 0 in practice;
             propagated here for API completeness).
         """
-        def A_T_fn(v):
-            """(I - dT/du_s)^T v.
+        # Linearize _sweep once at the converged point; reuse the resulting
+        # vjp_fn for every GMRES matvec to avoid one full sweep per iteration.
+        _, vjp_fn = jax.vjp(_sweep, u_s_star)
 
-            dT/du_s^T v is computed via the VJP of _sweep w.r.t. u_s at u_s*.
-            """
-            _, vjp_fn = jax.vjp(_sweep, u_s_star)
-            sweep_vjp = vjp_fn(v)[0]
-            return v - sweep_vjp
+        def A_T_fn(v):
+            """(I - dT/du_s)^T v via the pre-built VJP of _sweep at u_s*."""
+            return v - vjp_fn(v)[0]
 
         lambda_vec, _ = jax.scipy.sparse.linalg.gmres(
             A_T_fn, g_u_s, tol=gmres_tol, atol=1e-12, maxiter=gmres_maxiter
@@ -271,34 +403,185 @@ def solve_staggered(
     # ------------------------------------------------------------------
 
     u_s_init = jnp.zeros(n_s)
-    u_s_star = _run_iterations(u_s_init)
+    u_s_star, sol_list_by_coil = _run_iterations(u_s_init)
 
     # Pass through the custom_vjp hook so gradients are computed via IFT.
+    # sol_list_by_coil comes from the last _sweep_full call (the converged
+    # iteration), avoiding a redundant recovery sweep after convergence.
     u_s_star = _staggered_core(u_s_star)
-
-    # ------------------------------------------------------------------
-    # Final sweep at u_s_star to recover full sol_list_by_coil
-    # ------------------------------------------------------------------
-
-    state_star = {'u_s': u_s_star}
-    sol_list_by_coil = []
-    for i, pipeline in enumerate(pipelines):
-        u_attach_i = support.compute_attach(
-            i, surface_pts_by_coil[i], curves_by_coil, support_dofs, state_star
-        )
-        sol = pipeline.solve(
-            mesh_points_by_coil[i],
-            body_force_by_coil[i],
-            weights_by_coil[i],
-            support_attach=u_attach_i,
-        )
-        sol_list_by_coil.append(sol['sol_list'])
 
     return {
         'sol_list_by_coil': sol_list_by_coil,
         'u_s':              u_s_star,
         'diagnostics':      {},
     }
+
+
+# ============================================================================
+# make_merged_solve — factory for the cuDSS custom_vjp kernel
+# ============================================================================
+
+def make_merged_solve(
+    pipelines: list,
+    support,
+    static: MonolithicStatic,
+) -> Callable:
+    """Build a ``custom_vjp``-wrapped merged direct-solve function.
+
+    The returned callable captures ``pipelines``, ``support``, and
+    ``static`` (which holds the pre-built CSR patterns, coupling index
+    arrays, and cuDSS solver handles) and exposes only the traced arguments
+    to JAX autodiff.
+
+    Parameters
+    ----------
+    pipelines : list[ElasticPipeline]
+    support : Support
+    static : MonolithicStatic
+        Must have all cuDSS fields populated (``solver_K``, ``solver_KT``,
+        ``coo_to_csr``, ``coo_to_csr_T``, etc.).
+
+    Returns
+    -------
+    merged_solve : Callable
+        ``merged_solve(bcd, sdofs, pts, bf, wt) -> sol_flat``
+        where ``bcd`` is a list of per-coil DOF arrays (traced),
+        ``sdofs`` is the support DOF dict (traced), and ``pts``, ``bf``,
+        ``wt`` are per-coil mesh points, body forces, and Winkler weights
+        (all traced).
+    """
+    from ..solvers.cudss import assemble_csr_values
+    from ..geo.curve_jax import CurveXYZFourierJAX as _CurveJAX
+
+    coil_dof_offsets          = static.coil_dof_offsets
+    support_dof_offset        = static.support_dof_offset
+    n_dofs_per_coil           = static.n_dofs_per_coil
+    n_s                       = static.n_s
+    has_cs                    = static.has_cs
+    has_sc                    = static.has_sc
+    coo_to_csr                = static.coo_to_csr
+    nnz_csr                   = static.nnz_csr
+    coo_to_csr_T              = static.coo_to_csr_T
+    nnz_csr_T                 = static.nnz_csr_T
+    solver_K                  = static.solver_K
+    solver_KT                 = static.solver_KT
+    curve_qps                 = static.curve_qps
+    curve_orders              = static.curve_orders
+    I_cs_jax = jnp.asarray(static.I_cs_pat) if has_cs else None
+    J_cs_jax = jnp.asarray(static.J_cs_pat) if has_cs else None
+    I_sc_jax = jnp.asarray(static.I_sc_pat) if has_sc else None
+    J_sc_jax = jnp.asarray(static.J_sc_pat) if has_sc else None
+
+    n_pipelines = len(pipelines)
+
+    def _make_curves(bcd):
+        return [_CurveJAX(curve_qps[i], bcd[i], curve_orders[i])
+                for i in range(n_pipelines)]
+
+    def _surf_pts(pts):
+        return [pts[i][pipelines[i].surface_node_indices]
+                for i in range(n_pipelines)]
+
+    def _coil_params(i, pts, bf, wt):
+        return {
+            'points':          pts[i],
+            'body_force':      bf[i],
+            'support_weights': wt[i],
+            'support_attach':  jnp.zeros(
+                (pipelines[i].surface_node_indices.shape[0], 3),
+                dtype=pts[i].dtype,
+            ),
+        }
+
+    def _assemble_merged_values(bcd, sdofs, pts, bf, wt):
+        """Assemble merged COO value vector V and RHS f."""
+        surf_pts = _surf_pts(pts)
+        curves   = _make_curves(bcd)
+        # Compute beam geometry once; reuse for coo and coupling_values.
+        geom = support.geometry(curves, sdofs)
+        V_blocks, f_blocks = [], []
+        for i, pipeline in enumerate(pipelines):
+            p_params = _coil_params(i, pts, bf, wt)
+            _, _, Vi, _, fi = pipeline.assemble_coo(p_params)
+            V_blocks.append(Vi)
+            f_blocks.append(fi)
+        geom_kw = {'geom': geom} if geom is not None else {}
+        _, _, V_ss, _ = support.coo(curves, sdofs, surf_pts, **geom_kw)
+        V_blocks.append(V_ss)
+        f_blocks.append(jnp.zeros(n_s, dtype=V_ss.dtype))
+        V_cs, V_sc = support.coupling_values(curves, sdofs, surf_pts, **geom_kw)
+        if has_cs:
+            V_blocks.append(V_cs)
+        if has_sc:
+            V_blocks.append(V_sc)
+        V_merged = jnp.concatenate([jnp.asarray(v) for v in V_blocks])
+        f_merged = jnp.concatenate(f_blocks)
+        return V_merged, f_merged
+
+    @jax.custom_vjp
+    def merged_solve(bcd, sdofs, pts, bf, wt):
+        V_merged, f_merged = _assemble_merged_values(bcd, sdofs, pts, bf, wt)
+        csr_values = assemble_csr_values(V_merged, coo_to_csr, nnz_csr)
+        sol_flat, _inertia = solver_K(f_merged, csr_values)
+        return sol_flat
+
+    def _fwd(bcd, sdofs, pts, bf, wt):
+        sol = merged_solve(bcd, sdofs, pts, bf, wt)
+        # Recompute geom here so it can be saved in the residual tuple and
+        # reused in _bwd, avoiding a redundant geometry evaluation per backward.
+        fwd_geom = support.geometry(_make_curves(bcd), sdofs)
+        return sol, (bcd, sdofs, pts, bf, wt, sol, fwd_geom)
+
+    def _bwd(res, g_flat):
+        bcd, sdofs, pts, bf, wt, sol_flat, fwd_geom = res
+        V_merged, _ = _assemble_merged_values(bcd, sdofs, pts, bf, wt)
+        csr_values_T = assemble_csr_values(V_merged, coo_to_csr_T, nnz_csr_T)
+        lambda_flat, _inertia = solver_KT(g_flat, csr_values_T)
+
+        def _merged_constraint(bcd_in, sdofs_in, pts_in, bf_in, wt_in):
+            s_pts  = _surf_pts(pts_in)
+            curves = _make_curves(bcd_in)
+            # Use the pre-computed geometry from the forward pass when the
+            # inputs are the same (always the case here — we differentiate
+            # through the constraint at the forward-pass point).
+            geom_in = fwd_geom
+            geom_kw = {'geom': geom_in} if geom_in is not None else {}
+            residuals = []
+            for i, pipeline in enumerate(pipelines):
+                p_par = _coil_params(i, pts_in, bf_in, wt_in)
+                u_c_i = sol_flat[
+                    coil_dof_offsets[i]:coil_dof_offsets[i] + n_dofs_per_coil[i]
+                ].reshape(pipeline.problem.fes[0].num_total_nodes, 3)
+                pipeline.problem.set_params(p_par)
+                res_i = pipeline.problem.compute_residual_vars(
+                    [u_c_i],
+                    pipeline.problem.internal_vars,
+                    pipeline.problem.internal_vars_surfaces,
+                )
+                residuals.append(jax.flatten_util.ravel_pytree(res_i)[0])
+            Iss, Jss, Vss, ns = support.coo(curves, sdofs_in, s_pts, **geom_kw)
+            u_s = sol_flat[support_dof_offset:]
+            r_s = jnp.zeros(ns, dtype=Vss.dtype).at[Iss].add(Vss * u_s[Jss])
+            r_full = jnp.concatenate(residuals + [r_s])
+            V_cs_in, V_sc_in = support.coupling_values(
+                curves, sdofs_in, s_pts, **geom_kw
+            )
+            if has_cs:
+                r_full = r_full.at[I_cs_jax].add(
+                    V_cs_in * sol_flat[J_cs_jax]
+                )
+            if has_sc:
+                r_full = r_full.at[I_sc_jax].add(
+                    V_sc_in * sol_flat[J_sc_jax]
+                )
+            return r_full
+
+        _, vjp_fn = jax.vjp(_merged_constraint, bcd, sdofs, pts, bf, wt)
+        grads = vjp_fn(-lambda_flat)
+        return grads
+
+    merged_solve.defvjp(_fwd, _bwd)
+    return merged_solve
 
 
 # ============================================================================
@@ -309,8 +592,7 @@ def solve_monolithic(
     pipelines: list,
     support,
     params: dict,
-    *,
-    options: dict | None = None,
+    static: MonolithicStatic,
 ) -> dict:
     """Merged-system sparse direct solve for coupled coil + support systems.
 
@@ -327,19 +609,20 @@ def solve_monolithic(
 
     and solves it in one shot with the cuDSS GPU sparse direct solver.
 
+    The CSR sparsity pattern, cuDSS solver handles, and the ``custom_vjp``
+    merged-solve closure are all pre-built in ``static``
+    (via :meth:`~coil_fem.CoilFEM.build_monolithic_static`) and reused here
+    without any host-side pattern construction.
+
     Parameters
     ----------
     pipelines : list[:class:`~coil_fem.pipelines.ElasticPipeline`]
     support : :class:`~coil_fem.coupling.supports.Support`
     params : dict
         Same format as :func:`solve_staggered`.
-    options : dict or None
-        Optional knobs:
-
-        * ``'mtype_id'`` (int, default 0) — cuDSS matrix type.  Default 0
-          (general/asymmetric) because ``K_ss`` from ``SupportBeams`` has
-          an asymmetric torque block.
-        * ``'device_id'`` (int, default 0) — GPU device index.
+    static : MonolithicStatic
+        Pre-built static bundle from
+        :meth:`~coil_fem.CoilFEM.build_monolithic_static`.
 
     Returns
     -------
@@ -348,33 +631,12 @@ def solve_monolithic(
     Raises
     ------
     NotImplementedError
-        When ``pipelines[0].problem_options.get('solver') != 'cudss'``.
-        The monolithic merge requires the cuDSS GPU backend because each
-        pipeline's stiffness block is stored as a device-side COO array
-        (``problem.V_jax``).  CPU-only sparse assembly is not supported.
-
-    Notes
-    -----
-    The merged system is assembled from three sources:
-
-    1. **Per-coil blocks** ``K_cc^i``: assembled via
-       :meth:`~coil_fem.pipelines.ElasticPipeline.assemble_coo`, which
-       triggers a single Newton assembly step on the GPU.
-    2. **Support block** ``K_ss``: from ``support.coo()``.
-    3. **Coupling blocks** ``K_cs`` / ``K_sc``: from
-       ``support.coupling_terms()``.
-
-    The merged ``custom_vjp`` backward re-uses the cuDSS factorisation
-    (re-computed from the saved residual) and differentiates through the
-    merged constraint function for each parameter block.
+        When ``static.merged_solve`` is ``None``, which happens when the
+        pipeline solver is not ``'cudss'``.  CPU-only monolithic solves are
+        not implemented; use :func:`solve_staggered` on CPU backends.
     """
-    opts = options or {}
-
-    # ── Guard: cuDSS-only ─────────────────────────────────────────────────
-    if not pipelines:
-        raise ValueError("pipelines must be non-empty.")
-    solver_opt = pipelines[0].problem_options.get('solver', '')
-    if solver_opt != 'cudss':
+    if static.merged_solve is None:
+        solver_opt = pipelines[0].problem_options.get('solver', '')
         raise NotImplementedError(
             "solve_monolithic requires problem_options={'solver': 'cudss'}. "
             f"Got solver='{solver_opt}'. "
@@ -383,254 +645,29 @@ def solve_monolithic(
             "for CPU-compatible coupled solves."
         )
 
-    mtype_id  = int(opts.get('mtype_id',  0))   # 0 = general (asymmetric K_ss)
-    device_id = int(opts.get('device_id', 0))
+    coil_dof_offsets = static.coil_dof_offsets
+    n_dofs_per_coil  = static.n_dofs_per_coil
+    support_dof_offset = static.support_dof_offset
 
     mesh_points_by_coil = params['mesh_points_by_coil']
     body_force_by_coil  = params['body_force_by_coil']
     weights_by_coil     = params['weights_by_coil']
-    base_curves_dofs    = params['base_curves_dofs']
+    curves_by_coil      = params['curves_by_coil']
     support_dofs        = params['support_dofs']
 
-    n_pipelines = len(pipelines)
-    surface_pts_by_coil = [
-        mesh_points_by_coil[i][pipelines[i].surface_node_indices]
-        for i in range(n_pipelines)
-    ]
-
-    # Compute per-coil DOF sizes and offsets in the merged system
-    n_dofs_per_coil = [p.problem.num_total_dofs_all_vars for p in pipelines]
-    coil_dof_offsets = []
-    offset = 0
-    for nd in n_dofs_per_coil:
-        coil_dof_offsets.append(offset)
-        offset += nd
-    support_dof_offset = offset
-    n_total_dofs = offset + support.n_support_dofs
-
-    surface_node_indices_by_coil = [p.surface_node_indices for p in pipelines]
-
-    # ── Wrapping the merged forward + adjoint in custom_vjp ───────────────
-
-    @jax.custom_vjp
-    def _merged_solve(
-        base_curves_dofs_inner,
-        support_dofs_inner,
-        mesh_points_by_coil_inner,
-        body_force_by_coil_inner,
-        weights_by_coil_inner,
-    ):
-        return _forward_merged(
-            base_curves_dofs_inner,
-            support_dofs_inner,
-            mesh_points_by_coil_inner,
-            body_force_by_coil_inner,
-            weights_by_coil_inner,
-        )
-
-    def _forward_merged(
-        bcd, sdofs, pts_by_coil, bf_by_coil, wt_by_coil
-    ):
-        """Assemble + solve the merged system; returns flat solution vector."""
-        surf_pts = [pts_by_coil[i][pipelines[i].surface_node_indices]
-                    for i in range(n_pipelines)]
-
-        # ── Per-coil stiffness blocks (K_cc^i) ────────────────────────────
-        I_list, J_list, V_list = [], [], []
-        f_list = []
-
-        for i, pipeline in enumerate(pipelines):
-            p_params = {
-                'points':          pts_by_coil[i],
-                'body_force':      bf_by_coil[i],
-                'support_weights': wt_by_coil[i],
-                'support_attach':  jnp.zeros(
-                    (pipeline.surface_node_indices.shape[0], 3),
-                    dtype=pts_by_coil[i].dtype,
-                ),
-            }
-            Ii, Ji, Vi, _ = pipeline.assemble_coo(p_params)
-            off = coil_dof_offsets[i]
-            I_list.append(Ii + off)
-            J_list.append(Ji + off)
-            V_list.append(Vi)
-            # RHS: -R(0) = load vector
-            fi = -pipeline.solve_residual(p_params)
-            f_list.append(fi)
-
-        # ── Support block (K_ss) ───────────────────────────────────────────
-        I_ss, J_ss, V_ss, n_s = support.coo(bcd, sdofs, surf_pts)
-        I_list.append(jnp.asarray(I_ss) + support_dof_offset)
-        J_list.append(jnp.asarray(J_ss) + support_dof_offset)
-        V_list.append(V_ss)
-        f_list.append(jnp.zeros(n_s, dtype=V_ss.dtype))   # f_s = 0 (MVP)
-
-        # ── Coupling blocks (K_cs, K_sc) ──────────────────────────────────
-        coupling = support.coupling_terms(
-            bcd, sdofs, surf_pts,
-            coil_dof_offsets, support_dof_offset,
-            surface_node_indices_by_coil,
-        )
-        if coupling['V_cs'].shape[0] > 0:
-            I_list.append(coupling['I_cs'])
-            J_list.append(coupling['J_cs'])
-            V_list.append(coupling['V_cs'])
-        if coupling['V_sc'].shape[0] > 0:
-            I_list.append(coupling['I_sc'])
-            J_list.append(coupling['J_sc'])
-            V_list.append(coupling['V_sc'])
-
-        # ── Merge and solve ────────────────────────────────────────────────
-        I_merged = jnp.concatenate([jnp.asarray(x) for x in I_list])
-        J_merged = jnp.concatenate([jnp.asarray(x) for x in J_list])
-        V_merged = jnp.concatenate(V_list)
-        f_merged = jnp.concatenate(f_list)
-
-        # Use cuDSS for the merged solve
-        from ..solvers.cudss import _import_cudss_solver, assemble_csr_from_coo
-        CuDSSSolver = _import_cudss_solver()
-
-        csr_indptr, csr_cols, coo_to_csr, nnz_csr = assemble_csr_from_coo(
-            I_merged, J_merged, n_total_dofs
-        )
-        csr_values = assemble_csr_values_merged(V_merged, coo_to_csr, nnz_csr)
-
-        cudss_solver = CuDSSSolver(
-            n_total_dofs, nnz_csr, device_id, mtype_id=mtype_id
-        )
-        cudss_solver.set_csr(csr_indptr, csr_cols)
-        sol_flat, _ = cudss_solver.solve(f_merged, csr_values)
-
-        return sol_flat
-
-    def _fwd_wrapper(bcd, sdofs, pts, bf, wt):
-        sol = _merged_solve(bcd, sdofs, pts, bf, wt)
-        return sol, (bcd, sdofs, pts, bf, wt, sol)
-
-    def _bwd_wrapper(res, g_flat):
-        bcd, sdofs, pts, bf, wt, sol_flat = res
-        surf_pts = [pts[i][pipelines[i].surface_node_indices]
-                    for i in range(n_pipelines)]
-
-        # Re-assemble K at the converged solution (linear → same K as forward)
-        # and solve K^T λ = g for the adjoint variable.
-        from ..solvers.cudss import _import_cudss_solver, assemble_csr_from_coo
-        CuDSSSolver = _import_cudss_solver()
-
-        I_list, J_list, V_list = [], [], []
-        for i, pipeline in enumerate(pipelines):
-            p_params = {
-                'points':          pts[i],
-                'body_force':      bf[i],
-                'support_weights': wt[i],
-                'support_attach':  jnp.zeros(
-                    (pipeline.surface_node_indices.shape[0], 3),
-                    dtype=pts[i].dtype,
-                ),
-            }
-            Ii, Ji, Vi, _ = pipeline.assemble_coo(p_params)
-            off = coil_dof_offsets[i]
-            I_list.append(Ii + off)
-            J_list.append(Ji + off)
-            V_list.append(Vi)
-
-        I_ss, J_ss, V_ss, n_s = support.coo(bcd, sdofs, surf_pts)
-        I_list.append(jnp.asarray(I_ss) + support_dof_offset)
-        J_list.append(jnp.asarray(J_ss) + support_dof_offset)
-        V_list.append(V_ss)
-
-        coupling = support.coupling_terms(
-            bcd, sdofs, surf_pts,
-            coil_dof_offsets, support_dof_offset,
-            surface_node_indices_by_coil,
-        )
-        if coupling['V_cs'].shape[0] > 0:
-            I_list.append(coupling['I_cs'])
-            J_list.append(coupling['J_cs'])
-            V_list.append(coupling['V_cs'])
-        if coupling['V_sc'].shape[0] > 0:
-            I_list.append(coupling['I_sc'])
-            J_list.append(coupling['J_sc'])
-            V_list.append(coupling['V_sc'])
-
-        I_merged = jnp.concatenate([jnp.asarray(x) for x in I_list])
-        J_merged = jnp.concatenate([jnp.asarray(x) for x in J_list])
-        V_merged = jnp.concatenate(V_list)
-
-        csr_indptr, csr_cols, coo_to_csr, nnz_csr = assemble_csr_from_coo(
-            I_merged, J_merged, n_total_dofs
-        )
-        csr_values = assemble_csr_values_merged(V_merged, coo_to_csr, nnz_csr)
-
-        # Solve K^T λ = g (transpose for adjoint)
-        cudss_solver = CuDSSSolver(
-            n_total_dofs, nnz_csr, device_id, mtype_id=mtype_id
-        )
-        cudss_solver.set_csr(csr_indptr, csr_cols)
-        lambda_flat, _ = cudss_solver.solve(g_flat, csr_values, transpose=True)
-
-        # Gradient via merged constraint VJP: grad = -λ^T ∂(K u - f)/∂params
-        def _merged_constraint(bcd_in, sdofs_in, pts_in, bf_in, wt_in):
-            """K(params) * sol_flat - f(params) at the converged solution."""
-            s_pts = [pts_in[i][pipelines[i].surface_node_indices]
-                     for i in range(n_pipelines)]
-            residuals = []
-            for i, pipeline in enumerate(pipelines):
-                p_par = {
-                    'points':          pts_in[i],
-                    'body_force':      bf_in[i],
-                    'support_weights': wt_in[i],
-                    'support_attach':  jnp.zeros(
-                        (pipeline.surface_node_indices.shape[0], 3),
-                        dtype=pts_in[i].dtype,
-                    ),
-                }
-                # compute_residual evaluates K_cc^i u_c^{i*} - f_c^i
-                u_c_i = sol_flat[
-                    coil_dof_offsets[i]:coil_dof_offsets[i] + n_dofs_per_coil[i]
-                ].reshape(pipeline.problem.num_total_nodes, 3)
-                pipeline.problem.set_params(p_par)
-                res_i = pipeline.problem.compute_residual_vars(
-                    [u_c_i],
-                    pipeline.problem.internal_vars,
-                    pipeline.problem.internal_vars_surfaces,
-                )
-                import jax.flatten_util
-                residuals.append(jax.flatten_util.ravel_pytree(res_i)[0])
-
-            # Support residual: K_ss u_s
-            Iss, Jss, Vss, ns = support.coo(bcd_in, sdofs_in, s_pts)
-            K_ss = jnp.zeros((ns, ns))
-            K_ss = K_ss.at[Iss, Jss].add(Vss)
-            u_s = sol_flat[support_dof_offset:]
-            residuals.append(K_ss @ u_s)
-
-            return jnp.concatenate(residuals)
-
-        _, vjp_fn = jax.vjp(
-            _merged_constraint, bcd, sdofs, pts, bf, wt
-        )
-        grads = vjp_fn(-lambda_flat)  # grad = -λ^T ∂R/∂params
-
-        return grads
-
-    _merged_solve.defvjp(_fwd_wrapper, _bwd_wrapper)
-
-    # ── Call the wrapped solver ────────────────────────────────────────────
-    sol_flat = _merged_solve(
-        base_curves_dofs,
+    sol_flat = static.merged_solve(
+        [c.dofs for c in curves_by_coil],
         support_dofs,
         mesh_points_by_coil,
         body_force_by_coil,
         weights_by_coil,
     )
 
-    # ── Split solution into per-coil + support ────────────────────────────
     sol_list_by_coil = []
     for i, pipeline in enumerate(pipelines):
         u_c_i = sol_flat[
             coil_dof_offsets[i]:coil_dof_offsets[i] + n_dofs_per_coil[i]
-        ].reshape(pipeline.problem.num_total_nodes, 3)
+        ].reshape(pipeline.problem.fes[0].num_total_nodes, 3)
         sol_list_by_coil.append([u_c_i])
 
     u_s = sol_flat[support_dof_offset:]
@@ -640,31 +677,3 @@ def solve_monolithic(
         'u_s':              u_s,
         'diagnostics':      {},
     }
-
-
-# ============================================================================
-# Internal helpers for monolithic assembly
-# ============================================================================
-
-def assemble_csr_values_merged(
-    V_coo: jax.Array,
-    coo_to_csr: jax.Array,
-    nnz_csr: int,
-) -> jax.Array:
-    """Scatter flat COO values into CSR value array.
-
-    Parameters
-    ----------
-    V_coo : jax.Array, shape ``(nnz_coo,)``
-        COO values.
-    coo_to_csr : jax.Array, shape ``(nnz_coo,)``
-        Mapping from COO index to CSR index.
-    nnz_csr : int
-        Number of non-zeros in the CSR representation.
-
-    Returns
-    -------
-    jax.Array, shape ``(nnz_csr,)``
-    """
-    csr_values = jnp.zeros(nnz_csr, dtype=V_coo.dtype)
-    return csr_values.at[coo_to_csr].add(V_coo)
