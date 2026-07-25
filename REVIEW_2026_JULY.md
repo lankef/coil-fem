@@ -28,14 +28,16 @@ Three findings are worth acting on before anything cosmetic:
    FEM solves it exists to coordinate.** A forward-only 2-coil objective takes
    29 s, of which roughly 20 s is eager beam assembly that jits down to under
    a millisecond. **[measured]**
-3. **The block Gauss–Seidel loop never reaches a fixed point** on a 2-coil
-   beam network, and returns the unconverged state with no warning. The
-   iteration marches along a single direction with eigenvalue 1.0000044 —
-   a marginal mode of the coupled operator — and the residual is flat from
-   sweep ~7 onward. This is insensitive to coil shape, to attachment
-   locality, and to both spring stiffnesses, so it is structural rather
-   than a tuning problem, and the same near-singular `K_ss` (condition
-   number 9.1 × 10⁹) also feeds the monolithic cuDSS path. **[measured]**
+3. **The coupled operator is non-self-adjoint with an indefinite symmetric
+   part whenever `k_tor ≠ k_lin`**, and that is what stops the block
+   Gauss–Seidel loop from ever reaching a fixed point: it marches along a
+   single direction with eigenvalue 1.0000044 while the residual stays flat
+   from sweep ~7, then returns the unconverged state with no warning. The
+   behaviour is independent of coil shape, attachment locality, and `k_lin`,
+   but `k_tor` controls it exactly — at `k_tor = k_lin` the matrix becomes
+   symmetric to machine precision, positive definite, and 4 orders of
+   magnitude better conditioned. The same `K_ss` feeds the monolithic cuDSS
+   path, so this is not confined to the deprioritised driver. **[measured]**
 
 Beyond that, roughly 600 lines across the package have no caller anywhere in
 `src/`, `tests/`, `examples/`, or `docs/`, the von Mises stress kernel is
@@ -220,22 +222,51 @@ separately forbids the strong under-relaxation (`ω ≪ 0.1`) that a marginally
 stable coupling would need even if the mode were merely stiff rather than
 singular. That clamp is worth revisiting on its own merits.
 
-Raising `k_tor` from `1e4` to `1e8` (equal to `k_lin`) left the growth ratio
-unchanged at `1.000004428` to nine digits, so the mode is not a
-torsional-spring deficiency either.
+The one stiffness that *does* control the mode is `k_tor`; see
+[A2c](#a2c--the-support-stiffness-block-is-near-singular).
 
 #### A2c — The support stiffness block is near-singular
 
-Assembling `K_ss` directly for the same configuration and taking its SVD
-**[measured]**:
+Assembling `K_ss` and the coupling blocks directly and sweeping `k_tor` with
+`k_lin = 1e8` fixed **[measured]**:
 
-```
-K_ss (48x48) singular values: max 1.543e+08  min 1.696e-02  cond 9.097e+09
-K_ss asymmetry ||K-K^T||/||K|| = 1.249e-03
-```
+| `k_tor` | `‖K_ss − K_ssᵀ‖/‖K_ss‖` | `‖K_cs − K_scᵀ‖/‖K_cs‖` | negative eigenvalues of `sym(K_ss)` | `σ_min(K_ss)` | cond `K_ss` |
+|---:|---|---|---:|---|---:|
+| 1e4 (fixture) | 1.249e-03 | 2.726e-02 | 4 / 48 | 1.696e-02 | 9.10e9 |
+| 1e6 | 1.236e-03 | 2.699e-02 | 4 / 48 | 1.695e+00 | 9.10e7 |
+| 1e8 (= `k_lin`) | **1.7e-17** | **0.0 exactly** | **0 / 48** | 1.611e+02 | 9.58e5 |
 
-A condition number of 9 × 10⁹ on a 48 × 48 matrix is consistent with the
-marginal mode above and has two direct consequences:
+`k_tor` is the knob. `σ_min(K_ss)` tracks it linearly over four decades, and at
+`k_tor = k_lin` the four negative eigenvalues of the symmetric part vanish, the
+matrix becomes symmetric to machine precision, and the condition number drops
+by four orders of magnitude. So the weak subspace is exactly the rotational
+DOFs, whose only external stiffness is `k_tor`.
+
+The reason is structural rather than a tuning accident.
+`_spring_stiffness_contributions` writes the translation–rotation block as
+`−k_lin Σ w [r]×` and the torque–translation block as `+k_tor Σ w [r]×`
+(`beam_network.py:1797-1803`). Since `[r]×ᵀ = −[r]×`, the transpose of the
+first is `+k_lin Σ w [r]×`, which equals the second only when
+`k_tor = k_lin`. `coupling_values` has the same structure:
+`(blk_r_cs)ᵀ = −k_lin · skew_eff · Q` while `blk_r_sc = −k_tor · skew_eff · Q`
+(`beam_network.py:1541-1547`). Translation–translation blocks are symmetric
+unconditionally, and the bare beam `K_global = Γ K_local Γᵀ` is symmetric by
+congruence, so **`k_tor` is the only source of asymmetry in the whole merged
+system**, and it enters both the diagonal `K_ss` and the off-diagonal coupling.
+
+A non-self-adjoint operator whose symmetric part is indefinite is exactly the
+setting in which a partitioned Dirichlet–Neumann iteration has a growing mode,
+which is what [A2b](#a2b--the-iteration-marches-along-a-mode-with-eigenvalue-10000044)
+observes. This looks like a modelling choice with numerical consequences rather
+than a coding defect: the torque law `τ = k_tor Σ w r × Δu` with an independent
+`k_tor` is what breaks self-adjointness. A single foundation modulus (a genuine
+distributed spring bed, `k_tor ≡ k_lin`) would make the entire merged system
+symmetric positive definite for free — worth deciding deliberately, since
+`CoilFEM` already enforces `winkler_k == k_lin` but places no constraint on
+`k_tor`.
+
+A condition number of 9 × 10⁹ on a 48 × 48 matrix has two further direct
+consequences:
 
 1. `SupportBeams.solve` densifies this block and factors it with
    `lineax.LU()` (`beam_network.py:2024-2037`), losing roughly 10 of 16
@@ -244,10 +275,9 @@ marginal mode above and has two direct consequences:
    `make_merged_solve` — so this is not confined to the staggered path that
    the philosophy deprioritises. It sits in the cuDSS path too.
 
-Two structural candidates worth checking first, in the order I would check
-them. I did not isolate the mode, so these are leads rather than conclusions:
+Two further defects in the same rotational subspace, which compound the above:
 
-- **The CF foundation endpoint provides no rotational grounding.**
+- **The CF foundation endpoint provides no rotational grounding at all.**
   `_endpoint_weights_and_r` sets `r_fnd = x_foundation[i][j] - geom['x_end'][b]`
   where `geom['x_end'][b]` *is* `x_foundation[i][j]` (the code says so at
   `beam_network.py:1704`), so `r_fnd ≡ 0`, hence `skew_sum = skew2_sum = 0`,
@@ -255,7 +285,9 @@ them. I did not isolate the mode, so these are leads rather than conclusions:
   contributes translational stiffness only, and `_assemble_rhs` explicitly
   does nothing for it (`pass`, `beam_network.py:1952`). The foundation-side
   rotation DOFs are then restrained only through the bare beam's own bending
-  and torsion.
+  and torsion — so even setting `k_tor = k_lin` leaves the foundation nodes
+  with no rotational spring, because `k_tor` multiplies a zero moment arm
+  there.
 - **A units mismatch between the coil side and the foundation side.** After the
   working-tree JxW change, every coil-side endpoint contributes
   `K_tt += k_lin · Σ(w · JxW) · I₃` — an *area*-weighted sum — while the
@@ -355,11 +387,59 @@ since `K_ss` is explicitly documented as non-symmetric:
             mtype_id=int(problem_options.get('cudss_mtype_id', 1)),
 ```
 
-Both read the *same* `problem_options` dict. A user who sets
-`cudss_mtype_id=0` to be explicit about the merged matrix silently degrades
-the per-coil solver to a general factorisation; a user who sets `1` gives
-cuDSS a symmetric matrix type for a matrix that is not symmetric. Use two
-distinct keys, or derive the merged type from `support.k_lin == support.k_tor`.
+Both read the *same* `problem_options` dict, and — this is the point — **each
+default is individually correct for its own matrix**, so there is no single
+value that can serve both.
+
+`cudss_mtype_id` is passed through spineax to cuDSS's `cudssMatrixType_t`
+(the if-chain is at `spineax/cudss/single_solve.cpp:157-174`) and declares
+which structural property the solver may exploit. It is a promise, not a
+check — cuDSS never validates the matrix against it:
+
+| id | cuDSS type | Mathematical requirement | Factorisation |
+|---:|---|---|---|
+| 0 | `GENERAL` | none | LU, partial pivoting |
+| 1 | `SYMMETRIC` | `A = Aᵀ` | LDLᵀ, handles indefinite |
+| 2 | `HERMITIAN` | `A = Aᴴ` | LDLᴴ |
+| 3 | `SPD` | `A = Aᵀ` and `xᵀAx > 0 ∀x ≠ 0` | Cholesky, no pivoting |
+| 4 | `HPD` | `A = Aᴴ` and positive definite | Cholesky, complex |
+
+coil-fem is real `float64` throughout, so 2 and 4 are unreachable in practice
+(`Aᴴ = Aᵀ` for real `A`, making them equivalent to 1 and 3). The 1-vs-3
+distinction is definiteness, not symmetry.
+
+What the two matrices actually are **[measured]**:
+
+- **Single-coil `K_cc`** is symmetric to machine precision,
+  `‖K − Kᵀ‖/‖K‖ = 6.0e-17`, and structurally so: the elasticity tangent
+  `∫ C ε(u):ε(v) dV` inherits the major symmetry `C_ijkl = C_klij`, the
+  Winkler term `∫ k w u·v dS` is a surface mass matrix, and
+  `apply_symmetric_dirichlet` zeros rows *and* columns and folds the columns
+  into the RHS — which is what its name is about. Definiteness depends on the
+  clamp: with `w = 1` everywhere the smallest eigenvalue is `+1.12e6` against
+  a largest of `2.07e11` (genuinely SPD, cond ≈ 1.9e5), but with `w = 1` on
+  only 10 % of the surface quadrature points five eigenvalues fall within
+  `1e-6` of zero relative to the largest and the condition number rises to
+  ≈ 6.6e9. Those five are the rigid-body modes a partial clamp does not pin.
+  So `1` is the sound default and `3` is not safe in general, because the
+  sigmoid clamps used in practice do underflow to exactly zero away from the
+  clamp.
+- **The merged monolithic matrix** is symmetric **iff `k_tor = k_lin`**, and
+  is otherwise both non-symmetric and indefinite in its symmetric part; see
+  the sweep in [A2c](#a2c--the-support-stiffness-block-is-near-singular). With
+  the fixture's `k_tor = 1e4, k_lin = 1e8` the relative asymmetry is `1.2e-3`
+  in `K_ss` and `2.7e-2` between `K_cs` and `K_scᵀ`, so `0` is required.
+
+The hazard is therefore worse than a mistuned option. With `mview_id`
+hard-coded to `0` (`CUDSS_MVIEW_FULL`, `coil_fem.py:441`) you hand cuDSS the
+complete matrix and then tell it which triangle it may ignore; declaring
+`SYMMETRIC` for the merged system yields the solution of a symmetrised matrix
+with no error raised. Use two distinct option keys
+(`cudss_mtype_id_coil` / `cudss_mtype_id_merged`), or derive the merged value
+from `support.k_tor == support.k_lin` and assert it at construction. If
+`k_tor ≡ k_lin` were adopted as the model (see
+[A2c](#a2c--the-support-stiffness-block-is-near-singular)), `1` would become
+valid for the merged matrix too, and cheaper than `0`.
 
 ### A6 — Mutable default arguments are mutated in place
 
@@ -1185,6 +1265,13 @@ call, with `jax.block_until_ready` before and after timing.
 Sweep count and gradient failure: the same, with `n_beam_cc=1`,
 `n_beam_cf=1`, `N=8`, and a 1×1 cross-section grid, so the run completes in
 ~20 s.
+
+Symmetry and conditioning study: the same, with `K_ss` assembled directly via
+`support.coo(...)` and scattered into a dense array with `np.add.at`, and the
+coupling blocks via `coupling_pattern` + `coupling_values`. `K_cc` was obtained
+as `jax.jacfwd` of `problem.compute_residual_vars` at zero displacement, which
+is the same tangent the solver factorises. No staggered solves were involved in
+any of these.
 
 Convergence study: `n_beam_cc=1`, `n_beam_cf=1`, `N=16`, mesh
 `{'w1': 0.03, 'w2': 0.03, 'n_grid_1': 1, 'n_grid_2': 1}`, `k_tor=1e4` unless
