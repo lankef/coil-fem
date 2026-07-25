@@ -623,8 +623,57 @@ caller who omits the flag.
 `_broadcast_problem_options` already raises if `'winkler_k'` is absent, and
 line 298 does `float(...)` on it before this branch is reached — so
 `winkler_k is None` either never happens or has already raised `TypeError`.
-Either delete the branch or move the default-from-support resolution above
-line 298 and relax the hard requirement in `_broadcast_problem_options`.
+
+**Decision: `winkler_k` stays mandatory, and must never be defaulted from
+`support.k_lin`.** Delete the inner branch (lines 306–310) outright rather than
+repairing it by hoisting the resolution above line 298 and relaxing
+`_broadcast_problem_options`. Keep only the `else` arm — the equality
+assertion. Reasons to record, since the dead branch reads as an intention
+someone might otherwise restore:
+
+- `winkler_k` is a property of the **coil-side discretisation**, not of the
+  support. It is baked into `LinearElasticity3D` at construction through
+  `additional_info` and is fixed for the life of the problem, so it must be
+  known before the pipelines are built — which is why line 298 sits where it
+  does.
+- The key is required on the **uncoupled** path too, where no `k_lin` exists.
+  Making it support-derived would leave the same option sometimes required and
+  sometimes not, depending on the support class.
+- Defaulting one modulus from the other hides a physical modelling choice. With
+  the equality constraint in force, a user adjusting `k_lin` would silently
+  change the coil FEM discretisation without ever naming the new value.
+- It also makes `problem_options` a partly-output structure: line 309 rebuilds
+  it with a value the caller never supplied.
+
+#### A8a — The `hasattr` guard defeats the check it guards
+
+Once the default-from-support branch is gone, the whole block exists only to
+assert `winkler_k == support.k_lin`. That makes the guard actively harmful:
+
+```305:305:src/coil_fem/coil_fem.py
+        if self.support.is_coupled and hasattr(self.support, 'k_lin'):
+```
+
+`k_lin` is a **required** attribute whenever `is_coupled=True` (AGENTS.md
+states this as part of the `Support` contract), so the `hasattr` tests for
+something the contract already guarantees, and in practice it is always true
+when reached: `SupportBeams.k_lin` is a property, and the base `Support` has no
+`k_lin` but short-circuits on `is_coupled=False` first. Both halves of the
+condition are effectively constant.
+
+The problem is what happens if it is ever false. A coupled support genuinely
+missing `k_lin` would **silently skip** the assertion rather than fail, leaving
+the coil-side Winkler modulus free to disagree with the beam-side spring
+modulus — precisely the inconsistency the block exists to prevent. Defensive
+`hasattr` converts a contract violation into silent wrong physics.
+
+Either declare `k_lin` on the base `Support` (as a property returning `None`
+or raising `NotImplementedError`) and test unconditionally, or validate at
+construction that `is_coupled=True` implies `k_lin` is present. Note also that
+the tolerance here is `1e-6` relative, which is appropriate for a physical
+consistency check but must **not** be reused for the exact `k_tor == k_lin`
+symmetry test in
+[A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest).
 
 ### A9 — `disk` meshes are accepted but cannot be solved
 
