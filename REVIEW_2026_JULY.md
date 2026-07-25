@@ -53,7 +53,7 @@ Priority ordering:
 | P0 | `K_ss` is near-singular (cond 9.1e9) and feeds the monolithic path too | [A2c](#a2c--the-support-stiffness-block-is-near-singular) |
 | P0 | `hollow_circle` / `solid_rectangle` / `solid_square` presets cannot be used | [A4](#a4--three-of-the-four-cross-section-presets-are-unusable) |
 | P1 | JIT the beam side and the body-force block | [4a](#4a-jit-the-beam-side-biggest-single-win-on-cpu), [4c](#4c-jit-_body_force_at_quads) |
-| P1 | `cudss_mtype_id` has two different defaults for the same key | [A5](#a5--cudss_mtype_id-has-two-conflicting-defaults) |
+| P1 | One `cudss_mtype_id` key serves two matrices that need different values; wrong value silently symmetrises. Fix planned in [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest) | [A5](#a5--cudss_mtype_id-has-two-conflicting-defaults) |
 | P1 | Mutable default arguments mutated in place | [A6](#a6--mutable-default-arguments-are-mutated-in-place) |
 | P2 | Dead code removal (~700 lines) | [Rule 1](#rule-1--does-this-need-to-exist) |
 | P2 | Collapse the three von Mises implementations | [2a](#2a-von-mises--cauchy-stress-written-three-times) |
@@ -434,12 +434,124 @@ The hazard is therefore worse than a mistuned option. With `mview_id`
 hard-coded to `0` (`CUDSS_MVIEW_FULL`, `coil_fem.py:441`) you hand cuDSS the
 complete matrix and then tell it which triangle it may ignore; declaring
 `SYMMETRIC` for the merged system yields the solution of a symmetrised matrix
-with no error raised. Use two distinct option keys
-(`cudss_mtype_id_coil` / `cudss_mtype_id_merged`), or derive the merged value
-from `support.k_tor == support.k_lin` and assert it at construction. If
-`k_tor ≡ k_lin` were adopted as the model (see
-[A2c](#a2c--the-support-stiffness-block-is-near-singular)), `1` would become
-valid for the merged matrix too, and cheaper than `0`.
+with no error raised.
+
+#### A5a — Fix: each block declares its own symmetry, `CoilFEM` takes the weakest
+
+Rather than pick a default, let the matrix type be *derived* from claims made
+by the objects that actually know the answer. No object infers another
+object's properties, and no caller has to remember a cuDSS integer.
+
+| Block | Owner of the claim | Claim | Why that owner |
+|---|---|---|---|
+| `K_cc` | `LinearElasticity3D` | `'symmetric'`, unconditionally | Property of the weak form. `k_tor` never enters it |
+| `K_ss`, `K_cs` / `K_sc` | `Support` | base: `'symmetric'`; `SupportBeams`: `'symmetric'` if `k_tor == k_lin` else `'general'` | `k_tor` is the only asymmetry source anywhere in the system ([A2c](#a2c--the-support-stiffness-block-is-near-singular)) |
+| merged | `CoilFEM`, derived | weakest of all contributing claims | A merged matrix is only as symmetric as its least symmetric block |
+
+**Vocabulary.** Solver-agnostic strings, matching the existing
+`coupling='staggered'|'monolithic'` and `shape='rect'|'disk'` style. The
+cuDSS-specific integers stay confined to `solvers/cudss.py`, which also
+removes the `0=general, 1=symmetric, …` enum currently written out in two
+separate docstrings (`coil_fem.py:131`, `solvers/__init__.py:49`) and keeps the
+information reusable if the `'amgx'` entry in `_VALID_SOLVERS` ever grows a
+backend.
+
+```python
+# solvers/cudss.py
+_MTYPE_ID  = {'general': 0, 'symmetric': 1, 'spd': 3}   # cuDSS mtype_id
+_STRENGTH  = {'general': 0, 'symmetric': 1, 'spd': 2}   # ordering for the meet
+
+def weakest_symmetry(*claims: str) -> str:
+    """Weakest (least-assuming) claim among ``claims``."""
+    return min(claims, key=_STRENGTH.__getitem__)
+```
+
+```python
+# problems/linear_elasticity.py
+@property
+def matrix_symmetry(self) -> str:
+    """``'symmetric'`` — elasticity tangent, Winkler mass term, symmetric BC elimination."""
+    return 'symmetric'
+
+# coupling/supports.py — uniform contract; base support adds no asymmetry
+@property
+def matrix_symmetry(self) -> str:
+    return 'symmetric'
+
+# coupling/beam_network.py
+@property
+def matrix_symmetry(self) -> str:
+    """``'symmetric'`` only when the torque and force laws share a modulus."""
+    return 'symmetric' if self._k_tor == self._k_lin else 'general'
+```
+
+**Consumption points.** Two, and neither needs new plumbing:
+
+- `build_fwd_pred(problem, problem_options)` already receives the problem, so it
+  reads `problem.matrix_symmetry` itself. `CoilFEM` passes nothing.
+- `build_monolithic_static` already holds `self.pipelines` and `self.support`,
+  so it computes
+  `weakest_symmetry(*[p.problem.matrix_symmetry for p in self.pipelines], self.support.matrix_symmetry)`
+  locally.
+
+**Override.** Keep `problem_options['cudss_mtype_id']` as an escape hatch, but
+warn when it disagrees with the derived value, naming both. Silence is the
+wrong default here because the failure mode is a wrong answer rather than an
+exception. Split into `cudss_mtype_id_coil` / `cudss_mtype_id_merged` only if
+overriding one path independently turns out to be needed.
+
+**Constraints the implementation must respect:**
+
+1. **Compare `k_tor == k_lin` exactly — do not reuse the `1e-6` relative
+   tolerance** that `CoilFEM` applies to `winkler_k` vs `k_lin`
+   (`coil_fem.py:313`). A `1e-6` relative difference in `k_tor` produces a
+   `~1e-6` relative asymmetry, which is nowhere near machine zero, and with
+   `mview = FULL` that silently symmetrises. **[measured]** the asymmetry is
+   `1.7e-17` at exact equality and `1.2e-3` at `k_tor = k_lin·1e-4`. Both are
+   Python floats set once from `beam_options`, so exact equality is both
+   achievable and the only safe test.
+2. **Never let anything auto-declare `'spd'`.** Definiteness is not a static
+   property: **[measured]** `K_cc` is SPD with `w = 1` everywhere but has five
+   eigenvalues within `1e-6` of zero with a 10 %-area clamp, because whether
+   the six rigid-body modes are pinned depends on runtime weight values.
+   Reserve `'spd'` for explicit opt-in. The cheap runtime verification already
+   exists and is being thrown away: `merged_solve` receives the matrix inertia
+   from cuDSS and discards it (`sol_flat, _inertia = solver_K(...)`,
+   `drivers.py:559`).
+3. **`mview_id` stays `0` (`CUDSS_MVIEW_FULL`)** — the full matrix is always
+   supplied. Document the `mtype`/`mview` pairing next to `_MTYPE_ID` so the
+   two cannot drift apart.
+
+**Scope, and what actually changes.** The per-coil claim only alters behaviour
+for `coupling='staggered'` with `solver='cudss'`: under `'monolithic'` the
+per-coil `fwd_pred` is never called for a solve, and the uncoupled path only
+ever sees a base `Support`, which already claims `'symmetric'`. So splitting
+the ownership is about correctness of ownership and about not paying ~2× flops
+and storage on the staggered path — not a broad speed-up. The one behaviour
+change to flag is on the merged side: a user running `k_tor == k_lin` today
+gets `mtype=0` (LU) and would get `mtype=1` (LDLᵀ) after this change, which is
+both valid and cheaper, but is a change.
+
+**Tests** (all matrix-assembly only; none require a solve):
+
+- `SupportBeams.matrix_symmetry` returns `'symmetric'` at `k_tor == k_lin` and
+  `'general'` otherwise, including at the boundary
+  `k_tor = k_lin * (1 + 1e-12)`.
+- `weakest_symmetry` returns `'general'` if any claim is `'general'`.
+- Assemble `K_ss` plus the coupling blocks and assert
+  `‖K − Kᵀ‖/‖K‖ < 1e-14` exactly when the derived claim is `'symmetric'`, and
+  `> 1e-6` when it is `'general'`. This is the test that validates the claim
+  against the matrix rather than against another line of code.
+- `LinearElasticity3D.matrix_symmetry == 'symmetric'`, with the same assembled
+  check on `K_cc` via `jax.jacfwd` of `compute_residual_vars`.
+- An explicit `cudss_mtype_id` that disagrees with the derived value warns.
+
+Finally, note that if `k_tor ≡ k_lin` were adopted as the model rather than
+left as a free parameter (see
+[A2c](#a2c--the-support-stiffness-block-is-near-singular)), `SupportBeams`
+would claim `'symmetric'` unconditionally and this whole mechanism would
+reduce to a single constant — which is an argument for settling that modelling
+question first.
 
 ### A6 — Mutable default arguments are mutated in place
 
@@ -1028,6 +1140,11 @@ anyway, or keeping `_jit_J` only for the `run()`-style diagnostic path.
 
 - `CoilFEM.meshes` rebuilds a list on every access and is read inside
   `_solve_all`'s per-coil loop. Cache it.
+- `ElasticPipeline.__init__` calls `build_fwd_pred` unconditionally
+  (`pipelines.py:75`), so on the monolithic cuDSS path every coil constructs a
+  `CuDSSNewtonSolver` — CSR pattern, BC metadata, and a cuDSS device handle —
+  that is then never used, since `solve_monolithic` goes through
+  `merged_solve`. Build it lazily on first `solve()`.
 - `_local_stiffness.single_beam` builds a 12×12 with 44 separate
   `.at[i, j].set(...)` calls (`beam_network.py:888-944`). Under `vmap` + jit
   XLA folds these, but a single `jnp.zeros((12,12)).at[rows, cols].set(vals)`
@@ -1193,7 +1310,10 @@ ancestor of `coil_fem.py`). Worth deleting from the working tree.
    [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) (report
    non-convergence; revisit the `ω ≥ 0.1` clamp),
    [A4](#a4--three-of-the-four-cross-section-presets-are-unusable),
-   [A5](#a5--cudss_mtype_id-has-two-conflicting-defaults),
+   [A5](#a5--cudss_mtype_id-has-two-conflicting-defaults) (plan in
+   [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest);
+   settle the `k_tor ≡ k_lin` question first, since it may collapse the whole
+   mechanism to a constant),
    [A6](#a6--mutable-default-arguments-are-mutated-in-place). Add a regression
    test that takes `jax.grad` through a *real* `SupportBeams`, not a constant
    mock, and one that asserts BG-S actually converges rather than only that it
