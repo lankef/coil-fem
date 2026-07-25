@@ -54,6 +54,7 @@ Priority ordering:
 | P0 | `hollow_circle` / `solid_rectangle` / `solid_square` presets cannot be used | [A4](#a4--three-of-the-four-cross-section-presets-are-unusable) |
 | P1 | JIT the beam side and the body-force block | [4a](#4a-jit-the-beam-side-biggest-single-win-on-cpu), [4c](#4c-jit-_body_force_at_quads) |
 | P1 | One `cudss_mtype_id` key serves two matrices that need different values; wrong value silently symmetrises. Fix planned in [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest) | [A5](#a5--cudss_mtype_id-has-two-conflicting-defaults) |
+| P1 | cuDSS defaults to a host-syncing Newton loop for an affine problem, arming a jit trap. Fix planned in [3f-plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop) | [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop) |
 | P1 | Mutable default arguments mutated in place | [A6](#a6--mutable-default-arguments-are-mutated-in-place) |
 | P2 | Dead code removal (~700 lines) | [Rule 1](#rule-1--does-this-need-to-exist) |
 | P2 | Collapse the three von Mises implementations | [2a](#2a-von-mises--cauchy-stress-written-three-times) |
@@ -592,9 +593,21 @@ breaks tracing in [A1](#a1--jaxgrad-through-solve_staggered-raises).
 
 This only bites on `coupling='staggered'` with `solver='cudss'`, or the
 uncoupled cuDSS path (the monolithic path never calls `fwd_pred`), but it is a
-sharp edge. `LinearElasticity3D` is linear by construction — default
-`linear=True` when the problem is a `LinearElasticity3D`, or drop the
-non-linear branch entirely (see [3f](#3f-the-non-linear-newton-branch-is-ballast)).
+sharp edge.
+
+**Fix: adopt the [3f plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop).**
+`LinearElasticity3D` is affine in `u` by construction, so declaring
+`is_linear = True` on the problem and deleting the iterative branch removes
+both `float(jnp.linalg.norm(...))` calls outright. That closes this item rather
+than working around it: with no host sync left in `newton_loop`, the `jax.jit`
+that `CoilFEMObjective` switches on for `solver == 'cudss'` becomes valid
+instead of latent, and the same construct can no longer break `jax.grad` the
+way it does in [A1](#a1--jaxgrad-through-solve_staggered-raises).
+
+Do not fix it the other way round — by leaving the loop and setting
+`cudss_linear=True` at the call sites — since that leaves a default that is
+wrong for every problem in the repo, and leaves the trap armed for the next
+caller who omits the flag.
 
 ### A8 — Unreachable default-from-support branch
 
@@ -995,10 +1008,82 @@ read with `ep.get('is_foundation', False)`.
 `CuDSSNewtonSolver.newton_loop` has a full Newton iteration with residual
 norms and host syncs (`cudss.py:457-485`) for a codebase whose only `Problem`
 is `LinearElasticity3D`. The `linear=True` fast path is the correct one and is
-16 lines. Given [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop),
-consider deleting the iterative branch (and `tol`/`rel_tol`/`max_iter`) until a
-non-linear problem exists; jax-fem's own `ad_wrapper` is available as the
+16 lines.
+
+#### 3f-plan — Declare linearity on the problem and delete the loop
+
+**Why it is safe.** `LinearElasticity3D`'s residual is exactly affine in `u`:
+the stress `λ tr(ε − ε_th) I + 2μ(ε − ε_th)` has `ε_th` as a constant offset,
+the body-force term does not involve `u`, the Winkler term
+`∫ k w (u − u_att)·v dS` is affine, and Dirichlet conditions are imposed by
+symmetric elimination. So `R(u) = K u − f`, and a single Newton step from
+`u = 0` *is* the solution — the increment returned by `solve_step` is the
+answer, with the post-step residual zero to round-off. Geometry enters through
+`params['points']`, which is a parameter rather than the unknown, so nothing
+in the differentiable pipeline makes the solve non-linear.
+
+**Scope — smaller than it looks.** Two paths are unaffected:
+
+- `coupling='monolithic'` already performs exactly one assemble and one solve.
+  `solve_monolithic` goes through `merged_solve` and never calls
+  `newton_loop`.
+- The CPU backends are untouched. On `umfpack`/`petsc`, `build_fwd_pred`
+  returns jax-fem's `ad_wrapper`, whose Newton loop lives inside
+  `jax_fem.solver.solver()`; the `linear` flag never reaches it.
+
+The change therefore affects `coupling='staggered'` with `solver='cudss'` and
+the uncoupled cuDSS path — which is precisely where
+[A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop) bites.
+
+**How.** Not by hard-coding `linear=True` inside `build_fwd_pred`.
+`cudss_ad_wrapper` is a general utility, and one Newton step on a genuinely
+non-linear problem is a *silently wrong answer* — a bad property to bake into
+the wrapper. Declare it on the problem instead, as the same kind of static
+claim as `matrix_symmetry` in
+[A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest),
+so the two live side by side and `build_fwd_pred` reads both from the object
+it already receives:
+
+```python
+# problems/linear_elasticity.py
+class LinearElasticity3D(DeviceProblem):
+    is_linear = True                  # R(u) = K u - f exactly
+    matrix_symmetry = 'symmetric'     # see A5a
+```
+
+Then **delete** the iterative branch rather than leaving it dormant, and have
+`build_fwd_pred` raise on the cuDSS path when a problem declares
+`is_linear = False`. That satisfies YAGNI — there is no non-linear problem in
+the repo and `HeatConduction3D` is a stub
+([1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs)) — while making a
+future mistake loud instead of silent. jax-fem's `ad_wrapper` remains the
 fallback for anything non-linear.
+
+**What this removes:**
+
+- the iteration branch, `cudss.py:457-485`;
+- `tol`, `rel_tol`, `max_iter` on `CuDSSNewtonSolver` and `cudss_ad_wrapper`;
+- the `cudss_tol`, `cudss_rel_tol`, `cudss_max_iter`, and `cudss_linear`
+  option keys, plus their docstring entries in `coil_fem.py:133-135`,
+  `solvers/__init__.py:50-55`, and `cudss.py:295-302`;
+- the two `float()` host syncs, which is what closes
+  [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop).
+
+**One caveat: keep a way to detect a bad factorisation.** With no residual
+check, a singular or near-singular `K` yields garbage silently — and that is
+not hypothetical here, since
+[A2c](#a2c--the-support-stiffness-block-is-near-singular) measures
+`cond(K_ss) = 9.1 × 10⁹`. The iterative branch at least reported a large
+residual. The cheap replacement already exists and is being discarded: cuDSS
+returns the matrix inertia at both `cudss.py:408`
+(`inc, _inertia = self.cudss(...)`) and `drivers.py:559`, and both throw it
+away. Surface it, or assert on it under a debug flag, and the deletion loses
+nothing.
+
+**Tests:** assert `‖K u − f‖ / ‖f‖ < 1e-10` after the single solve on a small
+problem (which is the claim `is_linear` makes, checked against the matrix
+rather than against another line of code), and assert that
+`build_fwd_pred` raises for a stub problem with `is_linear = False`.
 
 ---
 
@@ -1322,7 +1407,12 @@ ancestor of `coil_fem.py`). Worth deleting from the working tree.
    [1b](#1b-placeholder-implementations-that-the-architecture-no-longer-uses),
    [1d](#1d-single-use-wrappers-that-add-a-hop-without-adding-meaning), and the
    unused imports in [3d](#3d-unused-imports-and-locals-pyflakes). This shrinks
-   the surface everything else has to be checked against.
+   the surface everything else has to be checked against. Take the
+   [3f plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop)
+   here too: it closes [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop)
+   by deletion rather than by adding a flag, and it pairs naturally with
+   [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)
+   since both add a static claim to the same problem class.
 4. **Unify.** One constitutive kernel
    ([2a](#2a-von-mises--cauchy-stress-written-three-times)), one Rodrigues,
    one set of symmetry transforms
