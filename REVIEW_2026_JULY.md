@@ -970,6 +970,115 @@ staggered path `compute_weights`, `compute_attach`, and the two inside
 - `beam_network._check_beam_counts` and `coil_fem._broadcast_mesh_opts` both
   hand-roll "scalar or length-N sequence" broadcasting.
 
+### 2j. `_solve_all` builds the same result dict twice; the uncoupled driver is missing
+
+`_solve_all` ends in two hand-built dictionaries that agree on six of seven
+keys:
+
+```754:777:src/coil_fem/coil_fem.py
+            return {
+                'sol_list_by_coil': result['sol_list_by_coil'],
+                'pts_by_coil':      pts_by_coil,
+                ...
+                'u_s':              result['u_s'],
+            }
+
+        # Uncoupled: independent per-coil solves
+        sol_list_by_coil = [
+            self.pipelines[i].solve(pts_by_coil[i], bf_by_coil[i], wt_by_coil[i])['sol_list']
+            for i in range(n_base)
+        ]
+        return {
+            'sol_list_by_coil': sol_list_by_coil,
+            'pts_by_coil':      pts_by_coil,
+            ...
+            'u_s':              None,
+        }
+```
+
+The only differences are where `sol_list_by_coil` comes from and whether `u_s`
+is a value or `None`. The reason the second block exists inline rather than
+behind a driver is simply that the uncoupled driver was never written — the
+`drivers.py` module docstring already describes drivers as the things that
+"replace the uncoupled per-coil loop inside `CoilFEM`", so the loop it refers
+to is still sitting in `CoilFEM`.
+
+#### 2j-plan — Extract `solve_uncoupled` for a uniform driver contract
+
+Add the missing member so all three modes share one signature and one return
+shape, and `_solve_all` reduces to a single dispatch and a single `return`:
+
+```python
+# coupling/drivers.py
+def solve_uncoupled(pipelines, support, params) -> dict:
+    """Independent per-coil FEM solves; no support DOFs.
+
+    Returns the same keys as :func:`solve_staggered` with ``u_s = None``.
+    """
+```
+
+Take `support` even though it is unused, so the three drivers are
+interchangeable at the call site — that is what turns the dispatch into a
+lookup rather than nested conditionals.
+
+**One wrinkle to resolve first.** The contract is not actually uniform today:
+`solve_monolithic(pipelines, support, params, static)` takes a fourth
+argument. Two ways to fix it, either acceptable:
+
+- bind it at construction with
+  `functools.partial(solve_monolithic, static=self.monolithic_static)`, which
+  also removes a `self.monolithic_static` read from the per-evaluation path; or
+- move `static` into `params`, consistent with how every other driver input is
+  already passed.
+
+`_solve_all` then becomes roughly:
+
+```python
+driver = solve_uncoupled if not self.support.is_coupled else self._driver
+result = driver(self.pipelines, self.support, driver_params)
+return {
+    'sol_list_by_coil': result['sol_list_by_coil'],
+    'pts_by_coil':      pts_by_coil,
+    ...
+    'u_s':              result['u_s'],
+}
+```
+
+**Also worth carrying through:** all three drivers return a `'diagnostics'`
+key that `_solve_all` currently discards in both branches. A uniform contract
+is where the non-convergence reporting from
+[A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) would land, so
+plumb `diagnostics` out rather than dropping it.
+
+**The payoff that matters most.** The uncoupled path is currently the only one
+where `jax.grad` works on CPU — monolithic raises `NotImplementedError` unless
+`solver='cudss'`, and staggered raises `ConcretizationTypeError`
+([A1](#a1--jaxgrad-through-solve_staggered-raises)). Today that working path is
+the fall-through `else` of a function whose coupled branch carries the dead IFT
+`custom_vjp`, the host syncs, and the non-convergent loop. Separating them means
+that acting on A1 — whether by rewriting `solve_staggered` around
+`lax.while_loop` or deleting it and declaring the mode forward-only — cannot
+regress the one path that works end to end.
+
+**Explicit non-goals.** Keep the scope to the extraction. In particular, do
+*not* also:
+
+- add `'uncoupled'` to `_VALID_COUPLING`;
+- derive the mode from `support.is_coupled` and validate an explicit
+  `coupling` against it.
+
+Dispatch stays keyed on `support.is_coupled` first, then `self.coupling`, as
+it is now. (Noted for the record: this leaves
+`CoilFEM(..., support=Support(), coupling='monolithic')` silently ignoring
+`coupling`, and leaves `coupling='monolithic'` as a default that is untrue for
+every base-`Support` problem. Deliberate — revisit separately if it ever
+causes confusion.)
+
+**Tests:** call each of the three drivers directly with the same
+`driver_params` and assert the returned dict has identical keys; assert
+`solve_uncoupled` reproduces the current per-coil results bit-for-bit on a
+base-`Support` problem.
+
 ---
 
 ## Rule 3 — Replaceable by stdlib, a native feature, or an installed dependency
@@ -1463,7 +1572,10 @@ ancestor of `coil_fem.py`). Worth deleting from the working tree.
    [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)
    since both add a static claim to the same problem class.
 4. **Unify.** One constitutive kernel
-   ([2a](#2a-von-mises--cauchy-stress-written-three-times)), one Rodrigues,
+   ([2a](#2a-von-mises--cauchy-stress-written-three-times)), the missing
+   `solve_uncoupled` driver so the three modes share one contract
+   ([2j-plan](#2j-plan--extract-solve_uncoupled-for-a-uniform-driver-contract)),
+   one Rodrigues,
    one set of symmetry transforms
    ([2b](#2b-rotation-and-symmetry-primitives-written-twice)), one
    `curves_from_dofs` ([2e](#2e-curves_jax-rebuilt-in-eight-places)), one FE
