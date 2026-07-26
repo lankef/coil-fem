@@ -16,220 +16,125 @@ across `src/`, `tests/`, `examples/`, and `docs/`.
 
 ---
 
+## Status
+
+Reviewed 2026-07-24. **Revised 2026-07-25** with the author's decisions folded
+in, so most items now read as *decisions* rather than options. Items marked
+**Resolved** are already applied; **Excluded** means an unfinished feature that
+is out of scope; **Declined** means considered and not taken.
+
 ## Executive summary
 
-Three findings are worth acting on before anything cosmetic:
+Two findings drive everything else:
 
-1. **`jax.grad` through the staggered driver does not work.** It raises
-   `ConcretizationTypeError`, and the `custom_vjp` that the docstring
-   advertises as providing implicit-function-theorem gradients is bypassed
-   even in principle. **[measured]**
-2. **The staggered driver is dominated by un-jitted JAX dispatch, not by the
-   FEM solves it exists to coordinate.** A forward-only 2-coil objective takes
-   29 s, of which roughly 20 s is eager beam assembly that jits down to under
-   a millisecond. **[measured]**
-3. **The coupled operator is non-self-adjoint with an indefinite symmetric
-   part whenever `k_tor ≠ k_lin`**, and that is what stops the block
-   Gauss–Seidel loop from ever reaching a fixed point: it marches along a
-   single direction with eigenvalue 1.0000044 while the residual stays flat
-   from sweep ~7, then returns the unconverged state with no warning. The
-   behaviour is independent of coil shape, attachment locality, and `k_lin`,
-   but `k_tor` controls it exactly — at `k_tor = k_lin` the matrix becomes
-   symmetric to machine precision, positive definite, and 4 orders of
-   magnitude better conditioned. The same `K_ss` feeds the monolithic cuDSS
-   path, so this is not confined to the deprioritised driver. **[measured]**
+1. **Staggered coupling is being retired.** `jax.grad` through it raises
+   `ConcretizationTypeError`, the `custom_vjp` its docstring advertises as
+   providing implicit-function-theorem gradients is bypassed even in
+   principle, and the block Gauss–Seidel iteration never reaches a fixed
+   point. `solve_staggered` will raise `NotImplementedError`; the numerical
+   analysis is preserved in `notes/PLANS.md`. **[measured]**
+2. **`k_tor ≠ k_lin` makes the coupled operator non-self-adjoint with an
+   indefinite symmetric part, and this is *not* fixed by retiring staggered.**
+   The same `K_ss` feeds the merged monolithic matrix, at `cond = 9.1 × 10⁹`
+   with four negative eigenvalues out of 48. At `k_tor = k_lin` the matrix
+   becomes symmetric to machine precision, positive definite, and four orders
+   of magnitude better conditioned. **[measured]**
 
-Beyond that, roughly 600 lines across the package have no caller anywhere in
-`src/`, `tests/`, `examples/`, or `docs/`, the von Mises stress kernel is
-written out three times, and the beam-network assembly recomputes the same
-per-endpoint weights and moment arms two to four times per evaluation.
+Behind those: roughly 500 lines have no caller anywhere in `src/`, `tests/`,
+`examples/`, or `docs/`; the von Mises kernel is written out three times; the
+beam-network assembly recomputes the same per-endpoint weights and moment arms
+two to four times per evaluation; and on CPU the un-jitted pure-JAX code costs
+more than twice as much as the sparse solves it feeds.
 
 Priority ordering:
 
 | Priority | Item | Where |
 |---|---|---|
-| P0 | Staggered gradient is broken; the IFT `custom_vjp` is dead | [A1](#a1--jaxgrad-through-solve_staggered-raises) |
-| P0 | Coupled system has a marginal mode; BG-S never converges and says nothing | [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) |
-| P0 | `K_ss` is near-singular (cond 9.1e9) and feeds the monolithic path too | [A2c](#a2c--the-support-stiffness-block-is-near-singular) |
-| P0 | `hollow_circle` / `solid_rectangle` / `solid_square` presets cannot be used | [A4](#a4--three-of-the-four-cross-section-presets-are-unusable) |
+| P0 | `k_tor ≠ k_lin` leaves `K_ss` near-singular; inherited by the monolithic path | [A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular) |
+| P0 | Retire the staggered driver and delete its body | [A1](#a1--staggered-coupling-is-disabled-by-decision), [2c](#2c-_sweep-and-_sweep_full-are-the-same-function) |
+| P1 | Derive the cuDSS matrix type from per-block symmetry claims | [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest) |
+| P1 | Declare `is_linear` and delete the Newton branch; closes the jit trap | [3f-plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop), [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop) |
 | P1 | JIT the beam side and the body-force block | [4a](#4a-jit-the-beam-side-biggest-single-win-on-cpu), [4c](#4c-jit-_body_force_at_quads) |
-| P1 | One `cudss_mtype_id` key serves two matrices that need different values; wrong value silently symmetrises. Fix planned in [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest) | [A5](#a5--cudss_mtype_id-has-two-conflicting-defaults) |
-| P1 | cuDSS defaults to a host-syncing Newton loop for an affine problem, arming a jit trap. Fix planned in [3f-plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop) | [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop) |
 | P1 | Mutable default arguments mutated in place | [A6](#a6--mutable-default-arguments-are-mutated-in-place) |
-| P2 | Dead code removal (~700 lines) | [Rule 1](#rule-1--does-this-need-to-exist) |
+| P2 | Dead-code removal | [Rule 1](#rule-1--does-this-need-to-exist) |
 | P2 | Collapse the three von Mises implementations | [2a](#2a-von-mises--cauchy-stress-written-three-times) |
+| P2 | Unify rotation and symmetry primitives into `geo/symmetries` | [2b](#2b-rotation-and-symmetry-primitives-written-twice) |
 | P2 | Replace per-endpoint Python loops with `vmap` | [4b](#4b-replace-per-endpoint-python-loops-with-vmap) |
 | P3 | Redundant geometry recomputation (volume 3×, surface 3×) | [2d](#2d-fe-geometry-recomputed-three-times-per-coil-per-evaluation) |
-| P3 | `Support` reaches into `CoilFEM` privates for plotting/VTU | [P2](#philosophy-2--support-must-be-independent-of-coilfem) |
+| P3 | `Support` reaches into `CoilFEM` privates for plotting/VTU | [Philosophy 2](#philosophy-2--support-must-be-independent-of-coilfem) |
+
+**Resolved during the revision:** [A10](#a10--resolved-k_lin--k_tor-units-corrected)
+(`k_lin` / `k_tor` documented as N/m³) and
+[1e](#1e-resolved-copy-pasted-property-docstrings) (`nfp` / `stellsym` /
+`beam_options` docstrings).
+
+**Excluded as unfinished features:**
+[A4](#a4--excluded-cross-section-presets-are-incomplete) (cross-section
+presets) and [A9](#a9--excluded-disk-meshes-are-incomplete) (disk meshes).
+
+**Declined:** [1d](#1d-single-use-wrappers--declined) (single-use wrappers),
+the `print()` summary and `kwargs is None` check in
+[Philosophy 3 / 4](#philosophy-3--4--simsopt-wrappers), and the
+`set_params` mutation in
+[Philosophy 1](#philosophy-1--coilfem-as-a-functional-container), which is
+idiomatic jax-fem.
 
 ---
 
 ## A. Correctness issues found while applying the rules
 
 These are not rule violations as such, but they came out of the same reading
-pass and they change what the rule-driven cleanup should look like — there is
-no point tidying machinery that does not run.
+pass. Each carries the decision taken in the 2026-07-25 review pass.
 
-### A1 — `jax.grad` through `solve_staggered` raises
+### A1 — Staggered coupling is disabled by decision
 
-**[measured]** With a genuinely coupled `SupportBeams` and
-`coupling='staggered'`, the forward pass works but the gradient does not:
+**Decision: make `solve_staggered` raise `NotImplementedError`.** Coupled
+supports use `coupling='monolithic'`. The full numerical analysis and the
+measurements behind it are recorded in `notes/PLANS.md` under *Issue:
+Staggered coupling is numerically unsound*; only the summary is kept here.
 
-```
-=== forward staggered ===
-J = 0.36798387349276307
-=== grad through staggered ===
-ConcretizationTypeError: Abstract tracer value encountered where concrete
-value is expected: traced array with shape float64[]
-The problem arose with the `float` function.
-```
+Three defects were found, of mixed kind, which is why the driver is being
+retired rather than repaired piecemeal:
 
-The failure is in the convergence check:
+- **Numerical.** The block Gauss–Seidel map has an eigenvalue of essentially
+  exactly 1 (measured `1.0000047`). The residual is flat from roughly sweep 7
+  while `‖u_s‖` marches along a fixed direction with a per-sweep increment
+  constant to four digits, so there is no fixed point to reach along that
+  direction. Aitken cannot help, and the effective relaxation factor sits on
+  its `max(0.1, ...)` clamp floor regardless. Independent of coil shape,
+  attachment locality, and `k_lin`. **[measured]**
+- **Numerical / modelling.** `k_tor ≠ k_lin` makes the coupled operator
+  non-self-adjoint with an indefinite symmetric part. This one is **not**
+  fixed by disabling the staggered driver — see
+  [A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular).
+- **Programming.** `jax.grad` through the driver raises
+  `ConcretizationTypeError` from `float(jnp.max(jnp.abs(delta)))` in
+  `_run_iterations`. The docstrings advertise `jax.lax.custom_root`, which does
+  not exist anywhere in the file; the `_staggered_core` `custom_vjp` that does
+  exist is an identity applied *after* the Python loop, is bypassed by
+  `sol_list_by_coil` (the only output the objective consumes), and would
+  double-count against the unrolled iteration history if it were reached.
+  Separately, `_run_iterations` records `last_sol_list` *before* the Aitken
+  update, so the returned `sol_list_by_coil` and `u_s` are one relaxation step
+  out of sync. **[measured]**
 
-```321:341:src/coil_fem/coupling/drivers.py
-        for k in range(max_iters):
-            u_s_new, sol_list = _sweep_full(u_s)
-            delta = u_s_new - u_s          # f(u_s) = T(u_s) - u_s
-            res   = float(jnp.max(jnp.abs(delta)))
-```
+The existing test does not catch the gradient failure because
+`test_staggered_fixed_point_trivial` uses a mock support whose `solve` returns
+a constant `jnp.zeros`, which keeps `delta` concrete.
 
-Under `jax.grad`, `u_s_new` carries tracers (it depends on the coil DOFs
-through the FEM solves), so `float(...)` cannot be evaluated. The existing
-test suite does not catch this because `test_staggered_fixed_point_trivial`
-uses a mock support whose `solve` returns a *constant* `jnp.zeros`, which
-keeps `delta` concrete.
+**What to delete with it.** Once the function raises immediately, its whole
+body is dead: `_sweep`, `_sweep_full`, `_run_iterations`, `_staggered_core`
+with its `fwd`/`bwd` pair, and the unreachable `options` plumbing
+([1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs)). See
+[2c](#2c-_sweep-and-_sweep_full-are-the-same-function).
 
-The `custom_vjp` machinery around it is dead in three separate ways, so
-fixing the `float()` alone would not give correct gradients:
+### A2 — Unequal `k_tor` and `k_lin` make the coupled operator near-singular
 
-- The module docstring and `solve_staggered`'s docstring both say the fixed
-  point is "wrapped in `jax.lax.custom_root`". There is no `custom_root`
-  anywhere in the file. What exists is `_staggered_core`, a `@jax.custom_vjp`
-  **identity** applied to `u_s_star` *after* the Python loop has already run.
-- The objective consumes `sol_list_by_coil`, not `u_s`. `sol_list_by_coil`
-  comes straight out of the last `_sweep_full` call and never passes through
-  `_staggered_core`, so the metric gradient would not see the IFT correction
-  even if the loop were traceable.
-- `_staggered_core_bwd` returns the GMRES solution as the cotangent with
-  respect to its own input, which then *also* propagates back through the
-  unrolled iteration history — double counting. The code comment
-  (`drivers.py:400-405`) effectively concedes this: "the closure params …
-  flow through the standard autodiff path".
+This is the finding that survives disabling the staggered driver, because the
+same `K_ss` and coupling blocks are assembled into the merged monolithic
+matrix.
 
-Two honest options:
-
-1. Delete `_staggered_core`, `_sweep`, and the IFT prose, and document
-   `solve_staggered` as forward-only (which matches the philosophy point that
-   monolithic + cuDSS is the path that matters for optimisation).
-2. Rewrite the fixed point as a `lax.while_loop` with a bounded trip count and
-   put a real `custom_vjp` (or `lax.custom_root`) around the *whole* solve so
-   that both `u_s*` and `sol_list` are outputs of the differentiated
-   primitive. This also makes the loop jittable, which is where most of the
-   CPU time is going ([4a](#4a-jit-the-beam-side-biggest-single-win-on-cpu)).
-
-### A2 — Block Gauss–Seidel does not converge, and says nothing
-
-**[measured]** On a 2-coil, 4-beam network the loop runs all 100 sweeps:
-
-```
-BG-S sweeps: 100   J = 0.36798387349276307
-```
-
-`_run_iterations` breaks on `res < atol` and otherwise falls out of the `for`
-loop and returns whatever it has. There is no warning, no diagnostic, and
-`result['diagnostics']` is hard-coded to `{}` (`drivers.py:424`). A caller has
-no way to know the answer is not a fixed point.
-
-The reporting gap is the easy half to fix: emit a warning with the final
-residual and populate `diagnostics` with
-`{'iterations', 'residual', 'converged'}`. The harder half is why it does not
-converge.
-
-#### A2a — It is not the coil geometry, the clamp, or the stiffness
-
-The first run used the repo's own fixtures: `_make_curves` from
-`tests/test_beam_networks.py`, which is **coplanar circles** of radius 1.0 and
-1.1 in the *xz*-plane, and `_uniform_clamp_fn`, which returns weight 1.0 at
-*every* surface quadrature point — so each of the three beam endpoints touching
-coil 0 clamps its entire 0.74 m² surface (300 % of the coil area in aggregate).
-That is a soft configuration in one sense and a pathological one in another, so
-I re-ran it across the axes that normally govern block Gauss–Seidel
-convergence. **[measured]**, all with `max_iters = 100`:
-
-| Coil shape | Attachment | `k_lin` | Sweeps | Residual `max|T(u)−u|` |
-|---|---|---:|---:|---|
-| Coplanar circles R = 1.0, 1.1 | uniform, 300 % of area | 1e8 | 100 | 9.7e-6 → 1.19e-5, flat from k≈7 |
-| Coplanar circles R = 1.0, 1.1 | sigmoid ball r = 0.06, 9.4 % of area | 1e8 | 100 | 9.5e-4 → 3.34e-4, flat from k≈7 |
-| Coplanar circles R = 1.0, 1.1 | sigmoid ball r = 0.06 | 1e5 | 100 | 9.5e-1 → 3.39e-1, flat from k≈7 |
-| Offset, non-coplanar circles (Δy = 0.45) | sigmoid ball r = 0.06 | 1e8 | 100 | 2.113e-2 → 2.119e-2, never decreases |
-
-So it is not caused by the coil shape (the non-coplanar case is *worse* — the
-residual never decreases at all), not by the whole-surface clamp in the
-fixture, and not by the coupling stiffness (the residual scales exactly as
-`1/k_lin` while the iteration behaviour is identical). Non-planar,
-randomly-perturbed order-3 coils were also tried but did not complete within
-the review budget; see [A2d](#a2d--higher-order-curves-are-pathologically-slow).
-
-This is the opposite of the usual expectation that irregular coil shapes
-destabilise the partitioned scheme. It already fails on two concentric
-circles, which is about the most benign geometry available.
-
-#### A2b — The iteration marches along a mode with eigenvalue 1.0000044
-
-Instrumenting the sweep (recording `u_s` on the way into `compute_attach` and
-on the way out of `support.solve`) shows the signature clearly. Offset-circle
-case, `k_lin = 1e8`, `k_tor = 1e4`: **[measured]**
-
-```
-   k    omega_effective   ||T(u)-u||     ||u_s||
-   0         1.000000     3.378882e-02   0.000000e+00
-   1         0.100000     3.451686e-02   3.378882e-02
-   ...
-  14         0.100000     3.456616e-02   7.852101e-02
-  15         0.100000     3.456624e-02   8.196935e-02
-  16         0.180800     3.456606e-02   8.541803e-02
-  ...
-  20         2.000000     3.453636e-02   1.772595e-01
-  21         2.000000     3.451431e-02   2.462480e-01
-  22         0.100000     3.452460e-02   3.151921e-01
-  ...
-  28         0.100000     3.452555e-02   3.358820e-01
-
-cos angle between successive late increments: 0.999999989
-ratio of successive late increment norms:     1.000004660
-```
-
-Three things to read off this:
-
-- `‖T(u) − u‖` is constant to three digits for 29 sweeps. It never decays.
-- `‖u_s‖` grows with a per-sweep increment that is constant to four digits, and
-  the increment *direction* is fixed: successive increments have
-  `cos = 0.999999989` with a norm ratio of `1.0000047`.
-- The effective relaxation factor sits on the clamp floor `0.1` most of the
-  time, with excursions to the ceiling `2.0`.
-
-A fixed direction reproduced with ratio ≈ 1 means the BG-S map `T(u) = Au + b`
-has an eigenvalue of essentially exactly 1 (marginally above it), and the
-residual has a component in that eigenspace. There is therefore no fixed point
-to converge to along that direction, and the iteration translates along it
-forever. Aitken cannot rescue this: for a unit eigenvalue no scalar `ω`
-produces a correction in that direction, and the clamp
-
-```333:333:src/coil_fem/coupling/drivers.py
-                    omega = max(0.1, min(2.0, omega))
-```
-
-separately forbids the strong under-relaxation (`ω ≪ 0.1`) that a marginally
-stable coupling would need even if the mode were merely stiff rather than
-singular. That clamp is worth revisiting on its own merits.
-
-The one stiffness that *does* control the mode is `k_tor`; see
-[A2c](#a2c--the-support-stiffness-block-is-near-singular).
-
-#### A2c — The support stiffness block is near-singular
-
-Assembling `K_ss` and the coupling blocks directly and sweeping `k_tor` with
-`k_lin = 1e8` fixed **[measured]**:
+Sweeping `k_tor` with `k_lin = 1e8` fixed **[measured]**:
 
 | `k_tor` | `‖K_ss − K_ssᵀ‖/‖K_ss‖` | `‖K_cs − K_scᵀ‖/‖K_cs‖` | negative eigenvalues of `sym(K_ss)` | `σ_min(K_ss)` | cond `K_ss` |
 |---:|---|---|---:|---|---:|
@@ -237,13 +142,13 @@ Assembling `K_ss` and the coupling blocks directly and sweeping `k_tor` with
 | 1e6 | 1.236e-03 | 2.699e-02 | 4 / 48 | 1.695e+00 | 9.10e7 |
 | 1e8 (= `k_lin`) | **1.7e-17** | **0.0 exactly** | **0 / 48** | 1.611e+02 | 9.58e5 |
 
-`k_tor` is the knob. `σ_min(K_ss)` tracks it linearly over four decades, and at
+`σ_min(K_ss)` tracks `k_tor` linearly over four decades, and at
 `k_tor = k_lin` the four negative eigenvalues of the symmetric part vanish, the
 matrix becomes symmetric to machine precision, and the condition number drops
-by four orders of magnitude. So the weak subspace is exactly the rotational
-DOFs, whose only external stiffness is `k_tor`.
+by four orders of magnitude. The weak subspace is exactly the rotational DOFs,
+whose only external stiffness is `k_tor`.
 
-The reason is structural rather than a tuning accident.
+The cause is structural rather than a tuning accident.
 `_spring_stiffness_contributions` writes the translation–rotation block as
 `−k_lin Σ w [r]×` and the torque–translation block as `+k_tor Σ w [r]×`
 (`beam_network.py:1797-1803`). Since `[r]×ᵀ = −[r]×`, the transpose of the
@@ -255,123 +160,66 @@ unconditionally, and the bare beam `K_global = Γ K_local Γᵀ` is symmetric by
 congruence, so **`k_tor` is the only source of asymmetry in the whole merged
 system**, and it enters both the diagonal `K_ss` and the off-diagonal coupling.
 
-A non-self-adjoint operator whose symmetric part is indefinite is exactly the
-setting in which a partitioned Dirichlet–Neumann iteration has a growing mode,
-which is what [A2b](#a2b--the-iteration-marches-along-a-mode-with-eigenvalue-10000044)
-observes. This looks like a modelling choice with numerical consequences rather
-than a coding defect: the torque law `τ = k_tor Σ w r × Δu` with an independent
-`k_tor` is what breaks self-adjointness. A single foundation modulus (a genuine
-distributed spring bed, `k_tor ≡ k_lin`) would make the entire merged system
-symmetric positive definite for free — worth deciding deliberately, since
-`CoilFEM` already enforces `winkler_k == k_lin` but places no constraint on
-`k_tor`.
-
-A condition number of 9 × 10⁹ on a 48 × 48 matrix has two further direct
-consequences:
+Two direct consequences of `cond = 9.1 × 10⁹` on a 48 × 48 matrix:
 
 1. `SupportBeams.solve` densifies this block and factors it with
    `lineax.LU()` (`beam_network.py:2024-2037`), losing roughly 10 of 16
    digits.
-2. The **same** `K_ss` values go into the merged monolithic matrix via
-   `make_merged_solve` — so this is not confined to the staggered path that
-   the philosophy deprioritises. It sits in the cuDSS path too.
+2. The same values go into the merged monolithic matrix via
+   `make_merged_solve`, so the conditioning is inherited by the cuDSS path.
 
-Two further defects in the same rotational subspace, which compound the above:
+Two further defects in the same rotational subspace, which compound it:
 
 - **The CF foundation endpoint provides no rotational grounding at all.**
   `_endpoint_weights_and_r` sets `r_fnd = x_foundation[i][j] - geom['x_end'][b]`
   where `geom['x_end'][b]` *is* `x_foundation[i][j]` (the code says so at
   `beam_network.py:1704`), so `r_fnd ≡ 0`, hence `skew_sum = skew2_sum = 0`,
-  hence `K_tr = K_rt = K_rr = 0` at the foundation node. The foundation
-  contributes translational stiffness only, and `_assemble_rhs` explicitly
-  does nothing for it (`pass`, `beam_network.py:1952`). The foundation-side
-  rotation DOFs are then restrained only through the bare beam's own bending
-  and torsion — so even setting `k_tor = k_lin` leaves the foundation nodes
-  with no rotational spring, because `k_tor` multiplies a zero moment arm
-  there.
-- **A units mismatch between the coil side and the foundation side.** After the
-  working-tree JxW change, every coil-side endpoint contributes
-  `K_tt += k_lin · Σ(w · JxW) · I₃` — an *area*-weighted sum — while the
-  foundation endpoint still contributes `K_tt += k_lin · 1.0 · I₃` with a
-  dimensionless `w_sum = 1.0` (`beam_network.py:1778-1781`). With
-  `k_lin = 1e8` N/m³ the coil side is `≈ 7 × 10⁶` N/m and the foundation side
-  is `10⁸` N/m — 14× stiffer, for no physical reason. The JxW change updated
-  the coil branch and left the foundation branch alone.
+  hence `K_tr = K_rt = K_rr = 0` at the foundation node. `_assemble_rhs`
+  explicitly does nothing for it (`pass`, `beam_network.py:1952`). Even setting
+  `k_tor = k_lin` leaves the foundation nodes with no rotational spring,
+  because `k_tor` multiplies a zero moment arm there.
+- **A units mismatch between the coil side and the foundation side.** Every
+  coil-side endpoint contributes `K_tt += k_lin · Σ(w · JxW) · I₃` — an
+  *area*-weighted sum — while the foundation endpoint contributes
+  `K_tt += k_lin · 1.0 · I₃` with a dimensionless `w_sum = 1.0`
+  (`beam_network.py:1778-1781`). At `k_lin = 1e8` N/m³ the coil side is
+  `≈ 7 × 10⁶` N/m and the foundation side is `10⁸` N/m — 14× stiffer, for no
+  physical reason. The JxW change updated the coil branch and left the
+  foundation branch alone.
 
-A cheap diagnostic that would have surfaced this: `merged_solve` already gets
-the matrix inertia back from cuDSS and throws it away
+A cheap diagnostic that would surface this at assembly time: `merged_solve`
+already receives the matrix inertia from cuDSS and discards it
 (`sol_flat, _inertia = solver_K(f_merged, csr_values)`, `drivers.py:559`).
 Surfacing it, or asserting on `min(svd(K_ss))` in a test, would catch a
-zero-energy mode at assembly time instead of as a silent non-convergence 100
-sweeps later.
+zero-energy mode where it happens.
 
-#### A2d — Higher-order curves are pathologically slow
+**Open modelling question, worth settling before anything downstream:** should
+`k_tor` remain a free parameter? A single foundation modulus
+(`k_tor ≡ k_lin`, a genuine distributed spring bed) makes the merged system
+symmetric positive definite for free. Both are N/m³ — see
+[A10](#a10--resolved-k_lin--k_tor-units-corrected) — so a single modulus is
+also the dimensionally natural choice. It would additionally collapse the
+[A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)
+mechanism to a constant.
 
-Also **[measured]**, and unexplained: with everything else held fixed, swapping
-the order-1 circles for randomly perturbed order-3 curves takes a case that
-runs in 3–8 s to over 10 minutes without completing (three separate attempts,
-including one at 20 minutes). The same happened for order-2 perturbations. The
-per-sweep work should not depend on the Fourier order — the curve is evaluated
-once per objective call, not once per sweep — so the likely culprits are
-distorted or inverted tetrahedra making the umfpack solve pathological, or
-repeated re-lowering of the RMF `lax.scan` that
-`framed_curve_jax.py:226-238` warns about. Worth reproducing and profiling,
-because randomly-shaped coils are the realistic optimisation input.
+### A3 — Merged into A1
 
-Note that non-convergence also means every staggered solve currently pays the
-full 100 sweeps, which is why the timing in
-[Rule 4](#rule-4--jit-opportunities) looks the way it does.
+The out-of-sync `sol_list` / `u_s` return is a property of the staggered
+driver's Aitken loop and is covered by
+[A1](#a1--staggered-coupling-is-disabled-by-decision).
 
-### A3 — The returned solutions do not correspond to the returned `u_s`
+### A4 — Excluded: cross-section presets are incomplete
 
-```335:342:src/coil_fem/coupling/drivers.py
-            u_s = u_s + omega * delta
-            last_sol_list = sol_list
+`solid_rectangle` and `solid_square` have no `*_attachment` function, so
+`attachment_type='direct'` (the default) raises `ValueError` from `fetch_attr`
+at construction; and `hollow_circle_attachment` is an alias of
+`solid_circle_attachment`, which reads `dofs['r_beam']` — a key
+`hollow_circle_dof_keys` does not provide.
 
-            if res < atol:
-                break
-            delta_prev = delta
-
-        return u_s, last_sol_list
-```
-
-`sol_list` was produced by `_sweep_full(u_s)` *before* the Aitken update, so
-the returned `u_s` and `last_sol_list` are one relaxation step out of sync.
-On a converged run the mismatch is below `atol`; combined with
-[A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) it is not.
-
-### A4 — Three of the four cross-section presets are unusable
-
-`CoilSupportBeams` resolves the attachment function by string concatenation:
-
-```517:522:src/coil_fem/simsopt/optimizables.py
-        if attachment_type == 'direct':
-            attachment_fn = fetch_attr(cross_section_type + '_attachment', cross_section_fns)
-        elif attachment_type == 'wrap':
-            attachment_fn = cross_section_fns.wrap_attachment
-            cross_section_option_keys += cross_section_fns.wrap_option_keys
-```
-
-`attachment_type` defaults to `'direct'`, but `presets/cross_section_fns.py`
-only defines `solid_circle_attachment` and the alias
-`hollow_circle_attachment`. There is no `solid_rectangle_attachment` and no
-`solid_square_attachment`, so `cross_section_type='solid_rectangle'` or
-`'solid_square'` raises `ValueError` from `fetch_attr` at construction.
-
-The `hollow_circle` alias is worse because it fails later and less obviously:
-
-```298:298:src/coil_fem/presets/cross_section_fns.py
-hollow_circle_attachment = solid_circle_attachment
-```
-
-`solid_circle_attachment` reads `dofs['r_beam']`, but
-`hollow_circle_dof_keys = ('r_1_beam', 'r_2_beam')`, so
-`_clamp_weights_for_spec` never puts `r_beam` into `beam_dofs` and the call
-raises `KeyError` during the first assembly.
-
-Separately, an `attachment_type` that is neither `'direct'` nor `'wrap'`
-leaves `attachment_fn` unbound and raises `UnboundLocalError` rather than a
-useful message. Add an `else: raise ValueError(...)`.
+**Excluded by review decision:** these are unfinished features rather than
+defects. One adjacent point is worth keeping regardless: an `attachment_type`
+that is neither `'direct'` nor `'wrap'` leaves `attachment_fn` unbound and
+raises `UnboundLocalError`. Add an `else: raise ValueError(...)`.
 
 ### A5 — `cudss_mtype_id` has two conflicting defaults
 
@@ -427,7 +275,7 @@ What the two matrices actually are **[measured]**:
   clamp.
 - **The merged monolithic matrix** is symmetric **iff `k_tor = k_lin`**, and
   is otherwise both non-symmetric and indefinite in its symmetric part; see
-  the sweep in [A2c](#a2c--the-support-stiffness-block-is-near-singular). With
+  the sweep in [A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular). With
   the fixture's `k_tor = 1e4, k_lin = 1e8` the relative asymmetry is `1.2e-3`
   in `K_ss` and `2.7e-2` between `K_cs` and `K_scᵀ`, so `0` is required.
 
@@ -446,7 +294,7 @@ object's properties, and no caller has to remember a cuDSS integer.
 | Block | Owner of the claim | Claim | Why that owner |
 |---|---|---|---|
 | `K_cc` | `LinearElasticity3D` | `'symmetric'`, unconditionally | Property of the weak form. `k_tor` never enters it |
-| `K_ss`, `K_cs` / `K_sc` | `Support` | base: `'symmetric'`; `SupportBeams`: `'symmetric'` if `k_tor == k_lin` else `'general'` | `k_tor` is the only asymmetry source anywhere in the system ([A2c](#a2c--the-support-stiffness-block-is-near-singular)) |
+| `K_ss`, `K_cs` / `K_sc` | `Support` | base: `'symmetric'`; `SupportBeams`: `'symmetric'` if `k_tor == k_lin` else `'general'` | `k_tor` is the only asymmetry source anywhere in the system ([A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular)) |
 | merged | `CoilFEM`, derived | weakest of all contributing claims | A merged matrix is only as symmetric as its least symmetric block |
 
 **Vocabulary.** Solver-agnostic strings, matching the existing
@@ -549,7 +397,7 @@ both valid and cheaper, but is a change.
 
 Finally, note that if `k_tor ≡ k_lin` were adopted as the model rather than
 left as a free parameter (see
-[A2c](#a2c--the-support-stiffness-block-is-near-singular)), `SupportBeams`
+[A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular)), `SupportBeams`
 would claim `'symmetric'` unconditionally and this whole mechanism would
 reduce to a single constant — which is an argument for settling that modelling
 question first.
@@ -588,7 +436,7 @@ mutates the caller's object. Use `beam_options=None` plus
 but `build_fwd_pred` passes `linear=bool(problem_options.get('cudss_linear', False))`,
 so the default `CuDSSNewtonSolver.newton_loop` takes the iterative branch,
 which calls `float(jnp.linalg.norm(res_vec_bc))` — the same host sync that
-breaks tracing in [A1](#a1--jaxgrad-through-solve_staggered-raises).
+breaks tracing in [A1](#a1--staggered-coupling-is-disabled-by-decision).
 `cudss_linear` is not set anywhere in the repo, tests, or examples.
 
 This only bites on `coupling='staggered'` with `solver='cudss'`, or the
@@ -602,14 +450,14 @@ both `float(jnp.linalg.norm(...))` calls outright. That closes this item rather
 than working around it: with no host sync left in `newton_loop`, the `jax.jit`
 that `CoilFEMObjective` switches on for `solver == 'cudss'` becomes valid
 instead of latent, and the same construct can no longer break `jax.grad` the
-way it does in [A1](#a1--jaxgrad-through-solve_staggered-raises).
+way it does in [A1](#a1--staggered-coupling-is-disabled-by-decision).
 
 Do not fix it the other way round — by leaving the loop and setting
 `cudss_linear=True` at the call sites — since that leaves a default that is
 wrong for every problem in the repo, and leaves the trap armed for the next
 caller who omits the flag.
 
-### A8 — Unreachable default-from-support branch
+### A8 — Delete the dead default-from-support branch
 
 ```298:311:src/coil_fem/coil_fem.py
         winkler_k = float(self.problem_options['winkler_k'])
@@ -624,9 +472,9 @@ caller who omits the flag.
 line 298 does `float(...)` on it before this branch is reached — so
 `winkler_k is None` either never happens or has already raised `TypeError`.
 
-**Decision: `winkler_k` stays mandatory, and must never be defaulted from
-`support.k_lin`.** Delete the inner branch (lines 306–310) outright rather than
-repairing it by hoisting the resolution above line 298 and relaxing
+**Decision: delete the inner branch (lines 306–310) now.** `winkler_k` stays
+mandatory and must never be defaulted from `support.k_lin`. Delete it outright
+rather than repairing it by hoisting the resolution above line 298 and relaxing
 `_broadcast_problem_options`. Keep only the `else` arm — the equality
 assertion. Reasons to record, since the dead branch reads as an intention
 someone might otherwise restore:
@@ -675,26 +523,31 @@ consistency check but must **not** be reused for the exact `k_tor == k_lin`
 symmetry test in
 [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest).
 
-### A9 — `disk` meshes are accepted but cannot be solved
+### A9 — Excluded: disk meshes are incomplete
 
-`_broadcast_mesh_opts` validates and accepts `shape='disk'`
-(`coil_fem.py:94-106`), and `CoilMeshDisk` builds fine, but `CoilMeshDisk`
-never overrides `_compute_uv_quad`, so `mesh.uv_quad` stays `None`, and
-`B_self_quadrature` raises `NotImplementedError` for `shape == 'disk'`
-regardless. Any `CoilFEM` built with a disk cross-section fails on the first
-`run()`/`objective()`. Reject `'disk'` at construction with the
-`NotImplementedError` message that `B_self_quadrature` already has, so the
-failure happens where the user can act on it.
+`_broadcast_mesh_opts` accepts `shape='disk'` and `CoilMeshDisk` builds fine,
+but `CoilMeshDisk` never overrides `_compute_uv_quad`, so `mesh.uv_quad` stays
+`None` and `B_self_quadrature` raises `NotImplementedError` for disk sections
+regardless. Any `CoilFEM` built with a disk cross-section therefore fails on
+the first `run()` / `objective()`.
 
-### A10 — `k_lin` units are documented inconsistently
+**Excluded by review decision:** an unfinished feature rather than a defect.
 
-`SupportBeams` documents `k_lin : Translational spring stiffness [N/m²]`
-(`beam_network.py:133`) and `CoilSupportBeams` repeats it
-(`optimizables.py:433`). But `CoilFEM.__init__` enforces
-`winkler_k == support.k_lin` and documents `winkler_k` as N/m³, and the
-dimensional analysis agrees: `K_tt = k_lin · Σ(w·JxW) · I₃` where
-`Σ(w·JxW)` is an area, so `k_lin·m² = N/m ⟹ k_lin = N/m³`. Fix the two
-docstrings.
+### A10 — Resolved: `k_lin` / `k_tor` units corrected
+
+`SupportBeams` documented `k_lin` as `[N/m²]` and `k_tor` as `[N·m/m²]`, and
+`CoilSupportBeams` repeated both. Dimensional analysis gives N/m³ for *both*:
+`K_tt = k_lin · Σ(w·JxW) · I₃` with `Σ(w·JxW)` an area gives
+`k_lin · m² = N/m`, and `τ = k_tor · Σ(w·JxW) · r × Δu` gives
+`k_tor · m² · m · m = N·m`. Since `CoilFEM` also enforces
+`winkler_k == support.k_lin` and documents `winkler_k` as N/m³, the two
+docstrings were simply wrong.
+
+**Resolved:** corrected in `beam_network.py:133-141` and
+`optimizables.py:432-438`, and both now state the relationship to
+`problem_options['winkler_k']`. That `k_lin` and `k_tor` share units is also
+an argument for the single-modulus question raised in
+[A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular).
 
 ---
 
@@ -711,23 +564,25 @@ docstrings.
 | `CoilMesh.to_vtu` | `meshing.py:787-798` | Hard-codes its own `TET4→tetra` map next to the `meshio_cell_type` property that already does this |
 | `CoilMesh.mesh_longest_edge_volume_ratio` | `meshing.py:837-876` | |
 | `CoilMesh.mesh_type` | `meshing.py:755-758` | "Alias for ele_type for backward compatibility"; the external `'mesh_type'` hits are all dict keys, not this property |
-| `CurveXYZFourierJAX.kappa` / `.torsion` / `.frenet_frame` | `curve_jax.py:144-216` | `gammadashdashdash` exists only to serve `torsion` |
-| `FramedCurveJAX.binorm` / `.torsion` | `framed_curve_jax.py:548-554` | Aliases of `frame_binormal_curvature` / `frame_torsion` |
+| ~~`CurveXYZFourierJAX.kappa` / `.torsion` / `.frenet_frame`~~ | `curve_jax.py:144-216` | **Keep** — general-purpose curve geometry, retained deliberately |
+| ~~`FramedCurveJAX.binorm` / `.torsion`~~ | `framed_curve_jax.py:548-554` | **Keep** — short aliases of `frame_binormal_curvature` / `frame_torsion`, retained deliberately |
 | `problems.dirichlet_bc` | `linear_elasticity.py:83-123` | Exported in `problems.__all__`; the only references are its own docstring examples. `LinearElasticity3D` raises if `location_fns` is passed alongside `winkler_k_scalar` |
-| `HeatConduction3D` | `problems/heat_conduction.py` | Whole module is a class that raises on `__init__`; re-exported in `problems.__all__` |
+| ~~`HeatConduction3D`~~ | `problems/heat_conduction.py` | **Keep** — placeholder for planned thermoelastic work |
 | `CoilFEM.n_total` | `coil_fem.py:274` | Assigned, never read |
-| `solve_staggered(..., options=...)` | `drivers.py:123` | `CoilFEM._solve_all` never passes it, so `max_iters`, `atol`, `aitken`, `gmres_maxiter`, `gmres_tol` are all unreachable from the public API — directly relevant to [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) |
+| `solve_staggered(..., options=...)` | `drivers.py:123` | `CoilFEM._solve_all` never passes it, so `max_iters`, `atol`, `aitken`, `gmres_maxiter`, `gmres_tol` are all unreachable from the public API — directly relevant to [A2](#a1--staggered-coupling-is-disabled-by-decision) |
 | `'amgx'` in `_VALID_SOLVERS` | `coil_fem.py:110` | Accepted by validation; `build_fwd_pred` would hand `{'amgx_solver': {}}` to jax-fem |
 | `_HAS_SPINEAX` | `solvers/cudss.py:36` | Computed via `importlib.util.find_spec` and never read |
 | Commented-out plot block | `coil_fem.py:1356-1364` | |
 
-`ThermoElasticPipeline` (`pipelines.py:282-295`) is a near-miss: it is
-reachable via `physics_options={'type': 'thermoelastic'}`, constructs
-successfully, and then raises on `solve`. Its `solve` signature also omits
-`support_attach`, so on the coupled path it raises `TypeError` before it can
-raise the intended `NotImplementedError`. Either wire it up or drop it and the
-`physics_options` plumbing with it; a stub that constructs but cannot run is
-worse than no stub.
+**Keep** `ThermoElasticPipeline` (`pipelines.py:282-295`) and
+`HeatConduction3D`: both are deliberate placeholders for the planned
+thermoelastic model. One small fix while they are here — `ThermoElasticPipeline.solve`
+omits the `support_attach` parameter that `ElasticPipeline.solve` accepts, so on
+the coupled path it raises `TypeError` before it can raise its intended
+`NotImplementedError`. Match the signature so the stub fails with its own
+message.
+
+Everything else in the table above is to be removed.
 
 ### 1b. Placeholder implementations that the architecture no longer uses
 
@@ -738,9 +593,10 @@ worse than no stub.
 rigid-body-displacement interpolation. AGENTS.md still lists
 `displacement_at` as a required abstract method and
 `docs/developers/support_structure.rst` devotes a step to implementing it.
-Delete the method, or delete `compute_attach` and make `displacement_at` do
-the work; having both, with the documented one being the dead one, is the
-worst arrangement.
+**Decision: remove `displacement_at`** from both classes, and drop it from the
+`Support` contract in AGENTS.md and from the walkthrough in
+`docs/developers/support_structure.rst`. `compute_attach` is the method that
+does the work.
 
 **`coupling_terms`.** `Support.coupling_terms` (48 lines, `supports.py:527-578`)
 and `SupportBeams.coupling_terms` (80 lines, `beam_network.py:1556-1635`)
@@ -749,74 +605,65 @@ have no caller in `src/`. `make_merged_solve` calls `coupling_pattern` and
 construction, traced values every evaluation). `coupling_terms` just glues them
 back together and is kept alive only by three tests. Note that
 `SupportBeams.coupling_terms` also forgets to forward `geom`, so calling it
-recomputes the beam geometry from scratch. Either delete it and have the tests
-call the two halves, or keep it as a documented test/debug convenience — but
-its physics-convention docstring (the clearest explanation of the `K_cs`/`K_sc`
-sign conventions in the codebase) should move to `coupling_values`, which is
-the method that implements it.
+recomputes the beam geometry from scratch. **Decision: remove `coupling_terms`** from both classes and have the three
+tests call `coupling_pattern` and `coupling_values` directly. Move its
+physics-convention docstring — the clearest explanation of the `K_cs` / `K_sc`
+sign conventions in the codebase — onto `coupling_values`, which is the method
+that implements it.
 
 ### 1c. Base-class contracts that do not match the subclass
 
-**`Support.coo(self)`** takes no arguments and raises `NotImplementedError`.
-`SupportBeams.coo(self, curves_jax, support_dofs, surface_pts_by_coil=None,
-geom=None, *, jxw_by_coil)` takes five. Drivers call the five-argument form,
-so a hypothetical uncoupled support reaching that code path gets `TypeError`,
-not the intended `NotImplementedError`. Give the base method the real
-signature.
+**Does a monolithic solve on a base `Support` reach `coo()`? No.** `_solve_all`
+branches on `support.is_coupled` *before* any driver is selected, and base
+`Support.is_coupled` is `False`, so the call goes to the inline per-coil loop.
+`solve_monolithic` is never entered and `coo()` is never called. The guard in
+`__init__` is the same: `build_monolithic_static` runs only when
+`self.support.is_coupled and coupling == 'monolithic'`.
+
+**And no, the base support should not force the staggered driver.** Each coil
+being its own problem is precisely the *uncoupled* case, which already has its
+own path — and forcing staggered would be strictly worse, since it would run
+BG-S sweeps over a system that has no support DOFs to converge. The right home
+for that path is the missing `solve_uncoupled` driver in
+[2j-plan](#2j-plan--extract-solve_uncoupled-for-a-uniform-driver-contract);
+with the staggered driver now raising
+([A1](#a1--staggered-coupling-is-disabled-by-decision)), forcing it would in
+fact break every uncoupled problem.
+
+That said, the two base-class stubs are still wrong as contracts:
+
+**`Support.coo(self)`** takes no arguments and raises `NotImplementedError`,
+while `SupportBeams.coo(self, curves_jax, support_dofs,
+surface_pts_by_coil=None, geom=None, *, jxw_by_coil)` takes five. The base
+signature is unreachable today, but it is not a usable contract for a future
+coupled support — anything calling it through the driver path would get
+`TypeError` rather than the intended `NotImplementedError`. Give the base
+method the real signature.
 
 **`Support.solve`** returns `{}` while every caller does
-`support.solve(inputs)['u_s']` — a `KeyError`, not a graceful no-op. It is
-only safe because it is never reached when `is_coupled=False`. Either return
-`{'u_s': jnp.zeros(0)}` or make it raise.
+`support.solve(inputs)['u_s']`, which is a `KeyError` rather than a graceful
+no-op. Safe only because it is never reached when `is_coupled=False`. Return
+`{'u_s': jnp.zeros(0)}` or raise.
 
-### 1d. Single-use wrappers that add a hop without adding meaning
+### 1d. Single-use wrappers — declined
 
-| Wrapper | Location | Suggestion |
-|---|---|---|
-| `_build_metric_fn` | `coil_fem.py:65-71` | A dict lookup plus an error message, called once in a comprehension. Inline into `objective` |
-| `metrics._resolve_shape_grads` / `_resolve_JxW` | `metrics.py:50-61` | One-line `if x is not None` fallbacks. `objective` always passes both |
-| `utils.fetch_attr` | `utils.py:3-8` | Reimplements `getattr` and downgrades `AttributeError` to `ValueError`. See [3a](#3a-stdlib-and-jax-built-ins) |
-| `meshing.rectangle_sweep` / `disk_sweep` | `meshing.py:503-551` | Self-described "backward-compatible shim"s that call the constructor. Only used in tests and examples — update those and delete |
-| `_scatter_block_diagonal` | `beam_network.py:1818-1835` | Returns `(self._coo_I, self._coo_J, K_beam.reshape(-1))`; one call site |
-| `_bool_to_sign` | `cross_section_fns.py:48-52` | Five lines for `1 if a else -1`; one call site |
-| `CoilFEM.plot_support` / `save_support_vtu` | `coil_fem.py:1185-1286` | Pure forwards to `Support` methods that immediately reach back into `CoilFEM` privates. See [Philosophy 2](#philosophy-2--support-must-be-independent-of-coilfem) |
+Excluded by review decision. The one item here that matters is
+`CoilFEM.plot_support` / `save_support_vtu` forwarding into `Support` methods
+that immediately reach back into `CoilFEM` privates; that is covered by
+[Philosophy 2](#philosophy-2--support-must-be-independent-of-coilfem) and
+should be addressed there instead. `utils.fetch_attr` is still covered by
+[3a](#3a-stdlib-and-jax-built-ins).
 
-`_broadcast_problem_options` (`coil_fem.py:113`) does not broadcast anything —
-it validates one dict and fills defaults. Rename to
-`_validate_problem_options`.
+### 1e. Resolved: copy-pasted property docstrings
 
-`CoilFEM.meshes` (`coil_fem.py:1124-1132`) is described as a
-"backward-compatibility shim", but it is now read 8× inside `coil_fem.py`
-itself, including inside `_solve_all`'s per-coil loop, and it rebuilds a list
-comprehension on every access. Either keep it and cache it in `__init__`, or
-change the internal call sites to `self.pipelines[i].mesh` and keep the
-property for external users.
+Three `SupportBeams` properties carried the docstring of a fourth
+(`"``True`` — beams have their own DOFs coupled to coil surface nodes."`), and
+`nfp` and `beam_options` were annotated `-> bool`.
 
-`presets/__init__.py` is a two-line docstring with a typo ("constantas") that
-re-exports nothing, while AGENTS.md describes it as the presets namespace.
-
-### 1e. Copy-pasted docstrings
-
-Three `SupportBeams` properties carry the docstring of a fourth:
-
-```392:405:src/coil_fem/coupling/beam_network.py
-    @property
-    def nfp(self) -> bool:
-        """``True`` — beams have their own DOFs coupled to coil surface nodes."""
-        return self._nfp
-
-    @property
-    def beam_options(self) -> bool:
-        """``True`` — beams have their own DOFs coupled to coil surface nodes."""
-        return self._beam_options
-
-    @property
-    def stellsym(self) -> bool:
-        """``True`` — beams have their own DOFs coupled to coil surface nodes."""
-        return self._stellsym
-```
-
-`nfp` and `beam_options` are also annotated `-> bool`.
+**Resolved:** `nfp` is now `"The number of field periods."` returning `int`,
+`stellsym` is `"Stellarator symmetry."`, and `beam_options` is
+`"Static beam configuration passed at construction."` returning `dict`
+(`beam_network.py:392-405`).
 
 ---
 
@@ -871,20 +718,32 @@ favour of the `metrics` functions.
 - **Stellarator symmetry.** `geo/symmetries` has `_rotate_points_z` and
   `_flip_points` for coil expansion; `SupportBeams.__init__` independently
   builds `diag(1,-1,-1)` and the `2π/nfp` z-rotation into `self._tfm_Q`
-  (`beam_network.py:283-294`). Per philosophy point 6, the `Q` matrices belong
-  in `geo/symmetries.py` (e.g. `stellsym_transform(tag, nfp) -> (3, 3)`), with
-  `beam_network` importing them. That also makes it checkable that the beam
-  network's `'flip_half' = rot @ flip` convention matches the coil expansion's
-  `flip(rotate(x))` ordering.
+  (`beam_network.py:283-294`).
+
+**Decision: unify all of it into simple, readable *public* functions in
+`geo/symmetries.py`**, imported by both the coil-expansion code and
+`beam_network`. Concretely: promote `_rotate_points_z` and `_flip_points` to
+public names, add the matrix form the beam network needs (e.g.
+`stellsym_transform(tag, nfp) -> (3, 3)` covering `'none'`, `'flip'`,
+`'flip_half'`, `'rotate'`), and put `rodrigues(axis, angle)` there so the two
+existing copies collapse onto one. Beyond removing the duplication, this makes
+it checkable in one place that the beam network's `'flip_half' = rot @ flip`
+convention matches the coil expansion's `flip(rotate(x))` ordering — currently
+verifiable only by reading two modules side by side.
 
 ### 2c. `_sweep` and `_sweep_full` are the same function
 
 `drivers._sweep` (`drivers.py:230-266`) and `_sweep_full`
 (`drivers.py:268-308`) differ only in whether `sol['sol_list']` is appended to
 a second list — 35 duplicated lines including the `geom_kw` dance and the
-`support_inputs` dict. `_sweep` exists only for `_staggered_core_bwd`, which
-is dead ([A1](#a1--jaxgrad-through-solve_staggered-raises)). Delete `_sweep`,
-or define it as `lambda u: _sweep_full(u)[0]`.
+`support_inputs` dict. `_sweep` exists only for `_staggered_core_bwd`.
+
+**Decision: delete both**, along with the rest of the staggered body. Since
+`solve_staggered` now raises `NotImplementedError` immediately
+([A1](#a1--staggered-coupling-is-disabled-by-decision)), `_sweep`,
+`_sweep_full`, `_run_iterations`, `_staggered_core` with its `fwd`/`bwd` pair,
+and the `options` plumbing are all unreachable. What remains of the function is
+the raise and its docstring.
 
 ### 2d. FE geometry recomputed three times per coil per evaluation
 
@@ -931,8 +790,33 @@ helpers accept the already-built list.
 
 The `pts_i → surf_idx → weights_surf → weight_full[surf_idx] = weights_surf`
 block is byte-similar in `CoilFEM.save_run_vtu` (`coil_fem.py:1526-1537`),
-`Support.save_support_vtu` (`supports.py:346-356`), and
-`Support.plot_support` (`supports.py:239-249`).
+`Support.save_support_vtu` (`supports.py:345-356`), and
+`Support.plot_support` (`supports.py:238-249`). The two in `supports.py` are
+identical for eleven lines, differing only in the loop header; the one in
+`coil_fem.py` differs only in taking node positions from
+`result['mesh_points'][i]` rather than recomputing them.
+
+**Decision: add a helper in `supports.py`** that all three call, and **state in
+its docstring that it exists solely for plotting and VTU export** — it is not
+on the solve path and must not acquire callers there:
+
+```python
+def _support_weights_full(fem, coil_idx, pts_i, curves_jax, support_dofs):
+    """Winkler weight per mesh node, zero off the Winkler surface.
+
+    Plotting and VTU export only.  No solve path uses this; solvers consume
+    per-surface-quadrature weights from ``Support.compute_weights`` directly.
+    """
+```
+
+It takes `fem`, so position it to move together with the plotting code when
+[Philosophy 2](#philosophy-2--support-must-be-independent-of-coilfem) is
+addressed.
+
+Note also that `save_support_vtu` and `save_run_vtu` then emit the *same* two
+point fields — `support_weights` and `spring_k_Npm3 = weight_full * winkler_k`
+— into two different files, so the identical quantity is computed and written
+twice.
 
 ### 2g. `gamma3` resolution duplicated four times
 
@@ -942,8 +826,12 @@ gamma3 = geom['gamma3'] if 'gamma3' in geom else self._direction_cosine_matrices
 
 appears verbatim in `compute_weights` (`beam_network.py:1054`),
 `compute_attach` (`:1330`), `coupling_values` (`:1506`), and `coo` (`:1887`).
-Since `geometry()` is the only public producer and always sets `'gamma3'`,
-either make the key mandatory or add one private `_gamma3(geom, dofs)`.
+
+**Decision: make `'gamma3'` a mandatory key of the `geom` dict.** `geometry()`
+is the only public producer and always sets it, so the four fallbacks are dead
+defensiveness that also silently masks a caller passing a bare
+`_beam_geometry()` result. Replace each occurrence with `geom['gamma3']` and
+let a missing key raise.
 
 ### 2h. Endpoint weights and moment arms recomputed 2–4× per assembly
 
@@ -961,6 +849,8 @@ staggered path `compute_weights`, `compute_attach`, and the two inside
 
 - `CoilSupportFixed._clamp_fn` (`optimizables.py:314-321`) and
   `CoilSupportBeams._clamp_fn` (`optimizables.py:776-783`) are byte-identical.
+  **Decision:** keep the single definition on `CoilSupportFixed` and have
+  `CoilSupportBeams` reuse it directly instead of redefining the body.
 - `MonolithicStatic` stores `curve_qps` / `curve_orders`, duplicating
   `CoilFEM.base_curves_jax[i].quadpoints` / `.order`, and
   `surface_node_indices_by_coil`, duplicating `pipeline.surface_node_indices`.
@@ -1047,13 +937,13 @@ return {
 **Also worth carrying through:** all three drivers return a `'diagnostics'`
 key that `_solve_all` currently discards in both branches. A uniform contract
 is where the non-convergence reporting from
-[A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) would land, so
+[A2](#a1--staggered-coupling-is-disabled-by-decision) would land, so
 plumb `diagnostics` out rather than dropping it.
 
 **The payoff that matters most.** The uncoupled path is currently the only one
 where `jax.grad` works on CPU — monolithic raises `NotImplementedError` unless
 `solver='cudss'`, and staggered raises `ConcretizationTypeError`
-([A1](#a1--jaxgrad-through-solve_staggered-raises)). Today that working path is
+([A1](#a1--staggered-coupling-is-disabled-by-decision)). Today that working path is
 the fall-through `else` of a function whose coupled branch carries the dead IFT
 `custom_vjp`, the host syncs, and the non-convergent loop. Separating them means
 that acting on A1 — whether by rewriting `solve_staggered` around
@@ -1119,7 +1009,15 @@ neither:
 hard-codes a second `TET4 → tetra` map next to `meshio_cell_type`, and
 `CoilFEM._write_coil_vtu` re-implements a thin `meshio.Mesh(...).write(...)`
 wrapper that `SupportBeams.save_support_vtu` then bypasses to call `meshio`
-directly for the beam lines. One helper, used everywhere, would do.
+directly for the beam lines.
+
+**Decision: call `meshio` directly at every write site** and drop the
+intermediate wrapper, keeping `CoilMesh.meshio_cell_type` as the single
+cell-type mapping. Note this does *not* subsume
+[2f](#2f-surface-weight-scatter-duplicated-three-times): meshio has no concept
+of point data on a subset of points, so the full-length weight array still has
+to be built by the caller — and `plot_support`, one of the three 2f sites,
+writes no file at all.
 
 ### 3d. Unused imports and locals (pyflakes)
 
@@ -1153,13 +1051,20 @@ but the dead local makes it look accidental.
 
 `_endpoint_specs` returns a list of 8-key dicts with string keys accessed as
 `spec['coil_origin']`, `spec['j_local']`, `spec['sign_x']`, … across four
-methods. A frozen dataclass (or a `NamedTuple`) gives attribute access, typo
-protection, and — more usefully — makes it obvious which fields are static
-Python and which are traced arrays, which is exactly what you need before
-`vmap`-ing them ([4b](#4b-replace-per-endpoint-python-loops-with-vmap)).
-Same for the endpoint dicts returned by `_endpoint_weights_and_r`, where
-`'is_foundation'` is *absent* rather than `False` on coil-side entries and is
-read with `ep.get('is_foundation', False)`.
+methods.
+
+**Decision: use `typing.NamedTuple`.** It gives attribute access, typo
+protection at the point of use, and — more usefully — makes it obvious which
+fields are static Python and which are traced arrays, which is exactly what is
+needed before `vmap`-ing them
+([4b](#4b-replace-per-endpoint-python-loops-with-vmap)). Being a tuple, it is
+also a JAX pytree, so a list of them flattens predictably if the endpoint data
+is ever stacked.
+
+Apply the same to the endpoint dicts returned by `_endpoint_weights_and_r`,
+where `'is_foundation'` is *absent* rather than `False` on coil-side entries
+and has to be read with `ep.get('is_foundation', False)` — a `NamedTuple` field
+with a `False` default removes that asymmetry.
 
 ### 3f. The non-linear Newton branch is ballast
 
@@ -1230,7 +1135,7 @@ fallback for anything non-linear.
 **One caveat: keep a way to detect a bad factorisation.** With no residual
 check, a singular or near-singular `K` yields garbage silently — and that is
 not hypothetical here, since
-[A2c](#a2c--the-support-stiffness-block-is-near-singular) measures
+[A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular) measures
 `cond(K_ss) = 9.1 × 10⁹`. The iterative branch at least reported a large
 residual. The cheap replacement already exists and is being discarded: cuDSS
 returns the matrix inertia at both `cudss.py:408`
@@ -1263,10 +1168,17 @@ rather than against another line of code), and assert that
 | `surface_jxw` | 1.5 ms | — | |
 
 A full forward `CoilFEM.objective` with `coupling='staggered'` on this problem
-takes **29.1 s**. The FEM solves account for 100 sweeps × 2 coils × 42 ms ≈
+took **29.1 s**. The FEM solves account for 100 sweeps × 2 coils × 42 ms ≈
 8.4 s. The remaining ~20 s is eager JAX dispatch in the beam assembly and the
 weight functions. **On the CPU path, the un-jitted pure-JAX code costs more
 than twice as much as the sparse solves it exists to feed.**
+
+That end-to-end figure is measured through the staggered driver, which is
+being retired ([A1](#a1--staggered-coupling-is-disabled-by-decision)). The
+per-block speed-ups above are not staggered-specific: `SupportBeams.geometry`,
+`.coo`, `compute_weights`, `coupling_values`, and
+`CoilFEM._body_force_at_quads` are all on the monolithic path too. Retiring
+staggered removes the 100× repetition, not the per-call eager overhead.
 
 The one non-jittable step is `pipeline.fwd_pred`, because `jax_fem`'s
 `ad_wrapper` runs scipy/PETSc on the host. Everything on either side of it is
@@ -1282,7 +1194,7 @@ point 2 already says these should be pytree-like for this reason).
 
 The payoff compounds: `solve` is called once per BG-S sweep, and the sweep
 count is currently pinned at 100
-([A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing)). Jitting it
+([A2](#a1--staggered-coupling-is-disabled-by-decision)). Jitting it
 turns ~19.5 s of the 29 s evaluation into ~0.09 s.
 
 The cleanest form is to jit one `_sweep(u_s, pts, bf, wt, sdofs, cdofs)`
@@ -1404,6 +1316,21 @@ anyway, or keeping `_jit_J` only for the `run()`-style diagnostic path.
   break block-diagonality; from `_spring_stiffness_contributions` they do not
   (every contribution lands inside beam `b`'s own 12×12).
 
+### 4j. Higher-order curves are pathologically slow — unexplained
+
+**[measured]** With everything else held fixed, swapping order-1 circles for
+randomly perturbed order-2 or order-3 curves turns a case that runs in 3–8 s
+into one that does not complete in over 10 minutes (three attempts, one at 20
+minutes). The per-sweep work should not depend on the Fourier order — the
+curve is evaluated once per objective call, not once per sweep — so the likely
+culprits are distorted or inverted tetrahedra making the sparse solve
+pathological, or repeated re-lowering of the RMF `lax.scan` that
+`framed_curve_jax.py:226-238` already warns about.
+
+This was found through the staggered driver, but nothing about it looks
+staggered-specific, and randomly-shaped coils are the realistic optimisation
+input. Worth reproducing on the monolithic path and profiling.
+
 ---
 
 ## Philosophy adherence
@@ -1413,16 +1340,19 @@ anyway, or keeping `_jit_J` only for the `run()`-style diagnostic path.
 Largely honoured: static topology is fixed at construction, DOFs flow in
 through `objective`/`run`, and the class is deliberately not a pytree.
 
-The exception is `LinearElasticity3D.set_params`, which mutates
-`self.shape_grads`, `self.JxW`, `self.v_grads_JxW`,
-`self.physical_quad_points`, `self.nanson_scale`, `self.internal_vars`, and
-`self.internal_vars_surfaces` on every forward pass. `objective` already works
-around this by recomputing geometry externally (with a good comment
-explaining why); `run` does not, and reads the mutated `shape_grads` via
-`problem.von_mises_stress`. Each pipeline owns its own problem, so the value
-happens to be right today — but it depends on which call last ran
-`set_params`, which is a property of the driver, not of `run`. Pass
-`shape_grads` explicitly, as `strain_tensors` already optionally allows.
+`LinearElasticity3D.set_params` mutates `self.shape_grads`, `self.JxW`,
+`self.v_grads_JxW`, `self.physical_quad_points`, `self.nanson_scale`, and
+`self.internal_vars` on every forward pass, which looks like a departure — but
+that is how jax-fem `Problem` subclasses are meant to work, and it is
+**accepted as idiomatic**, not a finding.
+
+The one thing worth carrying forward is a consequence rather than a cause:
+`run()` reads the mutated `shape_grads` through `problem.von_mises_stress`
+while `objective()` deliberately recomputes geometry externally, so the two
+entry points use different code paths for the same quantity. That is resolved
+by collapsing the duplicate von Mises implementations in
+[2a](#2a-von-mises--cauchy-stress-written-three-times), not by changing
+`set_params`.
 
 ### Philosophy 2 — `Support` must be independent of `CoilFEM`
 
@@ -1453,21 +1383,20 @@ on `recompute_bell`, and wraps `CoilFEM.objective` / `run` without duplicating
 logic.
 
 `CoilSupportBeams.__init__` is ~300 lines that mix preset resolution, DOF
-default generation, ragged-shape validation, fixed-mask construction, and
-diagnostics. Three specific points:
+default generation, ragged-shape validation, and fixed-mask construction.
 
-- It `print()`s a six-line summary on construction (`optimizables.py:753-761`).
-  A library that prints on every construction is awkward inside an
-  optimisation loop or a test suite. Use `logging` or gate on a `verbose`
-  flag, consistent with `CoilFEM.verbose`.
-- `if kwargs is None:` (`optimizables.py:678`) is dead — `**kwargs` is always a
-  dict.
-- The nested helpers `_uniform_list`, `_zeros_list`, `_check_ragged_shape` are
-  defined inside `__init__` and are ~70 lines of the total. `_uniform_list`'s
-  stellsym branch in particular encodes real physics (why the last two groups
-  use `[0, 0.5]` so reflections do not overlap) and deserves to be a
-  module-level function with that reasoning in a docstring rather than an
-  inline comment inside a closure.
+**Decision: move `_uniform_list`, `_zeros_list`, and `_check_ragged_shape` to
+module level** — about 70 lines of the total — and **comment each clearly as
+being used only during initialisation**, so nobody mistakes them for runtime
+helpers. `_uniform_list`'s stellsym branch in particular encodes real physics
+(why the last two groups span `[0, 0.5]`, so that reflections neither overlap
+nor intersect) which belongs in a docstring rather than an inline comment
+inside a closure.
+
+Two other observations here were **declined**: the `print()` summary on
+construction (`optimizables.py:753-761`) is fine because simsopt objects are
+constructed once per optimisation, and `if kwargs is None:`
+(`optimizables.py:678`) is expected.
 
 ### Philosophy 6 — logic should live where a dev would look for it
 
@@ -1539,58 +1468,58 @@ ancestor of `coil_fem.py`). Worth deleting from the working tree.
 
 ## Suggested sequencing
 
-1. **Find the marginal mode.** [A2c](#a2c--the-support-stiffness-block-is-near-singular)
-   is the one finding that affects the priority cuDSS path as much as the
-   staggered one, and everything downstream of it (BG-S convergence, the
-   accuracy of the dense `K_ss` LU, the conditioning of the merged matrix) is
-   contingent on it. Check the two leads — CF foundation rotational grounding
-   and the coil-side/foundation-side units mismatch — then add an assertion on
-   `min(svd(K_ss))` (or surface the cuDSS inertia) so a zero-energy mode fails
-   loudly at assembly.
-2. **Unblock the rest of correctness.**
-   [A1](#a1--jaxgrad-through-solve_staggered-raises) (decide: forward-only or
-   `lax.while_loop` + real `custom_vjp`),
-   [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing) (report
-   non-convergence; revisit the `ω ≥ 0.1` clamp),
-   [A4](#a4--three-of-the-four-cross-section-presets-are-unusable),
-   [A5](#a5--cudss_mtype_id-has-two-conflicting-defaults) (plan in
-   [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest);
-   settle the `k_tor ≡ k_lin` question first, since it may collapse the whole
-   mechanism to a constant),
-   [A6](#a6--mutable-default-arguments-are-mutated-in-place). Add a regression
-   test that takes `jax.grad` through a *real* `SupportBeams`, not a constant
-   mock, and one that asserts BG-S actually converges rather than only that it
-   returns.
-3. **Delete.** Everything in [1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs),
+1. **Settle `k_tor`.** [A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular)
+   is the finding that affects the priority cuDSS path, and several others are
+   contingent on it: the accuracy of the dense `K_ss` LU, the conditioning of
+   the merged matrix, and whether the
+   [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)
+   symmetry mechanism collapses to a constant. Decide whether `k_tor` stays a
+   free parameter, fix the two contributing defects (CF foundation rotational
+   grounding, coil-side vs foundation-side units), and add an assertion on
+   `min(svd(K_ss))` — or surface the cuDSS inertia — so a zero-energy mode
+   fails loudly at assembly.
+2. **Retire staggered.** Make `solve_staggered` raise and delete its body
+   ([A1](#a1--staggered-coupling-is-disabled-by-decision),
+   [2c](#2c-_sweep-and-_sweep_full-are-the-same-function)). Fix
+   [A6](#a6--mutable-default-arguments-are-mutated-in-place) and delete the
+   dead branch in [A8](#a8--delete-the-dead-default-from-support-branch) while
+   in the area.
+3. **Delete.** Everything still listed in
+   [1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs) and
    [1b](#1b-placeholder-implementations-that-the-architecture-no-longer-uses),
-   [1d](#1d-single-use-wrappers-that-add-a-hop-without-adding-meaning), and the
-   unused imports in [3d](#3d-unused-imports-and-locals-pyflakes). This shrinks
-   the surface everything else has to be checked against. Take the
+   plus the unused imports in
+   [3d](#3d-unused-imports-and-locals-pyflakes). Take the
    [3f plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop)
-   here too: it closes [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop)
-   by deletion rather than by adding a flag, and it pairs naturally with
+   here too: it closes
+   [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop) by
+   deletion rather than by adding a flag, and it pairs naturally with
    [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)
    since both add a static claim to the same problem class.
 4. **Unify.** One constitutive kernel
-   ([2a](#2a-von-mises--cauchy-stress-written-three-times)), the missing
-   `solve_uncoupled` driver so the three modes share one contract
-   ([2j-plan](#2j-plan--extract-solve_uncoupled-for-a-uniform-driver-contract)),
-   one Rodrigues,
-   one set of symmetry transforms
-   ([2b](#2b-rotation-and-symmetry-primitives-written-twice)), one
-   `curves_from_dofs` ([2e](#2e-curves_jax-rebuilt-in-eight-places)), one FE
-   and surface geometry cache
+   ([2a](#2a-von-mises--cauchy-stress-written-three-times)); the missing
+   `solve_uncoupled` driver so the modes share one contract
+   ([2j-plan](#2j-plan--extract-solve_uncoupled-for-a-uniform-driver-contract));
+   one set of public rotation and symmetry helpers in `geo/symmetries`
+   ([2b](#2b-rotation-and-symmetry-primitives-written-twice)); one
+   `curves_from_dofs` ([2e](#2e-curves_jax-rebuilt-in-eight-places)); one
+   plotting-only weight helper
+   ([2f](#2f-surface-weight-scatter-duplicated-three-times)); one FE and
+   surface geometry cache
    ([2d](#2d-fe-geometry-recomputed-three-times-per-coil-per-evaluation)).
 5. **Vectorise then JIT.** [4b](#4b-replace-per-endpoint-python-loops-with-vmap)
-   first (it shrinks what has to be compiled), then
+   first (it shrinks what has to be compiled, and the
+   [3e](#3e-dataclasses-for-the-endpoint-spec-dicts) `NamedTuple` change is its
+   natural precursor), then
    [4a](#4a-jit-the-beam-side-biggest-single-win-on-cpu),
    [4c](#4c-jit-_body_force_at_quads), [4d](#4d-jit-the-metric-block-in-objective),
    [4e](#4e-structure-objective-as-three-stages).
 6. **Priority-path polish.** [4g](#4g-halve-the-monolithic-backward-assembly)
    and [4f](#4f-biot_savart-materialises-an-n_src-n_targets-3-intermediate),
-   which are the two items that matter most for large cuDSS/monolithic runs.
+   the two items that matter most for large cuDSS/monolithic runs.
 7. **Boundaries and docs.** [Philosophy 2](#philosophy-2--support-must-be-independent-of-coilfem),
-   then reconcile AGENTS.md and `docs/developers/support_structure.rst`.
+   then reconcile AGENTS.md and `docs/developers/support_structure.rst` —
+   including removing `displacement_at` from both
+   ([1b](#1b-placeholder-implementations-that-the-architecture-no-longer-uses)).
 
 ---
 
@@ -1602,7 +1531,7 @@ using the fixtures from `tests/test_beam_networks.py`.
 
 ### Coil geometry used
 
-This matters for [A2](#a2--block-gaussseidel-does-not-converge-and-says-nothing),
+This matters for [A2](#a1--staggered-coupling-is-disabled-by-decision),
 so it is spelled out. All coils are `CurveXYZFourierJAX` objects:
 
 - **Coplanar circles** (`_make_curves` from `tests/test_beam_networks.py`):
@@ -1614,7 +1543,7 @@ so it is spelled out. All coils are `CurveXYZFourierJAX` objects:
   `amp · R · N(0, 1)` (`amp = 0.05`–`0.08`) to every sine and cosine
   coefficient of every coordinate above mode 1, plus an out-of-plane `y` mode-1
   term. These runs did not complete; see
-  [A2d](#a2d--higher-order-curves-are-pathologically-slow).
+  [4j](#4j-higher-order-curves-are-pathologically-slow--unexplained).
 
 Attachment functions: either `_uniform_clamp_fn` from the test fixture (weight
 1.0 at every surface quadrature point) or a localised sigmoid ball,
