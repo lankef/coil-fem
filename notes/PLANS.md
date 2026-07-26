@@ -81,11 +81,25 @@ regardless:
   branch still sums a dimensionless `w = 1.0`, so at `k_lin = 1e8` the coil
   side is about `7e6` N/m and the foundation side is `1e8` N/m.
 
-Open question to settle before re-enabling anything: should `k_tor` remain a
-free parameter at all? A single foundation modulus (`k_tor == k_lin`, a
-genuine distributed spring bed) makes the whole merged system symmetric
-positive definite for free and improves the conditioning by four orders of
-magnitude.
+**Decided:** `k_tor` and `k_lin` are unified into a single
+`beam_options['k_attachment']` [N/m³] — a genuine distributed spring bed, not
+a workaround, since both were already the same units. This removes the
+asymmetry/indefiniteness above entirely and unconditionally (not only when a
+user happens to configure equal values): `K_ss` and the `K_cs`/`K_sc`
+coupling blocks become symmetric to machine precision for every
+configuration, and the condition number improves by four orders of magnitude
+(`9.1e9 -> 9.58e5`). It also lets `SupportBeams.matrix_symmetry` inherit the
+base `Support` claim unconditionally rather than compare `k_tor == k_lin` at
+runtime — one fewer method on `SupportBeams`. See `REVIEW_2026_JULY.md` A2
+and A5a.
+
+**Unification does not fix the two contributing defects above** — they are
+about the CF foundation's zero moment arm and a missing area factor, neither
+of which depends on which constant (or how many) multiply them. Both remain
+open and need their own fix, alongside an assembly-time guard
+(`min(svd(K_ss))`, or surface the cuDSS inertia currently discarded at
+`cudss.py:408` / `drivers.py:559`) so a future zero-energy mode fails loudly
+rather than silently.
 
 ### Issue: `winkler_k` may be ignored for CF-beam-only supports
 
