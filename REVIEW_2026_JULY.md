@@ -33,12 +33,17 @@ Two findings drive everything else:
    principle, and the block Gauss–Seidel iteration never reaches a fixed
    point. `solve_staggered` will raise `NotImplementedError`; the numerical
    analysis is preserved in `notes/PLANS.md`. **[measured]**
-2. **`k_tor ≠ k_lin` makes the coupled operator non-self-adjoint with an
-   indefinite symmetric part, and this is *not* fixed by retiring staggered.**
-   The same `K_ss` feeds the merged monolithic matrix, at `cond = 9.1 × 10⁹`
-   with four negative eigenvalues out of 48. At `k_tor = k_lin` the matrix
-   becomes symmetric to machine precision, positive definite, and four orders
-   of magnitude better conditioned. **[measured]**
+2. **`k_tor` and `k_lin` are being unified into one `k_attachment` modulus,
+   because unequal values made the coupled operator non-self-adjoint with an
+   indefinite symmetric part — and this was *not* fixed by retiring
+   staggered.** The same `K_ss` feeds the merged monolithic matrix, at
+   `cond = 9.1 × 10⁹` with four negative eigenvalues out of 48. At
+   `k_tor = k_lin` the matrix becomes symmetric to machine precision,
+   positive definite, and four orders of magnitude better conditioned.
+   **[measured]** The unification does not fix the two independent defects
+   in the same rotational subspace — the CF foundation endpoint has no
+   moment arm, and its stiffness formula is missing the area factor every
+   coil-side endpoint carries — so those still need their own fix.
 
 Behind those: roughly 500 lines have no caller anywhere in `src/`, `tests/`,
 `examples/`, or `docs/`; the von Mises kernel is written out three times; the
@@ -50,7 +55,7 @@ Priority ordering:
 
 | Priority | Item | Where |
 |---|---|---|
-| P0 | `k_tor ≠ k_lin` leaves `K_ss` near-singular; inherited by the monolithic path | [A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular) |
+| P0 | Unify `k_tor`/`k_lin` into `k_attachment`; fix CF grounding and units mismatch that unification alone does not fix | [A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment) |
 | P0 | Retire the staggered driver and delete its body | [A1](#a1--staggered-coupling-is-disabled-by-decision), [2c](#2c-_sweep-and-_sweep_full-are-the-same-function) |
 | P1 | Derive the cuDSS matrix type from per-block symmetry claims | [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest) |
 | P1 | Declare `is_linear` and delete the Newton branch; closes the jit trap | [3f-plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop), [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop) |
@@ -108,7 +113,7 @@ retired rather than repaired piecemeal:
 - **Numerical / modelling.** `k_tor ≠ k_lin` makes the coupled operator
   non-self-adjoint with an indefinite symmetric part. This one is **not**
   fixed by disabling the staggered driver — see
-  [A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular).
+  [A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment).
 - **Programming.** `jax.grad` through the driver raises
   `ConcretizationTypeError` from `float(jnp.max(jnp.abs(delta)))` in
   `_run_iterations`. The docstrings advertise `jax.lax.custom_root`, which does
@@ -130,13 +135,22 @@ with its `fwd`/`bwd` pair, and the unreachable `options` plumbing
 ([1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs)). See
 [2c](#2c-_sweep-and-_sweep_full-are-the-same-function).
 
-### A2 — Unequal `k_tor` and `k_lin` make the coupled operator near-singular
+### A2 — Decision: unify `k_tor` and `k_lin` into a single `k_attachment`
 
 This is the finding that survives disabling the staggered driver, because the
 same `K_ss` and coupling blocks are assembled into the merged monolithic
-matrix.
+matrix. It is also the one open modelling question the earlier draft of this
+review left unresolved.
 
-Sweeping `k_tor` with `k_lin = 1e8` fixed **[measured]**:
+**Decision: `k_tor` and `k_lin` are unified into one modulus, `k_attachment`
+[N/m³].** Both were already documented as the same units (see
+[A10](#a10--resolved-k_lin--k_tor-units-corrected)), so this is a genuine
+distributed-spring-bed model, not a workaround: one attachment stiffness
+governs both the translational and the rotational (moment-arm) contribution
+of every spring in the network.
+
+**Evidence for the decision.** Sweeping `k_tor` with `k_lin = 1e8` fixed
+**[measured]**:
 
 | `k_tor` | `‖K_ss − K_ssᵀ‖/‖K_ss‖` | `‖K_cs − K_scᵀ‖/‖K_cs‖` | negative eigenvalues of `sym(K_ss)` | `σ_min(K_ss)` | cond `K_ss` |
 |---:|---|---|---:|---|---:|
@@ -144,65 +158,80 @@ Sweeping `k_tor` with `k_lin = 1e8` fixed **[measured]**:
 | 1e6 | 1.236e-03 | 2.699e-02 | 4 / 48 | 1.695e+00 | 9.10e7 |
 | 1e8 (= `k_lin`) | **1.7e-17** | **0.0 exactly** | **0 / 48** | 1.611e+02 | 9.58e5 |
 
-`σ_min(K_ss)` tracks `k_tor` linearly over four decades, and at
-`k_tor = k_lin` the four negative eigenvalues of the symmetric part vanish, the
-matrix becomes symmetric to machine precision, and the condition number drops
-by four orders of magnitude. The weak subspace is exactly the rotational DOFs,
-whose only external stiffness is `k_tor`.
+The cause is structural. `_spring_stiffness_contributions` writes the
+translation–rotation block as `−k_lin Σ w [r]×` and the torque–translation
+block as `+k_tor Σ w [r]×` (`beam_network.py:1797-1803`). Since
+`[r]×ᵀ = −[r]×`, the transpose of the first is `+k_lin Σ w [r]×`, which equals
+the second only when `k_tor = k_lin`. `coupling_values` has the same
+structure (`beam_network.py:1541-1547`). Translation–translation blocks are
+symmetric unconditionally, and the bare beam `K_global = Γ K_local Γᵀ` is
+symmetric by congruence, so `k_tor` was the *only* source of asymmetry
+anywhere in the merged system. With one modulus that source is gone: the
+translation–rotation and torque–translation blocks become transposes of each
+other by construction, for every beam, always — not only when a user happens
+to configure equal values.
 
-The cause is structural rather than a tuning accident.
-`_spring_stiffness_contributions` writes the translation–rotation block as
-`−k_lin Σ w [r]×` and the torque–translation block as `+k_tor Σ w [r]×`
-(`beam_network.py:1797-1803`). Since `[r]×ᵀ = −[r]×`, the transpose of the
-first is `+k_lin Σ w [r]×`, which equals the second only when
-`k_tor = k_lin`. `coupling_values` has the same structure:
-`(blk_r_cs)ᵀ = −k_lin · skew_eff · Q` while `blk_r_sc = −k_tor · skew_eff · Q`
-(`beam_network.py:1541-1547`). Translation–translation blocks are symmetric
-unconditionally, and the bare beam `K_global = Γ K_local Γᵀ` is symmetric by
-congruence, so **`k_tor` is the only source of asymmetry in the whole merged
-system**, and it enters both the diagonal `K_ss` and the off-diagonal coupling.
+**What this fixes.** The negative-eigenvalue / non-self-adjoint behaviour
+above vanishes entirely: `K_ss` and the `K_cs`/`K_sc` coupling blocks are
+symmetric to machine precision unconditionally, and the condition number
+improves by four orders of magnitude (`9.1e9 → 9.58e5`). Two direct
+consequences follow: `SupportBeams.solve`'s dense `lineax.LU()`
+(`beam_network.py:2024-2037`) no longer loses ~10 of 16 digits to an
+indefinite factorisation, and the same improvement is inherited by the merged
+monolithic matrix via `make_merged_solve`.
 
-Two direct consequences of `cond = 9.1 × 10⁹` on a 48 × 48 matrix:
+**What this does *not* fix — two independent defects remain, in the same
+rotational subspace:**
 
-1. `SupportBeams.solve` densifies this block and factors it with
-   `lineax.LU()` (`beam_network.py:2024-2037`), losing roughly 10 of 16
-   digits.
-2. The same values go into the merged monolithic matrix via
-   `make_merged_solve`, so the conditioning is inherited by the cuDSS path.
-
-Two further defects in the same rotational subspace, which compound it:
-
-- **The CF foundation endpoint provides no rotational grounding at all.**
+- **The CF foundation endpoint still provides no rotational grounding.**
   `_endpoint_weights_and_r` sets `r_fnd = x_foundation[i][j] - geom['x_end'][b]`
-  where `geom['x_end'][b]` *is* `x_foundation[i][j]` (the code says so at
-  `beam_network.py:1704`), so `r_fnd ≡ 0`, hence `skew_sum = skew2_sum = 0`,
-  hence `K_tr = K_rt = K_rr = 0` at the foundation node. `_assemble_rhs`
-  explicitly does nothing for it (`pass`, `beam_network.py:1952`). Even setting
-  `k_tor = k_lin` leaves the foundation nodes with no rotational spring,
-  because `k_tor` multiplies a zero moment arm there.
-- **A units mismatch between the coil side and the foundation side.** Every
-  coil-side endpoint contributes `K_tt += k_lin · Σ(w · JxW) · I₃` — an
-  *area*-weighted sum — while the foundation endpoint contributes
-  `K_tt += k_lin · 1.0 · I₃` with a dimensionless `w_sum = 1.0`
-  (`beam_network.py:1778-1781`). At `k_lin = 1e8` N/m³ the coil side is
-  `≈ 7 × 10⁶` N/m and the foundation side is `10⁸` N/m — 14× stiffer, for no
-  physical reason. The JxW change updated the coil branch and left the
-  foundation branch alone.
+  where `geom['x_end'][b]` *is* `x_foundation[i][j]` (`beam_network.py:1704`),
+  so `r_fnd ≡ 0`, hence `skew_sum = skew2_sum = 0`, hence
+  `K_tr = K_rt = K_rr = 0` at the foundation node regardless of the modulus
+  name. `_assemble_rhs` explicitly does nothing for it (`pass`,
+  `beam_network.py:1952`). This is orthogonal to the `k_tor`/`k_lin`
+  unification — it was never about which constant multiplies the moment arm,
+  it is that the moment arm is zero — so it still needs its own fix (a hard
+  clamp of the foundation node's rotational DOFs is the natural one, since a
+  foundation anchor is a rigid point rather than a distributed contact).
+- **The units mismatch between the coil side and the foundation side is
+  likewise untouched by the rename.** Every coil-side endpoint contributes
+  `K_tt += k_attachment · Σ(w · JxW) · I₃` — an *area*-weighted sum — while the
+  foundation endpoint contributes `K_tt += k_attachment · 1.0 · I₃` with a
+  dimensionless `w_sum = 1.0` (`beam_network.py:1778-1781`). At
+  `k_attachment = 1e8` N/m³ the coil side is `≈ 7 × 10⁶` N/m and the
+  foundation side is `10⁸` N/m — 14× stiffer, for no physical reason, and
+  unifying the two moduli does nothing about a formula that was never using
+  two moduli in the first place.
 
-A cheap diagnostic that would surface this at assembly time: `merged_solve`
-already receives the matrix inertia from cuDSS and discards it
+**A note on the residual conditioning.** `cond(K_ss) = 9.58e5` after the fix
+is not itself alarming — beam-frame stiffness matrices routinely span this
+range because axial (`EA/L`), torsional (`GJ/L`), and bending (`EI/L³`)
+terms differ by orders of magnitude — but it is not verified to be free of
+further soft modes, and the CF grounding defect above is exactly the kind of
+thing that could reintroduce one. Keep the assembly-time guard below
+regardless of whether the CF fix lands in the same change.
+
+A cheap diagnostic for this at assembly time: `merged_solve` already receives
+the matrix inertia from cuDSS and discards it
 (`sol_flat, _inertia = solver_K(f_merged, csr_values)`, `drivers.py:559`).
 Surfacing it, or asserting on `min(svd(K_ss))` in a test, would catch a
-zero-energy mode where it happens.
+zero-energy mode wherever one occurs.
 
-**Open modelling question, worth settling before anything downstream:** should
-`k_tor` remain a free parameter? A single foundation modulus
-(`k_tor ≡ k_lin`, a genuine distributed spring bed) makes the merged system
-symmetric positive definite for free. Both are N/m³ — see
-[A10](#a10--resolved-k_lin--k_tor-units-corrected) — so a single modulus is
-also the dimensionally natural choice. It would additionally collapse the
-[A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)
-mechanism to a constant.
+**What the rename touches in code:** `beam_options['k_lin']` /
+`beam_options['k_tor']` → a single `beam_options['k_attachment']`;
+`_REQUIRED_BEAM_OPTIONS` in `optimizables.py`; `SupportBeams.__init__`'s
+`self._k_lin` / `self._k_tor` → `self._k_attachment`; the `k_lin`/`k_tor`
+properties (`beam_network.py:441-446`) → one `k_attachment` property; every
+formula site in `coupling_values`, `_spring_stiffness_contributions`, and
+`_assemble_rhs` that reads `self.k_lin`/`self.k_tor`; the class docstring's
+"Stiffness matrix symmetry" note (`beam_network.py:209-214`), which currently
+says `K_ss` is *not* symmetric in general — that becomes simply false and
+should be rewritten to state the opposite; `CoilFEM`'s consistency check
+against `support.k_lin` ([A8](#a8--delete-the-dead-default-from-support-branch))
+becomes a check against `support.k_attachment`; and the docstrings fixed in
+[A10](#a10--resolved-k_lin--k_tor-units-corrected), which collapse from two
+entries to one.
 
 ### A3 — Merged into A1
 
@@ -275,11 +304,15 @@ What the two matrices actually are **[measured]**:
   So `1` is the sound default and `3` is not safe in general, because the
   sigmoid clamps used in practice do underflow to exactly zero away from the
   clamp.
-- **The merged monolithic matrix** is symmetric **iff `k_tor = k_lin`**, and
-  is otherwise both non-symmetric and indefinite in its symmetric part; see
-  the sweep in [A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular). With
-  the fixture's `k_tor = 1e4, k_lin = 1e8` the relative asymmetry is `1.2e-3`
-  in `K_ss` and `2.7e-2` between `K_cs` and `K_scᵀ`, so `0` is required.
+- **The merged monolithic matrix** was symmetric only when `k_tor = k_lin`,
+  and otherwise both non-symmetric and indefinite in its symmetric part; see
+  the sweep in [A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment).
+  With the fixture's `k_tor = 1e4, k_lin = 1e8` the relative asymmetry was
+  `1.2e-3` in `K_ss` and `2.7e-2` between `K_cs` and `K_scᵀ`, requiring `0`.
+  With [A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment)'s
+  `k_attachment` unification, this matrix is symmetric unconditionally, by
+  construction, for every configuration — not only when a user happens to set
+  equal values.
 
 The hazard is therefore worse than a mistuned option. With `mview_id`
 hard-coded to `0` (`CUDSS_MVIEW_FULL`, `coil_fem.py:441`) you hand cuDSS the
@@ -293,11 +326,27 @@ Rather than pick a default, let the matrix type be *derived* from claims made
 by the objects that actually know the answer. No object infers another
 object's properties, and no caller has to remember a cuDSS integer.
 
+**Simplified by the [A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment)
+decision.** With `k_tor` and `k_lin` unified into `k_attachment`,
+`SupportBeams` is symmetric unconditionally — there is no longer a
+configuration in which it is not — so it no longer needs to override
+`matrix_symmetry` at all. It simply inherits the base `Support` claim. That is
+one fewer method on `SupportBeams`, which is the "mildly simplifies
+`SupportBeams`" half of the A2 decision.
+
 | Block | Owner of the claim | Claim | Why that owner |
 |---|---|---|---|
-| `K_cc` | `LinearElasticity3D` | `'symmetric'`, unconditionally | Property of the weak form. `k_tor` never enters it |
-| `K_ss`, `K_cs` / `K_sc` | `Support` | base: `'symmetric'`; `SupportBeams`: `'symmetric'` if `k_tor == k_lin` else `'general'` | `k_tor` is the only asymmetry source anywhere in the system ([A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular)) |
+| `K_cc` | `LinearElasticity3D` | `'symmetric'`, unconditionally | Property of the weak form |
+| `K_ss`, `K_cs` / `K_sc` | `Support` | `'symmetric'`, unconditionally — inherited by `SupportBeams` without an override | `k_attachment` guarantees the translation–rotation and torque–translation blocks are transposes of each other for every beam ([A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment)) |
 | merged | `CoilFEM`, derived | weakest of all contributing claims | A merged matrix is only as symmetric as its least symmetric block |
+
+In the current codebase every claim now resolves to `'symmetric'`, so the
+derived merged type is `'symmetric'` unconditionally too — the mechanism is
+provably a no-op today. It is still worth building, for two reasons: it
+documents *why* `mtype_id=1` is safe rather than asserting it, and it is the
+regression guard for the day a future coupled `Support` subclass introduces
+its own asymmetry — at which point `weakest_symmetry` downgrades the merged
+claim automatically instead of silently staying at `1`.
 
 **Vocabulary.** Solver-agnostic strings, matching the existing
 `coupling='staggered'|'monolithic'` and `shape='rect'|'disk'` style. The
@@ -324,16 +373,12 @@ def matrix_symmetry(self) -> str:
     """``'symmetric'`` — elasticity tangent, Winkler mass term, symmetric BC elimination."""
     return 'symmetric'
 
-# coupling/supports.py — uniform contract; base support adds no asymmetry
+# coupling/supports.py — uniform contract; SupportBeams inherits this
+# unchanged now that k_tor and k_lin are unified into k_attachment.
 @property
 def matrix_symmetry(self) -> str:
+    """``'symmetric'`` — no coupled `Support` in this codebase is asymmetric."""
     return 'symmetric'
-
-# coupling/beam_network.py
-@property
-def matrix_symmetry(self) -> str:
-    """``'symmetric'`` only when the torque and force laws share a modulus."""
-    return 'symmetric' if self._k_tor == self._k_lin else 'general'
 ```
 
 **Consumption points.** Two, and neither needs new plumbing:
@@ -353,15 +398,7 @@ overriding one path independently turns out to be needed.
 
 **Constraints the implementation must respect:**
 
-1. **Compare `k_tor == k_lin` exactly — do not reuse the `1e-6` relative
-   tolerance** that `CoilFEM` applies to `winkler_k` vs `k_lin`
-   (`coil_fem.py:313`). A `1e-6` relative difference in `k_tor` produces a
-   `~1e-6` relative asymmetry, which is nowhere near machine zero, and with
-   `mview = FULL` that silently symmetrises. **[measured]** the asymmetry is
-   `1.7e-17` at exact equality and `1.2e-3` at `k_tor = k_lin·1e-4`. Both are
-   Python floats set once from `beam_options`, so exact equality is both
-   achievable and the only safe test.
-2. **Never let anything auto-declare `'spd'`.** Definiteness is not a static
+1. **Never let anything auto-declare `'spd'`.** Definiteness is not a static
    property: **[measured]** `K_cc` is SPD with `w = 1` everywhere but has five
    eigenvalues within `1e-6` of zero with a 10 %-area clamp, because whether
    the six rigid-body modes are pinned depends on runtime weight values.
@@ -369,7 +406,7 @@ overriding one path independently turns out to be needed.
    exists and is being thrown away: `merged_solve` receives the matrix inertia
    from cuDSS and discards it (`sol_flat, _inertia = solver_K(...)`,
    `drivers.py:559`).
-3. **`mview_id` stays `0` (`CUDSS_MVIEW_FULL`)** — the full matrix is always
+2. **`mview_id` stays `0` (`CUDSS_MVIEW_FULL`)** — the full matrix is always
    supplied. Document the `mtype`/`mview` pairing next to `_MTYPE_ID` so the
    two cannot drift apart.
 
@@ -378,31 +415,28 @@ for `coupling='staggered'` with `solver='cudss'`: under `'monolithic'` the
 per-coil `fwd_pred` is never called for a solve, and the uncoupled path only
 ever sees a base `Support`, which already claims `'symmetric'`. So splitting
 the ownership is about correctness of ownership and about not paying ~2× flops
-and storage on the staggered path — not a broad speed-up. The one behaviour
-change to flag is on the merged side: a user running `k_tor == k_lin` today
-gets `mtype=0` (LU) and would get `mtype=1` (LDLᵀ) after this change, which is
-both valid and cheaper, but is a change.
+and storage on the staggered path — not a broad speed-up. The behaviour
+change on the merged side is now unconditional rather than depending on user
+configuration: every merged system built with a `SupportBeams` moves from
+`mtype=0` (LU) to `mtype=1` (LDLᵀ), which is both valid and cheaper, because
+`k_attachment` makes the matrix symmetric by construction.
 
 **Tests** (all matrix-assembly only; none require a solve):
 
-- `SupportBeams.matrix_symmetry` returns `'symmetric'` at `k_tor == k_lin` and
-  `'general'` otherwise, including at the boundary
-  `k_tor = k_lin * (1 + 1e-12)`.
-- `weakest_symmetry` returns `'general'` if any claim is `'general'`.
-- Assemble `K_ss` plus the coupling blocks and assert
-  `‖K − Kᵀ‖/‖K‖ < 1e-14` exactly when the derived claim is `'symmetric'`, and
-  `> 1e-6` when it is `'general'`. This is the test that validates the claim
-  against the matrix rather than against another line of code.
+- `SupportBeams().matrix_symmetry == 'symmetric'` — a one-line check that the
+  inherited claim resolves correctly, now that there is no override to test
+  against a boundary condition.
+- `weakest_symmetry` returns `'general'` if any claim is `'general'` (an
+  isolated unit test of the meet, since nothing in the current codebase
+  exercises that branch).
+- Assemble `K_ss` plus the coupling blocks for a representative
+  `SupportBeams` network and assert `‖K − Kᵀ‖/‖K‖ < 1e-14` unconditionally —
+  this is the test that validates the claim against the matrix rather than
+  against another line of code, and it is the one that would have caught the
+  original defect.
 - `LinearElasticity3D.matrix_symmetry == 'symmetric'`, with the same assembled
   check on `K_cc` via `jax.jacfwd` of `compute_residual_vars`.
 - An explicit `cudss_mtype_id` that disagrees with the derived value warns.
-
-Finally, note that if `k_tor ≡ k_lin` were adopted as the model rather than
-left as a free parameter (see
-[A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular)), `SupportBeams`
-would claim `'symmetric'` unconditionally and this whole mechanism would
-reduce to a single constant — which is an argument for settling that modelling
-question first.
 
 ### A6 — Mutable default arguments are mutated in place
 
@@ -519,11 +553,11 @@ modulus — precisely the inconsistency the block exists to prevent. Defensive
 
 Either declare `k_lin` on the base `Support` (as a property returning `None`
 or raising `NotImplementedError`) and test unconditionally, or validate at
-construction that `is_coupled=True` implies `k_lin` is present. Note also that
-the tolerance here is `1e-6` relative, which is appropriate for a physical
-consistency check but must **not** be reused for the exact `k_tor == k_lin`
-symmetry test in
-[A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest).
+construction that `is_coupled=True` implies `k_lin` is present. The tolerance
+here is `1e-6` relative, which is appropriate for a physical consistency
+check between `winkler_k` and the support modulus. (With the
+[A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment) rename,
+this becomes `support.k_attachment`.)
 
 ### A9 — Excluded: disk meshes are incomplete
 
@@ -546,10 +580,11 @@ the first `run()` / `objective()`.
 docstrings were simply wrong.
 
 **Resolved:** corrected in `beam_network.py:133-141` and
-`optimizables.py:432-438`, and both now state the relationship to
-`problem_options['winkler_k']`. That `k_lin` and `k_tor` share units is also
-an argument for the single-modulus question raised in
-[A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular).
+`optimizables.py:432-438`. That `k_lin` and `k_tor` shared units the whole
+time is exactly what makes the
+[A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment) unification
+into `k_attachment` dimensionally sound rather than a workaround — the two
+docstrings collapse from two entries to one when that rename lands.
 
 ---
 
@@ -1137,7 +1172,7 @@ fallback for anything non-linear.
 **One caveat: keep a way to detect a bad factorisation.** With no residual
 check, a singular or near-singular `K` yields garbage silently — and that is
 not hypothetical here, since
-[A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular) measures
+[A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment) measures
 `cond(K_ss) = 9.1 × 10⁹`. The iterative branch at least reported a large
 residual. The cheap replacement already exists and is being discarded: cuDSS
 returns the matrix inertia at both `cudss.py:408`
@@ -1477,12 +1512,21 @@ files.
 
 Blocks Phase 3. Affects current monolithic results.
 
-- Decide whether `k_tor` stays a free parameter, or is fixed to `k_lin`
-  ([A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular)).
-- Give the CF foundation endpoint real rotational grounding (`r_fnd ≡ 0`).
-- Fix the coil-side / foundation-side units mismatch (`Σ w·JxW` vs `w = 1.0`).
+- Unify `k_tor` and `k_lin` into a single `beam_options['k_attachment']`
+  ([A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment)) —
+  rename through `SupportBeams` (constructor, storage, property, every
+  formula site), `CoilSupportBeams` (`_REQUIRED_BEAM_OPTIONS`), and the
+  `CoilFEM` consistency check against `support.k_lin`
+  ([A8](#a8--delete-the-dead-default-from-support-branch)).
+- Give the CF foundation endpoint real rotational grounding (`r_fnd ≡ 0`) —
+  not fixed by the rename above; still a separate defect.
+- Fix the coil-side / foundation-side units mismatch (`Σ w·JxW` vs `w = 1.0`)
+  — likewise not fixed by the rename.
 - Add an assembly-time guard: assert on `min(svd(K_ss))`, or surface the cuDSS
   inertia currently discarded at `cudss.py:408` and `drivers.py:559`.
+- Test: assemble `K_ss` and the coupling blocks for a representative network
+  and assert `‖K − Kᵀ‖/‖K‖ < 1e-14` unconditionally (no `k_tor`/`k_lin`
+  parametrisation needed any more).
 
 ### Phase 2 — Retire and delete
 
@@ -1508,7 +1552,8 @@ Pure subtraction. No behaviour change on the monolithic or uncoupled paths.
 
 ### Phase 3 — Solver claims
 
-Depends on the Phase 1 `k_tor` decision.
+Depends on Phase 1 landing first: `matrix_symmetry` is simpler to write and
+test once `SupportBeams` is unconditionally symmetric.
 
 - Declare `is_linear` on the problem and delete the Newton branch
   ([3f-plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop)),
@@ -1516,6 +1561,8 @@ Depends on the Phase 1 `k_tor` decision.
   [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop).
 - Declare `matrix_symmetry` per block and derive the merged cuDSS type
   ([A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)).
+  With Phase 1 done, `SupportBeams` needs no override at all — it inherits
+  the base `Support` claim.
 
 ### Phase 4 — Unify duplicates
 
@@ -1607,6 +1654,12 @@ support DOFs from `_make_support_dofs` (CC attachment at `φ = 0.1` on both
 ends, CF at `φ = 0.6`, foundation anchors offset `+0.5` in *x*).
 
 ### Configurations
+
+The `k_tor` / `k_lin` distinction below reflects the codebase *as measured*.
+[A2](#a2--decision-unify-k_tor-and-k_lin-into-a-single-k_attachment) unifies
+both into a single `k_attachment`; the sweep across `k_tor` values here is
+exactly the evidence for that decision, not a parametrisation that survives
+it.
 
 Timing table: `n_base=2`, `n_beam_cc=3`, `n_beam_cf=3`, `nfp=2`,
 `stellsym=False`, `N=32` quadpoints, mesh
