@@ -72,6 +72,8 @@ Priority ordering:
 [A4](#a4--excluded-cross-section-presets-are-incomplete) (cross-section
 presets) and [A9](#a9--excluded-disk-meshes-are-incomplete) (disk meshes).
 
+See [Implementation phases](#implementation-phases) for the suggested order.
+
 **Declined:** [1d](#1d-single-use-wrappers--declined) (single-use wrappers),
 the `print()` summary and `kwargs is None` check in
 [Philosophy 3 / 4](#philosophy-3--4--simsopt-wrappers), and the
@@ -1466,60 +1468,111 @@ ancestor of `coil_fem.py`). Worth deleting from the working tree.
 
 ---
 
-## Suggested sequencing
+## Implementation phases
 
-1. **Settle `k_tor`.** [A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular)
-   is the finding that affects the priority cuDSS path, and several others are
-   contingent on it: the accuracy of the dense `K_ss` LU, the conditioning of
-   the merged matrix, and whether the
-   [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)
-   symmetry mechanism collapses to a constant. Decide whether `k_tor` stays a
-   free parameter, fix the two contributing defects (CF foundation rotational
-   grounding, coil-side vs foundation-side units), and add an assertion on
-   `min(svd(K_ss))` — or surface the cuDSS inertia — so a zero-energy mode
-   fails loudly at assembly.
-2. **Retire staggered.** Make `solve_staggered` raise and delete its body
-   ([A1](#a1--staggered-coupling-is-disabled-by-decision),
-   [2c](#2c-_sweep-and-_sweep_full-are-the-same-function)). Fix
-   [A6](#a6--mutable-default-arguments-are-mutated-in-place) and delete the
-   dead branch in [A8](#a8--delete-the-dead-default-from-support-branch) while
-   in the area.
-3. **Delete.** Everything still listed in
-   [1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs) and
-   [1b](#1b-placeholder-implementations-that-the-architecture-no-longer-uses),
-   plus the unused imports in
-   [3d](#3d-unused-imports-and-locals-pyflakes). Take the
-   [3f plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop)
-   here too: it closes
-   [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop) by
-   deletion rather than by adding a flag, and it pairs naturally with
-   [A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)
-   since both add a static claim to the same problem class.
-4. **Unify.** One constitutive kernel
-   ([2a](#2a-von-mises--cauchy-stress-written-three-times)); the missing
-   `solve_uncoupled` driver so the modes share one contract
-   ([2j-plan](#2j-plan--extract-solve_uncoupled-for-a-uniform-driver-contract));
-   one set of public rotation and symmetry helpers in `geo/symmetries`
-   ([2b](#2b-rotation-and-symmetry-primitives-written-twice)); one
-   `curves_from_dofs` ([2e](#2e-curves_jax-rebuilt-in-eight-places)); one
-   plotting-only weight helper
-   ([2f](#2f-surface-weight-scatter-duplicated-three-times)); one FE and
-   surface geometry cache
-   ([2d](#2d-fe-geometry-recomputed-three-times-per-coil-per-evaluation)).
-5. **Vectorise then JIT.** [4b](#4b-replace-per-endpoint-python-loops-with-vmap)
-   first (it shrinks what has to be compiled, and the
-   [3e](#3e-dataclasses-for-the-endpoint-spec-dicts) `NamedTuple` change is its
-   natural precursor), then
-   [4a](#4a-jit-the-beam-side-biggest-single-win-on-cpu),
-   [4c](#4c-jit-_body_force_at_quads), [4d](#4d-jit-the-metric-block-in-objective),
-   [4e](#4e-structure-objective-as-three-stages).
-6. **Priority-path polish.** [4g](#4g-halve-the-monolithic-backward-assembly)
-   and [4f](#4f-biot_savart-materialises-an-n_src-n_targets-3-intermediate),
-   the two items that matter most for large cuDSS/monolithic runs.
-7. **Boundaries and docs.** [Philosophy 2](#philosophy-2--support-must-be-independent-of-coilfem),
-   then reconcile AGENTS.md and `docs/developers/support_structure.rst` —
-   including removing `displacement_at` from both
-   ([1b](#1b-placeholder-implementations-that-the-architecture-no-longer-uses)).
+Each phase is independently mergeable and touches a largely disjoint set of
+files.
+
+### Phase 1 — Correctness of the coupled operator
+
+Blocks Phase 3. Affects current monolithic results.
+
+- Decide whether `k_tor` stays a free parameter, or is fixed to `k_lin`
+  ([A2](#a2--unequal-k_tor-and-k_lin-make-the-coupled-operator-near-singular)).
+- Give the CF foundation endpoint real rotational grounding (`r_fnd ≡ 0`).
+- Fix the coil-side / foundation-side units mismatch (`Σ w·JxW` vs `w = 1.0`).
+- Add an assembly-time guard: assert on `min(svd(K_ss))`, or surface the cuDSS
+  inertia currently discarded at `cudss.py:408` and `drivers.py:559`.
+
+### Phase 2 — Retire and delete
+
+Pure subtraction. No behaviour change on the monolithic or uncoupled paths.
+
+- Make `solve_staggered` raise `NotImplementedError` and delete its body
+  ([A1](#a1--staggered-coupling-is-disabled-by-decision),
+  [2c](#2c-_sweep-and-_sweep_full-are-the-same-function)).
+- Delete the dead code in
+  [1a](#1a-dead-code-no-caller-in-src-tests-examples-or-docs) and the
+  placeholders in
+  [1b](#1b-placeholder-implementations-that-the-architecture-no-longer-uses).
+- Delete the dead default-from-support branch
+  ([A8](#a8--delete-the-dead-default-from-support-branch)) and drop the
+  `hasattr` guard ([A8a](#a8a--the-hasattr-guard-defeats-the-check-it-guards)).
+- Fix the mutable default arguments
+  ([A6](#a6--mutable-default-arguments-are-mutated-in-place)).
+- Clear the unused imports and locals
+  ([3d](#3d-unused-imports-and-locals-pyflakes)) and hoist the stdlib imports
+  ([3b](#3b-local-imports-of-stdlib-and-core-dependencies)).
+- Raise on an unrecognised `attachment_type`
+  ([A4](#a4--excluded-cross-section-presets-are-incomplete)).
+
+### Phase 3 — Solver claims
+
+Depends on the Phase 1 `k_tor` decision.
+
+- Declare `is_linear` on the problem and delete the Newton branch
+  ([3f-plan](#3f-plan--declare-linearity-on-the-problem-and-delete-the-loop)),
+  which closes
+  [A7](#a7--latent-trap-cudss-default-is-the-host-syncing-newton-loop).
+- Declare `matrix_symmetry` per block and derive the merged cuDSS type
+  ([A5a](#a5a--fix-each-block-declares-its-own-symmetry-coilfem-takes-the-weakest)).
+
+### Phase 4 — Unify duplicates
+
+- One constitutive kernel
+  ([2a](#2a-von-mises--cauchy-stress-written-three-times)).
+- Public rotation and symmetry helpers in `geo/symmetries`
+  ([2b](#2b-rotation-and-symmetry-primitives-written-twice)).
+- One `curves_from_dofs` ([2e](#2e-curves_jax-rebuilt-in-eight-places)), one
+  plotting-only weight helper
+  ([2f](#2f-surface-weight-scatter-duplicated-three-times)), one `_clamp_fn`
+  ([2i](#2i-smaller-duplications)).
+- Mandatory `gamma3` key
+  ([2g](#2g-gamma3-resolution-duplicated-four-times)).
+- The missing `solve_uncoupled` driver
+  ([2j-plan](#2j-plan--extract-solve_uncoupled-for-a-uniform-driver-contract)).
+- Direct `meshio` calls
+  ([3c](#3c-meshio-already-knows-how-to-write-these-files)) and the stdlib
+  replacements in [3a](#3a-stdlib-and-jax-built-ins).
+- Move the three init-only helpers to module level
+  ([Philosophy 3 / 4](#philosophy-3--4--simsopt-wrappers)).
+
+### Phase 5 — Vectorise and JIT
+
+- `NamedTuple` endpoint specs
+  ([3e](#3e-dataclasses-for-the-endpoint-spec-dicts)), then `vmap` the
+  per-endpoint loops
+  ([4b](#4b-replace-per-endpoint-python-loops-with-vmap),
+  [2h](#2h-endpoint-weights-and-moment-arms-recomputed-24-per-assembly)).
+- JIT the beam side
+  ([4a](#4a-jit-the-beam-side-biggest-single-win-on-cpu)), the body force
+  ([4c](#4c-jit-_body_force_at_quads)), and the metric block
+  ([4d](#4d-jit-the-metric-block-in-objective)); then stage `objective`
+  ([4e](#4e-structure-objective-as-three-stages)).
+- Cache the FE and surface geometry
+  ([2d](#2d-fe-geometry-recomputed-three-times-per-coil-per-evaluation)).
+- Monolithic-path polish:
+  [4g](#4g-halve-the-monolithic-backward-assembly),
+  [4f](#4f-biot_savart-materialises-an-n_src-n_targets-3-intermediate),
+  [4h](#4h-two-compilations-where-one-would-do),
+  [4i](#4i-small-hot-path-items).
+
+### Phase 6 — Boundaries and documentation
+
+- Separate `Support` from `CoilFEM`
+  ([Philosophy 2](#philosophy-2--support-must-be-independent-of-coilfem)).
+- Move `strain_energy_density` into `metrics`
+  ([Philosophy 6](#philosophy-6--logic-should-live-where-a-dev-would-look-for-it)).
+- Stop overriding `jax_platform_name` at import
+  ([Cross-cutting](#cross-cutting-magneticpy-rewrites-global-jax-config-at-import-time)).
+- Reconcile AGENTS.md and `docs/developers/support_structure.rst`
+  ([Documentation drift](#documentation-drift)).
+
+### Deferred
+
+- Investigate the higher-order-curve slowdown
+  ([4j](#4j-higher-order-curves-are-pathologically-slow--unexplained)).
+- The two open issues recorded in `notes/PLANS.md`.
 
 ---
 
