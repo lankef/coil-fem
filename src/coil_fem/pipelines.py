@@ -8,13 +8,14 @@ spread across lists in :class:`~coil_fem.CoilFEM`.  A stub
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
 import jax
 import jax.flatten_util
 import jax.numpy as jnp
 
-from .problems import LinearElasticity3D, lame_parameters, itc_strain
+from .problems import LinearElasticity3D, lame_parameters
 from .solvers import build_fwd_pred, needs_gpu_assembly
 
 if TYPE_CHECKING:
@@ -72,9 +73,18 @@ class ElasticPipeline:
         )
         mesh.attach_ref_coords(self.problem)
 
-        self.fwd_pred = build_fwd_pred(self.problem, problem_options)
         self.surface_node_indices = self.problem.surface_node_global_indices
         self.problem_options = problem_options
+
+    @functools.cached_property
+    def fwd_pred(self):
+        """Differentiable forward-prediction callable, built on first access.
+
+        Construction is deferred so that the cuDSS path (which builds the full
+        ``CuDSSNewtonSolver``) is skipped entirely on the monolithic coupling
+        path where ``fwd_pred`` is never called.
+        """
+        return build_fwd_pred(self.problem, self.problem_options)
 
     @property
     def n_surface_quads(self) -> int | None:
@@ -120,6 +130,8 @@ class ElasticPipeline:
         body_force: jnp.ndarray,
         support_weights: jnp.ndarray | None = None,
         support_attach: jnp.ndarray | None = None,
+        *,
+        fe_geom: tuple | None = None,
     ) -> dict:
         """Run one differentiable forward FEM solve.
 
@@ -141,6 +153,11 @@ class ElasticPipeline:
             ``k(x) (u − u_attach)`` rather than ``k(x) u``.  Obtain via
             ``support.compute_attach`` called at surface quad points.
             Defaults to zeros.
+        fe_geom : tuple or None
+            Pre-computed ``(shape_grads, JxW, v_grads_JxW, pqp)`` from an
+            earlier :func:`~coil_fem.problems.recompute_fe_geometry` call for
+            the same ``points``.  When provided, :meth:`~coil_fem.problems.LinearElasticity3D.set_params`
+            skips the recompute and uses these arrays directly.
 
         Returns
         -------
@@ -157,6 +174,8 @@ class ElasticPipeline:
             params['support_weights'] = support_weights
         if support_attach is not None:
             params['support_attach'] = support_attach
+        if fe_geom is not None:
+            params['_fe_geom'] = fe_geom  # consumed by set_params, not by the solver
 
         sol_list = self.fwd_pred(params)
         return {
@@ -164,32 +183,6 @@ class ElasticPipeline:
             'u':        sol_list[0],
             'problem':  self.problem,
         }
-
-    def solve_residual(self, params: dict) -> jnp.ndarray:
-        """Compute the flat FEM residual vector at the zero-displacement solution.
-
-        Calls :meth:`~coil_fem.problems.LinearElasticity3D.set_params` then
-        evaluates the residual ``R(0)`` (the negation of the load vector for
-        a linear problem).  Used by the monolithic driver to assemble the
-        merged right-hand side without re-running a full Newton solve.
-
-        Parameters
-        ----------
-        params : dict
-            Same format as accepted by :meth:`solve`.
-
-        Returns
-        -------
-        jnp.ndarray, shape ``(n_dofs,)``
-            Flat residual at zero displacement, equal to ``-f`` where ``f`` is
-            the body-force + surface-traction load vector.
-        """
-        self.problem.set_params(params)
-        zero_sol = [jnp.zeros((self.problem.fes[0].num_total_nodes, 3))]
-        res = self.problem.compute_residual_vars(
-            zero_sol, self.problem.internal_vars, self.problem.internal_vars_surfaces
-        )
-        return jax.flatten_util.ravel_pytree(res)[0]
 
     def assemble_coo(self, params: dict) -> tuple:
         """Assemble the stiffness matrix in COO format (cuDSS path only).
@@ -238,46 +231,6 @@ class ElasticPipeline:
         n_dofs = self.problem.num_total_dofs_all_vars
         return self.problem.I, self.problem.J, self.problem.V_jax, n_dofs, load
 
-    def attachment_displacement(self, sol_list: list) -> jnp.ndarray:
-        """Extract displacement at coil surface (attachment) nodes.
-
-        Parameters
-        ----------
-        sol_list : list[jnp.ndarray]
-            Raw ``fwd_pred`` output.
-
-        Returns
-        -------
-        jnp.ndarray, shape ``(n_surface_nodes, 3)``
-        """
-        return sol_list[0][self.surface_node_indices]
-
-    def coo(self):
-        """Return assembled stiffness matrix in COO format (Plan B preparation).
-
-        Only available when the problem was built with ``gpu_assembly=True``
-        (the cuDSS solver path).
-
-        Returns
-        -------
-        tuple
-            ``(I, J, V, n_dofs)`` — static COO row/column indices (host
-            ``numpy``), device-side COO values, and total number of DOFs.
-
-        Raises
-        ------
-        NotImplementedError
-            When the problem was built without on-device assembly
-            (``gpu_assembly=False``, i.e. the CPU / ``ad_wrapper`` path).
-        """
-        if not self.problem.gpu_assembly:
-            raise NotImplementedError(
-                "ElasticPipeline.coo() requires gpu_assembly=True "
-                "(problem_options={'solver': 'cudss'})."
-            )
-        n_dofs = self.problem.num_total_dofs_all_vars
-        return self.problem.I, self.problem.J, self.problem.V_jax, n_dofs
-
 
 class ThermoElasticPipeline(ElasticPipeline):
     """Stub pipeline for future thermoelastic coupling (not yet implemented).
@@ -287,7 +240,7 @@ class ThermoElasticPipeline(ElasticPipeline):
     coupling is implemented.
     """
 
-    def solve(self, points, body_force, support_weights=None):
+    def solve(self, points, body_force, support_weights=None, support_attach=None):
         """Not implemented — thermoelastic solve not yet available."""
         raise NotImplementedError(
             "ThermoElasticPipeline.solve() is not yet implemented. "

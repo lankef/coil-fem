@@ -31,16 +31,38 @@ from jax_fem.solver import (
     apply_bc,
 )
 
-# spineax (+ NVIDIA cuDSS) is optional; check availability without importing
-# so this module loads cleanly on CPU-only doc-build machines.
-_HAS_SPINEAX = importlib.util.find_spec("spineax") is not None
-
 _SPINEAX_INSTALL_HINT = (
     "coil_fem.solvers.cudss requires the optional GPU stack (spineax + "
     "NVIDIA cuDSS), which is not installed. Install it with:\n"
     "  conda install -c conda-forge cuda-nvcc=<version>\n"
     '  pip install --no-build-isolation -e ".[cudss]"'
 )
+
+# ============================================================================
+# Matrix symmetry helpers
+# ============================================================================
+
+# Maps solver-agnostic symmetry string → cuDSS mtype_id integer.
+# mview_id is always 0 (CUDSS_MVIEW_FULL): we always supply the full matrix.
+_MTYPE_ID: dict[str, int] = {'general': 0, 'symmetric': 1, 'spd': 3}
+# Ordering for weakest-claim meet: lower = weaker assumption.
+_STRENGTH: dict[str, int] = {'general': 0, 'symmetric': 1, 'spd': 2}
+
+
+def weakest_symmetry(*claims: str) -> str:
+    """Weakest (least-assuming) symmetry claim among ``claims``.
+
+    Parameters
+    ----------
+    *claims : str
+        One or more strings from ``{'general', 'symmetric', 'spd'}``.
+
+    Returns
+    -------
+    str
+        The claim with the smallest entry in ``_STRENGTH``.
+    """
+    return min(claims, key=_STRENGTH.__getitem__)
 
 
 def _import_cudss_solver():
@@ -271,11 +293,16 @@ def _build_bc_metadata(problem: Problem, n: int, dtype=jnp.float64):
 # ============================================================================
 
 class CuDSSNewtonSolver:
-    """Drives JAX-FEM Newton iterations using cuDSS as the linear solver.
+    """Single-step linear solver for JAX-FEM problems using cuDSS.
 
     All heavy data (CSR pattern, BC metadata) is pre-computed once at
-    construction and kept on device.  Each Newton iteration assembles
-    ``csr_values`` from ``problem.V_jax`` without touching host memory.
+    construction and kept on device.  The solve assembles ``csr_values``
+    from ``problem.V_jax`` without touching host memory.
+
+    Only linear problems (``problem.is_linear = True``) are supported on
+    the cuDSS path.  For such problems a single Newton step from ``u=0``
+    is the exact solution: ``R(u) = Ku - f`` yields ``inc = K⁻¹ f``
+    directly, with no residual check required.
 
     Parameters
     ----------
@@ -285,20 +312,11 @@ class CuDSSNewtonSolver:
     device_id : int
         cuDSS GPU device index (default 0).
     mtype_id : int
-        cuDSS matrix type (default 1 = symmetric).
+        cuDSS matrix type; derived from ``problem.matrix_symmetry`` by
+        :func:`~coil_fem.solvers.build_fwd_pred` (0=general, 1=symmetric,
+        3=SPD). Default 1.
     mview_id : int
         cuDSS matrix view (default 0 = full matrix stored).
-    tol : float
-        Absolute residual tolerance for Newton convergence.
-    rel_tol : float
-        Relative residual tolerance for Newton convergence.
-    max_iter : int
-        Maximum Newton iterations.
-    linear : bool
-        When ``True``, skip the Newton iteration loop and solve in a single
-        assemble-and-solve step with no host synchronisation.  Use this when
-        the problem is known to be linear (e.g. :class:`LinearElasticity3D`),
-        which always converges in exactly one Newton step.  Default ``False``.
     """
 
     def __init__(
@@ -308,16 +326,8 @@ class CuDSSNewtonSolver:
         device_id: int = 0,
         mtype_id: int = 1,
         mview_id: int = 0,
-        tol: float = 1e-6,
-        rel_tol: float = 1e-8,
-        max_iter: int = 50,
-        linear: bool = False,
     ):
         self.problem = problem
-        self.tol = tol
-        self.rel_tol = rel_tol
-        self.max_iter = max_iter
-        self.linear = linear
 
         n = problem.num_total_dofs_all_vars
         self.n = n
@@ -384,6 +394,10 @@ class CuDSSNewtonSolver:
         -------
         inc : (n,)
             Newton increment satisfying ``A_bc * inc = b_bc``.
+        inertia : tuple[int, int, int]
+            ``(n_positive, n_negative, n_zero)`` eigenvalue counts from
+            cuDSS.  Use to verify matrix definiteness (expect ``n_negative=0,
+            n_zero=0`` for symmetric positive-definite problems).
         """
         # Assemble CSR values from device Jacobian.
         csr_values = assemble_csr_values(
@@ -405,23 +419,21 @@ class CuDSSNewtonSolver:
         )
 
         # cuDSS solve: A_bc * inc = b_bc
-        inc, _inertia = self.cudss(b_bc, csr_values_bc)
-        return inc
+        # inertia = (n_positive, n_negative, n_zero) eigenvalues.
+        # For K_cc (symmetric linear-elastic) all n_positive, n_negative=0, n_zero=0.
+        inc, inertia = self.cudss(b_bc, csr_values_bc)
+        return inc, inertia
 
     # ------------------------------------------------------------------
-    # Full Newton loop
+    # Single-step linear solve
     # ------------------------------------------------------------------
 
-    def newton_loop(self, params) -> list[jnp.ndarray]:
-        """Run Newton iterations to convergence.
+    def solve(self, params) -> list[jnp.ndarray]:
+        """Solve the linear system in a single step.
 
-        Calls ``problem.set_params(params)`` and then iterates, using
-        ``problem.newton_update`` (which fills ``problem.V_jax``) to
-        compute the residual and Jacobian.
-
-        When ``self.linear`` is ``True``, the iteration loop is skipped and
-        the problem is solved in a single assemble-and-solve step with no
-        host synchronisation.
+        Calls ``problem.set_params(params)``, assembles ``K`` and ``f`` via
+        ``problem.newton_update``, and solves ``K u = f`` in one cuDSS call
+        with no host synchronisation.
 
         Returns
         -------
@@ -434,55 +446,20 @@ class CuDSSNewtonSolver:
         problem.set_params(params)
         dofs = jnp.zeros(self.n)
 
-        def _get_res_and_update(dofs):
-            sol_list = problem.unflatten_fn_sol_list(dofs)
-            res_list = problem.newton_update(sol_list)
-            res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
-            res_vec_bc = apply_bc_vec(res_vec, dofs, problem)
-            return res_vec_bc
-
-        if self.linear:
-            # Single-shot path: one assembly + one solve, no host sync.
-            # Linear problems converge in exactly one Newton step, so the
-            # post-step residual check is skipped entirely.
-            logger.debug("CuDSSNewtonSolver: linear fast path (single solve)")
-            res_vec_bc = _get_res_and_update(dofs)
-            dofs = self.solve_step(-res_vec_bc, dofs)
-            logger.info(
-                f"CuDSSNewtonSolver: linear solve finished in "
-                f"{time.time()-start:.2f}s"
-            )
-            return problem.unflatten_fn_sol_list(dofs)
-
-        logger.debug("CuDSSNewtonSolver: starting Newton loop")
-        res_vec_bc = _get_res_and_update(dofs)
-        res_val = float(jnp.linalg.norm(res_vec_bc))
-        res_val_initial = res_val
-        logger.debug(f"CuDSSNewtonSolver: initial residual = {res_val:.3e}")
-
-        for _it in range(self.max_iter):
-            rel_res = res_val / (res_val_initial + 1e-300)
-            if res_val < self.tol or rel_res < self.rel_tol:
-                break
-
-            b = -res_vec_bc
-            inc = self.solve_step(b, dofs)
-            dofs = dofs + inc
-
-            res_vec_bc = _get_res_and_update(dofs)
-            res_val = float(jnp.linalg.norm(res_vec_bc))
-            logger.debug(
-                f"CuDSSNewtonSolver: iter={_it+1}  res={res_val:.3e}"
-                f"  rel={res_val/(res_val_initial+1e-300):.3e}"
-            )
-
-        logger.info(
-            f"CuDSSNewtonSolver: solve finished in {time.time()-start:.2f}s  "
-            f"res={res_val:.3e}"
-        )
-
         sol_list = problem.unflatten_fn_sol_list(dofs)
-        return sol_list
+        res_list = problem.newton_update(sol_list)
+        res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
+        res_vec_bc = apply_bc_vec(res_vec, dofs, problem)
+
+        dofs, inertia = self.solve_step(-res_vec_bc, dofs)
+        logger.info(
+            f"CuDSSNewtonSolver: linear solve finished in "
+            f"{time.time()-start:.2f}s  inertia={inertia}"
+        )
+        return problem.unflatten_fn_sol_list(dofs)
+
+    # Keep alias so any user code that called newton_loop() still works.
+    newton_loop = solve
 
     # ------------------------------------------------------------------
     # Adjoint linear solve (for custom_vjp backward)
@@ -545,10 +522,6 @@ def cudss_ad_wrapper(
     device_id: int = 0,
     mtype_id: int = 1,
     mview_id: int = 0,
-    tol: float = 1e-6,
-    rel_tol: float = 1e-8,
-    max_iter: int = 50,
-    linear: bool = False,
 ):
     """Drop-in replacement for ``jax_fem.solver.ad_wrapper`` using cuDSS.
 
@@ -556,6 +529,9 @@ def cudss_ad_wrapper(
     callable decorated with ``jax.custom_vjp``.  The backward pass mirrors
     ``jax_fem.solver.implicit_vjp`` but replaces the PETSc/scipy linear solve
     with cuDSS, which reuses the factorization from the forward pass.
+
+    Only problems with ``is_linear = True`` are accepted; the check is
+    enforced in :func:`~coil_fem.solvers.build_fwd_pred` before reaching here.
 
     Parameters
     ----------
@@ -565,16 +541,10 @@ def cudss_ad_wrapper(
     device_id : int
         GPU device index for cuDSS.
     mtype_id : int
-        cuDSS matrix type: 0=general, 1=symmetric, 2=hermitian,
-        3=SPD, 4=HPD. Default 1 (symmetric — linear elasticity always is).
+        cuDSS matrix type: 0=general, 1=symmetric, 3=SPD.
+        Derived from ``problem.matrix_symmetry`` by :func:`build_fwd_pred`.
     mview_id : int
         cuDSS matrix view: 0=full, 1=lower triangle. Default 0.
-    tol, rel_tol, max_iter :
-        Newton convergence parameters (ignored when ``linear=True``).
-    linear : bool
-        Forwarded to :class:`CuDSSNewtonSolver`.  Set to ``True`` when the
-        problem is linear (e.g. :class:`~coil_fem.problems.LinearElasticity3D`)
-        to skip the iteration loop and avoid host synchronisation.
 
     Returns
     -------
@@ -586,15 +556,11 @@ def cudss_ad_wrapper(
         device_id=device_id,
         mtype_id=mtype_id,
         mview_id=mview_id,
-        tol=tol,
-        rel_tol=rel_tol,
-        max_iter=max_iter,
-        linear=linear,
     )
 
     @jax.custom_vjp
     def fwd_pred(params):
-        return cudss_solver.newton_loop(params)
+        return cudss_solver.solve(params)
 
     def f_fwd(params):
         sol_list = fwd_pred(params)

@@ -14,6 +14,9 @@ from .symmetries import (
     apply_symmetries_to_gammadashs,
     apply_symmetries_to_currents,
     n_coils_total,
+    rodrigues,
+    rotate_points_z,
+    flip_points,
 )
 
 __all__ = [
@@ -28,4 +31,7 @@ __all__ = [
     "apply_symmetries_to_gammadashs",
     "apply_symmetries_to_currents",
     "n_coils_total",
+    "rodrigues",
+    "rotate_points_z",
+    "flip_points",
 ]

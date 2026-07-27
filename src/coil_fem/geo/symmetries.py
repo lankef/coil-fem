@@ -20,7 +20,7 @@ import jax
 # Low-level geometry transforms (pure jnp, differentiable)
 # ============================================================================
 
-def _rotate_points_z(pts: jax.Array, phi: float) -> jax.Array:
+def rotate_points_z(pts: jax.Array, phi: float) -> jax.Array:
     """Rotate ``(N, 3)`` point array by angle *phi* about the z-axis.
 
     Uses the same convention as simsopt ``RotatedCurve``:
@@ -36,13 +36,47 @@ def _rotate_points_z(pts: jax.Array, phi: float) -> jax.Array:
     return jnp.stack([x, y, z], axis=-1)
 
 
-def _flip_points(pts: jax.Array) -> jax.Array:
+# Keep private aliases for backward compatibility with any internal callers.
+_rotate_points_z = rotate_points_z
+
+
+def flip_points(pts: jax.Array) -> jax.Array:
     """Apply stellarator reflection: negate y and z components.
 
     Matches simsopt's flip matrix ``diag(1, -1, -1)`` applied after rotation.
     """
     signs = jnp.array([1.0, -1.0, -1.0])
     return pts * signs
+
+
+_flip_points = flip_points
+
+
+def rodrigues(axis: jax.Array, angle: jax.Array) -> jax.Array:
+    """Rotation matrix that rotates by ``angle`` (radians) about unit ``axis``.
+
+    Uses the Rodrigues formula::
+
+        R = cos(θ) I + (1 − cos(θ)) (n ⊗ n) + sin(θ) [n]×
+
+    Parameters
+    ----------
+    axis : jax.Array, shape (3,)
+        Unit rotation axis (caller is responsible for normalising).
+    angle : jax.Array, scalar
+        Rotation angle in radians.
+
+    Returns
+    -------
+    jax.Array, shape (3, 3)
+    """
+    c, s = jnp.cos(angle), jnp.sin(angle)
+    x, y, z = axis[0], axis[1], axis[2]
+    outer = jnp.outer(axis, axis)
+    skew = jnp.array([[ 0., -z,  y],
+                      [ z,  0., -x],
+                      [-y,  x,  0.]])
+    return c * jnp.eye(3) + (1.0 - c) * outer + s * skew
 
 
 # ============================================================================

@@ -13,7 +13,6 @@ from .linear_elasticity import (
     LinearElasticity3D,
     lame_parameters,
     itc_strain,
-    dirichlet_bc,
     recompute_fe_geometry,
 )
 from .heat_conduction import HeatConduction3D
@@ -23,7 +22,6 @@ __all__ = [
     "LinearElasticity3D",
     "lame_parameters",
     "itc_strain",
-    "dirichlet_bc",
     "recompute_fe_geometry",
     "HeatConduction3D",
 ]

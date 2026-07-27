@@ -18,6 +18,114 @@
 
 ## Issues 
 
+### Issue: Staggered coupling is numerically unsound (driver disabled)
+
+Status: **Disabled**. `solve_staggered` raises `NotImplementedError`. Use
+`coupling='monolithic'` for coupled supports. Recorded here so the analysis is
+not lost; see `REVIEW_2026_JULY.md` A1 for the measurements.
+
+Two separate numerical problems were found. The first is confined to the
+staggered driver; the second is **not**, and still applies to the monolithic
+path.
+
+**1. The block Gauss-Seidel map has an eigenvalue of essentially exactly 1.**
+
+On a 2-coil, 4-beam network the iteration never reaches a fixed point. The
+residual `max|T(u) - u|` is flat from roughly sweep 7 onward while `||u_s||`
+grows with a per-sweep increment that is constant to four digits. Successive
+increments have `cos = 0.999999989` with a norm ratio of `1.0000047`, so the
+iteration is translating along a fixed eigenvector with eigenvalue marginally
+above 1 and there is no fixed point to reach along that direction. Aitken
+cannot rescue it — no scalar relaxation produces a correction in a
+unit-eigenvalue direction — and the effective factor sits on the `max(0.1, ...)`
+clamp floor for most sweeps anyway.
+
+The behaviour is independent of coil shape (concentric coplanar circles,
+offset non-coplanar circles), of attachment locality (uniform whole-surface
+clamp, 9.4 %-of-area sigmoid ball), and of `k_lin` (`1e5` and `1e8` give the
+same relative behaviour, with the residual scaling as `1/k_lin`).
+
+**2. `k_tor != k_lin` makes the coupled operator non-self-adjoint with an
+indefinite symmetric part.**
+
+With `k_lin = 1e8` fixed, sweeping `k_tor`:
+
+| `k_tor` | asymmetry of `K_ss` | `K_cs` vs `K_sc^T` | neg. eigenvalues | cond `K_ss` |
+|---:|---|---|---:|---:|
+| 1e4 | 1.249e-03 | 2.726e-02 | 4 / 48 | 9.10e9 |
+| 1e6 | 1.236e-03 | 2.699e-02 | 4 / 48 | 9.10e7 |
+| 1e8 | 1.7e-17 | 0.0 exactly | 0 / 48 | 9.58e5 |
+
+`sigma_min(K_ss)` tracks `k_tor` linearly, so the weak subspace is the
+rotational DOFs, whose only external stiffness is `k_tor`. The cause is
+structural: `_spring_stiffness_contributions` writes translation-rotation as
+`-k_lin Σ w [r]x` and torque-translation as `+k_tor Σ w [r]x`, and since
+`[r]x^T = -[r]x`, the two are transposes only when `k_tor == k_lin`. The same
+holds for `K_cs` / `K_sc` in `coupling_values`. `k_tor` is therefore the only
+source of asymmetry anywhere in the system.
+
+**This one is not fixed by disabling the staggered driver.** The same `K_ss`
+and coupling blocks are assembled into the merged monolithic matrix, and
+`SupportBeams.solve` factors `K_ss` densely with `lineax.LU()` at
+`cond = 9.1e9`, losing roughly 10 of 16 digits.
+
+Two contributing defects in the same rotational subspace, worth fixing
+regardless:
+
+- The CF foundation endpoint has `r_fnd == 0` by construction
+  (`geom['x_end'][b]` *is* `x_foundation[i][j]`), so `skew_sum` and
+  `skew2_sum` are zero and the foundation node gets no rotational grounding
+  at all — even at `k_tor == k_lin`, since `k_tor` there multiplies a zero
+  moment arm.
+- The coil-side branches now sum `w · JxW` (an area) while the foundation
+  branch still sums a dimensionless `w = 1.0`, so at `k_lin = 1e8` the coil
+  side is about `7e6` N/m and the foundation side is `1e8` N/m.
+
+**Decided:** `k_tor` and `k_lin` are unified into a single
+`beam_options['k_attachment']` [N/m³] — a genuine distributed spring bed, not
+a workaround, since both were already the same units. This removes the
+asymmetry/indefiniteness above entirely and unconditionally (not only when a
+user happens to configure equal values): `K_ss` and the `K_cs`/`K_sc`
+coupling blocks become symmetric to machine precision for every
+configuration, and the condition number improves by four orders of magnitude
+(`9.1e9 -> 9.58e5`). It also lets `SupportBeams.matrix_symmetry` inherit the
+base `Support` claim unconditionally rather than compare `k_tor == k_lin` at
+runtime — one fewer method on `SupportBeams`. See `REVIEW_2026_JULY.md` A2
+and A5a.
+
+**Resolved (Phase 1).** Both contributing defects above are fixed by the
+CF-foundation hard-clamp introduced in `SupportBeams.coo()`:
+
+- The CF foundation node-2 DOFs (rows and columns 6–11 of every CF beam's
+  `12×12` stiffness block) are Dirichlet-eliminated with a unit diagonal,
+  making the foundation a rigid anchor without any spring or moment-arm
+  dependence. `r_fnd` and the area-integral inconsistency no longer appear.
+- `K_ss` is now symmetric to machine precision for every configuration, and
+  `min(svd(K_ss)) > 0` for any network with at least one CF beam.
+
+The assembly-time guard requested above is also in place: the cuDSS inertia
+that was silently discarded at `cudss.py` / `drivers.py` is now threaded
+back into the diagnostics dict returned by `solve_monolithic`, and a new
+`test_k_ss_symmetry` + `test_cf_beam_cantilever_analytic` test pair in
+`tests/test_beam_networks.py` validates the fix.
+
+### Issue: `winkler_k` may be ignored for CF-beam-only supports
+
+Status: **Open, untested.** Noted while removing the dead
+default-from-`k_lin` branch in `CoilFEM.__init__` (`REVIEW_2026_JULY.md` A6).
+
+`winkler_k` remains a mandatory `problem_option` and is never defaulted from
+`support.k_lin`. But when a `SupportBeams` has no fixed clamps
+(`fixed_clamp_options={'enabled': False}`) and relies entirely on
+coil-foundation beams, the coil-side Winkler weight field comes only from the
+CF beam attachment functions — so `winkler_k` may end up scaling a weight
+field that is zero or near-zero over most of the coil, and effectively be
+ignored.
+
+CF-beam accuracy is untested at the moment, so it is not yet clear whether
+this is a real defect or expected behaviour. Needs a verification case before
+any change is made.
+
 ### Issue: Newton Double Assembly in Linear Elasticity Solve
 
 Status: **Deferred** (do not implement yet). Revisit only after the cuDSS

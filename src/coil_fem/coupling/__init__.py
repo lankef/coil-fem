@@ -10,11 +10,12 @@ factory :func:`~coil_fem.coupling.drivers.make_merged_solve`.
 
 from .supports import Support
 from .beam_network import SupportBeams
-from .drivers import solve_staggered, solve_monolithic, MonolithicStatic, make_merged_solve
+from .drivers import solve_uncoupled, solve_staggered, solve_monolithic, MonolithicStatic, make_merged_solve
 
 __all__ = [
     'Support',
     'SupportBeams',
+    'solve_uncoupled',
     'solve_staggered',
     'solve_monolithic',
     'MonolithicStatic',
