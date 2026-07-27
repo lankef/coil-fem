@@ -99,8 +99,7 @@ def _make_support_beams(
         'n_beam_cf': n_beam_cf,
         'E': 200e9,
         'nu': 0.3,
-        'k_lin': 1e8,
-        'k_tor': 1e4,
+        'k_attachment': 1e8,
     }
     return SupportBeams(
         nfp=nfp,
@@ -171,6 +170,25 @@ def _make_surface_pts(n_base: int = 2, n_surf: int = 10):
     return pts_list
 
 
+def _make_interp_and_jxw(surf_list):
+    """Build identity-like surf_interp_by_coil and unit jxw_by_coil.
+
+    Treats each surface point as a single face with 1 quadrature point
+    (n_fq=1) and 1 face node (n_face_nodes=1), so the folding einsum is
+    an identity operation on the weights.  JxW is set to 1.0 (area-agnostic
+    test fixture — gives the same result as the pre-JxW code path).
+    """
+    surf_interp = []
+    jxw = []
+    for pts in surf_list:
+        n = pts.shape[0]
+        face_sv = jnp.ones((n, 1, 1), dtype=jnp.float64)
+        face_to_surf_node = jnp.arange(n, dtype=jnp.int32).reshape(n, 1)
+        surf_interp.append((face_sv, face_to_surf_node, n))
+        jxw.append(jnp.ones((n, 1), dtype=jnp.float64))
+    return surf_interp, jxw
+
+
 # ============================================================================
 # 1. is_coupled
 # ============================================================================
@@ -206,8 +224,9 @@ def test_support_beams_coo_shapes():
     curves = _make_curves(n_base)
     sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
     surf   = _make_surface_pts(n_base)
+    _, jxw = _make_interp_and_jxw(surf)
 
-    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf)
+    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw)
 
     n_beams = n_base * (n_cc + n_cf)
     expected_nnz = n_beams * 144   # 12 * 12 per beam
@@ -229,9 +248,9 @@ def test_support_beams_coo_diagonal_dominance():
 
     The bare bisymmetric beam has 6 rigid-body modes (3 translations + torsion
     about its own axis + 2 bending rotations = 6).  The endpoint springs
-    constrain all of them: the translational blocks (k_lin) pin the
-    translation and bending-rotation RBMs, and the torque–rotation block
-    ``K_rr = -k_tor Σ w [r]×[r]×`` (PSD) pins the remaining torsional
+    constrain all of them: the translational blocks ``k_attachment * Σ w·JxW``
+    pin translation and bending-rotation RBMs, and the torque–rotation block
+    ``K_rr = -k_attachment Σ w [r]×[r]×`` (PSD) pins the remaining torsional
     rigid-body mode — pure rotation of the whole beam about its own axis —
     through the attach-point moment arms.
     """
@@ -240,8 +259,9 @@ def test_support_beams_coo_diagonal_dominance():
     curves = _make_curves(n_base)
     sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
     surf   = _make_surface_pts(n_base)
+    _, jxw = _make_interp_and_jxw(surf)
 
-    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf)
+    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw)
 
     # Reconstruct the dense block-diagonal matrix
     K = np.zeros((n_dofs, n_dofs))
@@ -268,12 +288,14 @@ def test_support_beams_solve_zero_rhs_yields_zero():
     curves = _make_curves(n_base)
     sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
     surf   = _make_surface_pts(n_base)
+    _, jxw = _make_interp_and_jxw(surf)
 
     result = sb.solve({
         'curves_jax':          curves,
         'support_dofs':        sdofs,
         'surface_pts_by_coil': surf,
         'u_mesh_by_coil':      None,
+        'jxw_by_coil':         jxw,
     })
 
     u_s = result['u_s']
@@ -297,6 +319,8 @@ def test_support_beams_grad_through_x_foundation():
     # Give nonzero coil displacements so that x_foundation shift matters
     u_mesh = [jnp.ones((s.shape[0], 3)) * 1e-3 for s in surf]
 
+    _, jxw = _make_interp_and_jxw(surf)
+
     def loss(x_found):
         sdofs = _make_support_dofs(n_base, n_cc, n_cf)
         sdofs = {**sdofs, 'x_foundation': x_found}
@@ -305,6 +329,7 @@ def test_support_beams_grad_through_x_foundation():
             'support_dofs':        sdofs,
             'surface_pts_by_coil': surf,
             'u_mesh_by_coil':      u_mesh,
+            'jxw_by_coil':         jxw,
         })
         return jnp.sum(result['u_s'])
 
@@ -435,7 +460,7 @@ def test_support_beams_bare_beam_rank():
     sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
 
     # Pass surface_pts_by_coil=None → bare beam, no spring regularisation
-    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=None)
+    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=None, jxw_by_coil=[])
 
     K = np.zeros((n_dofs, n_dofs))
     np.add.at(K, (np.asarray(I), np.asarray(J)), np.asarray(V))
@@ -475,8 +500,7 @@ def test_support_beams_end_side_gradient():
             'n_beam_cf': n_cf,
             'E': 200e9,
             'nu': 0.3,
-            'k_lin': 1e8,
-            'k_tor': 1e4,
+            'k_attachment': 1e8,
         },
         n_base=n_base,
         cross_section_fn=_constant_section_fn(),
@@ -541,8 +565,9 @@ def test_support_beams_ragged_coo_shapes():
     curves = _make_curves(n_base)
     sdofs  = _make_support_dofs(n_base, _RAGGED_CC, _RAGGED_CF)
     surf   = _make_surface_pts(n_base)
+    _, jxw = _make_interp_and_jxw(surf)
 
-    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf)
+    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw)
 
     n_beams = sum(_RAGGED_CC[i] + _RAGGED_CF[i] for i in range(n_base))
     expected_nnz = n_beams * 144
@@ -569,12 +594,14 @@ def test_support_beams_ragged_solve_zero_rhs_yields_zero():
     curves = _make_curves(n_base)
     sdofs  = _make_support_dofs(n_base, _RAGGED_CC, _RAGGED_CF)
     surf   = _make_surface_pts(n_base)
+    _, jxw = _make_interp_and_jxw(surf)
 
     result = sb.solve({
         'curves_jax':          curves,
         'support_dofs':        sdofs,
         'surface_pts_by_coil': surf,
         'u_mesh_by_coil':      None,
+        'jxw_by_coil':         jxw,
     })
     u_s = result['u_s']
     assert u_s.shape == (sb.n_support_dofs,)
@@ -591,6 +618,7 @@ def test_support_beams_ragged_coupling_terms_bounds():
     curves = _make_curves(n_base)
     sdofs  = _make_support_dofs(n_base, _RAGGED_CC, _RAGGED_CF)
     surf   = _make_surface_pts(n_base, n_surf=6)
+    interp, jxw = _make_interp_and_jxw(surf)
 
     # Minimal merged-system layout: 3 DOFs per surface node, coils packed first.
     n_surf = surf[0].shape[0]
@@ -598,17 +626,20 @@ def test_support_beams_ragged_coupling_terms_bounds():
     support_dof_offset = n_base * n_surf * 3
     surf_idx = [np.arange(n_surf, dtype=np.int32) for _ in range(n_base)]
 
-    terms = sb.coupling_terms(
-        curves, sdofs, surf, coil_dof_offsets, support_dof_offset, surf_idx,
+    I_cs, J_cs, I_sc, J_sc = sb.coupling_pattern(
+        coil_dof_offsets, support_dof_offset, surf_idx,
+    )
+    V_cs, V_sc = sb.coupling_values(
+        curves, sdofs, surf, surf_interp_by_coil=interp, jxw_by_coil=jxw,
     )
     n_total = support_dof_offset + sb.n_support_dofs
-    for key in ('I_cs', 'J_cs', 'I_sc', 'J_sc'):
-        idx = np.asarray(terms[key])
+    for idx in (I_cs, J_cs, I_sc, J_sc):
+        idx = np.asarray(idx)
         assert idx.size > 0
         assert int(idx.max()) < n_total
         assert int(idx.min()) >= 0
-    assert terms['V_cs'].shape[0] == terms['I_cs'].shape[0]
-    assert terms['V_sc'].shape[0] == terms['I_sc'].shape[0]
+    assert np.asarray(V_cs).shape[0] == np.asarray(I_cs).shape[0]
+    assert np.asarray(V_sc).shape[0] == np.asarray(I_sc).shape[0]
 
 
 def test_ragged_support_dofs_ravel_roundtrip():
@@ -654,8 +685,13 @@ def test_support_beams_rhs_matches_coupling_terms():
     support_dof_offset = n_base * n_surf * 3
     surf_idx = [np.arange(n_surf, dtype=np.int32) for _ in range(n_base)]
 
-    terms = sb.coupling_terms(
-        curves, sdofs, surf, coil_dof_offsets, support_dof_offset, surf_idx,
+    interp, jxw = _make_interp_and_jxw(surf)
+
+    I_cs, J_cs, I_sc, J_sc = sb.coupling_pattern(
+        coil_dof_offsets, support_dof_offset, surf_idx,
+    )
+    V_cs, V_sc = sb.coupling_values(
+        curves, sdofs, surf, surf_interp_by_coil=interp, jxw_by_coil=jxw,
     )
 
     # Dense K_sc: rows = support DOFs, cols = coil DOFs.
@@ -664,17 +700,18 @@ def test_support_beams_rhs_matches_coupling_terms():
     K_sc = np.zeros((n_s, n_c))
     np.add.at(
         K_sc,
-        (np.asarray(terms['I_sc']) - support_dof_offset,
-         np.asarray(terms['J_sc'])),
-        np.asarray(terms['V_sc']),
+        (np.asarray(I_sc) - support_dof_offset, np.asarray(J_sc)),
+        np.asarray(V_sc),
     )
     u_c = np.concatenate([np.asarray(u).reshape(-1) for u in u_mesh])
     f_expected = -K_sc @ u_c
 
-    # RHS from the standalone-solve path.
+    # RHS from the standalone-solve path (uses same JxW=1 fixture).
     geom   = sb._beam_geometry(curves, sdofs)
     gamma3 = sb._direction_cosine_matrices(geom, sdofs)
-    beps   = sb._endpoint_weights_and_r(curves, geom, gamma3, sdofs, surf)
+    beps   = sb._endpoint_weights_and_r(
+        curves, geom, gamma3, sdofs, surf, jxw_by_coil=jxw,
+    )
     f_rhs  = np.asarray(sb._assemble_rhs(geom, beps, u_mesh))
 
     assert f_rhs.shape == (n_s,)
@@ -709,7 +746,7 @@ def test_support_beams_stellsym_vs_explicit_expansion():
                        0.15, 0.10, 0.90])
     c0 = CurveXYZFourierJAX(quadpoints, dofs0, order=1)
 
-    beam_common = {'E': 200e9, 'nu': 0.3, 'k_lin': 1e8, 'k_tor': 1e4}
+    beam_common = {'E': 200e9, 'nu': 0.3, 'k_attachment': 1e8}
     const_w = lambda pts, dofs, sign_x, opts: jnp.full(pts.shape[0], 0.6)
 
     # ── Stellsym model: 1 coil, groups [(0,0,'flip_half'), (0,0,'flip')] ──
@@ -766,17 +803,22 @@ def test_support_beams_stellsym_vs_explicit_expansion():
     surf1 = jnp.asarray(np.asarray(surf0) @ Q_half.T)
     u1    = jnp.asarray(np.asarray(u0) @ Q_half.T)
 
+    _, jxw_sym = _make_interp_and_jxw([surf0])
+    _, jxw_exp = _make_interp_and_jxw([surf0, surf1])
+
     u_sym = np.asarray(sb_sym.solve({
         'curves_jax':          [c0],
         'support_dofs':        sdofs_sym,
         'surface_pts_by_coil': [surf0],
         'u_mesh_by_coil':      [u0],
+        'jxw_by_coil':         jxw_sym,
     })['u_s'])
     u_exp = np.asarray(sb_exp.solve({
         'curves_jax':          [c0, c1],
         'support_dofs':        sdofs_exp,
         'surface_pts_by_coil': [surf0, surf1],
         'u_mesh_by_coil':      [u0, u1],
+        'jxw_by_coil':         jxw_exp,
     })['u_s'])
 
     # Beam order — sym: [b0 = flip_half master, b1 = CF(c0), b2 = flip master]
@@ -828,4 +870,141 @@ def test_support_beams_stellsym_vs_explicit_expansion():
                        rtol=1e-7, atol=1e-15), (
         "coil-0 attach displacement differs between stellsym and explicit "
         f"models: max diff = {np.abs(np.asarray(ua_sym) - np.asarray(ua_exp)).max():.3e}"
+    )
+
+
+# ============================================================================
+# K_ss symmetry guard (Phase 1 assembly-time check)
+# ============================================================================
+
+def test_k_ss_symmetry():
+    """K_ss is symmetric to machine precision with k_attachment.
+
+    Assembles K_ss (in COO format) for a representative SupportBeams network
+    with both CC and CF beams, and asserts ‖K − Kᵀ‖_F / ‖K‖_F < 1e-14.
+    With the k_attachment unification (Phase 1.1) and CF hard-clamp (Phase 1.2)
+    this is unconditionally true and no longer depends on k_attachment values.
+    """
+    n_base, n_cc, n_cf = 2, 1, 1
+    sb     = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
+    surf   = _make_surface_pts(n_base, n_surf=12)
+    jxw    = [jnp.ones((12,), dtype=jnp.float64) for _ in range(n_base)]
+
+    I, J, V, n_dofs = sb.coo(
+        curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw
+    )
+
+    K = np.zeros((n_dofs, n_dofs))
+    np.add.at(K, (np.asarray(I), np.asarray(J)), np.asarray(V))
+
+    norm_K = np.linalg.norm(K, 'fro')
+    asym   = np.linalg.norm(K - K.T, 'fro')
+    assert asym / (norm_K + 1e-300) < 1e-14, (
+        f"K_ss is not symmetric: ‖K − Kᵀ‖/‖K‖ = {asym/norm_K:.2e}"
+    )
+
+
+# ============================================================================
+# Cantilever analytic check (Phase 1 CF hard-clamp validation)
+# ============================================================================
+
+def test_cf_beam_cantilever_analytic():
+    """Single CF beam under a transverse tip load matches the analytic formula.
+
+    Places a single CF beam along the x-axis: node-1 at origin (attached to
+    coil surface), node-2 at x=L (hard-clamped foundation anchor).  Applies
+    a transverse point force ``F`` in the z-direction at node-1.
+
+    Analytic cantilever tip deflection:  ``δ = F L³ / (3 E Iz)``.
+
+    The test validates the hard-clamp fix (Phase 1.2): without clamping,
+    node-2 is free and K_ss is rank-deficient — the solve would diverge.
+    With clamping, the beam behaves as a proper cantilever.
+    """
+    E, nu = 200e9, 0.3
+    L = 1.0           # beam length
+    R = 0.01          # cross-section radius
+    A_val  = math.pi * R**2
+    Iz_val = math.pi * R**4 / 4.0
+    Iy_val = Iz_val
+    J_val  = 2.0 * Iz_val
+    F = 1e3           # transverse tip force [N]
+
+    # One coil (n_base=1), zero CC beams, one CF beam.
+    # Place the coil at the origin; foundation anchor at (L, 0, 0).
+
+    # The coil curve is a tiny circle at the origin (R_curve ≈ 0.001 m),
+    # so the beam start (phi_cf=0 → x-axis start) is at approximately (0,0,0).
+    R_curve = 0.001
+    quadpoints = jnp.linspace(0.0, 1.0, 16, endpoint=False)
+    dofs_c = jnp.array([0.0, R_curve, 0.0,
+                        0.0, 0.0,    0.0,
+                        0.0, 0.0,    R_curve])
+    curve = CurveXYZFourierJAX(quadpoints, dofs_c, order=1)
+
+    def _section_fn(sdofs):
+        phi_cc = sdofs['phis_start_cc']
+        phi_cf = sdofs['phis_start_cf']
+        A_l, Iy_l, Iz_l, J_l = [], [], [], []
+        for g in range(len(phi_cc)):
+            n_cf_g = phi_cf[g].shape[0] if g < len(phi_cf) else 0
+            n_per = phi_cc[g].shape[0] + n_cf_g
+            A_l.append(jnp.full((n_per,), A_val))
+            Iy_l.append(jnp.full((n_per,), Iy_val))
+            Iz_l.append(jnp.full((n_per,), Iz_val))
+            J_l.append(jnp.full((n_per,), J_val))
+        return A_l, Iy_l, Iz_l, J_l
+
+    sb = SupportBeams(
+        nfp=1, stellsym=False,
+        beam_options={'n_beam_cc': 0, 'n_beam_cf': 1, 'E': E, 'nu': nu,
+                      'k_attachment': 1e8},
+        n_base=1,
+        cross_section_fn=_section_fn,
+        attachment_fn=_uniform_clamp_fn,
+    )
+
+    # Support dofs: n_base=1 → one CC group (zero beams) + one CF beam.
+    # phi=0 on the coil curve ≈ (R_curve, 0, 0), foundation at (L, 0, 0).
+    sdofs = {
+        'phis_start_cc':         [jnp.zeros(0)],   # 1 CC group, 0 CC beams
+        'phis_end_cc':           [jnp.zeros(0)],
+        'phis_start_cf':         [jnp.array([0.0])],  # phi=0 → coil x-axis
+        'x_foundation':          [jnp.array([[L, 0.0, 0.0]])],
+        'thetas_orientation_cc': [jnp.zeros(0)],
+        'thetas_orientation_cf': [jnp.array([0.0])],
+    }
+
+    # No Winkler spring (surface_pts_by_coil=None): only the beam stiffness
+    # plus the CF hard-clamp on node-2 DOFs.  This gives the pure cantilever.
+    I, J, V, n_dofs = sb.coo(
+        [curve], sdofs, surface_pts_by_coil=None, jxw_by_coil=None
+    )
+
+    K = np.zeros((n_dofs, n_dofs))
+    np.add.at(K, (np.asarray(I), np.asarray(J)), np.asarray(V))
+
+    # K must be non-singular (CF hard-clamp makes it full-rank).
+    assert np.linalg.matrix_rank(K, tol=1e-6) == n_dofs, (
+        f"K_ss is rank-deficient: rank={np.linalg.matrix_rank(K, tol=1e-6)} "
+        f"expected {n_dofs}"
+    )
+
+    # Apply a unit transverse load F in z at node-1 (local DOF 2 = z-translation).
+    f = np.zeros(n_dofs)
+    f[2] = F
+
+    u = np.linalg.solve(K, f)
+
+    # Analytic cantilever tip deflection (z at node-1 with node-2 clamped).
+    delta_analytic = F * L**3 / (3.0 * E * Iz_val)
+
+    # Relative tolerance is loose (10%) because the coil attachment point
+    # is not exactly at the true beam node-1 (small R_curve offset).
+    assert abs(u[2] - delta_analytic) / delta_analytic < 0.10, (
+        f"CF cantilever tip deflection: got {u[2]:.4e}, "
+        f"analytic {delta_analytic:.4e}, "
+        f"rel err = {abs(u[2]-delta_analytic)/delta_analytic:.2e}"
     )

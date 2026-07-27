@@ -100,15 +100,12 @@ The iteration proceeds as follows:
    interface displacement as a prescribed boundary attachment.
 2. Collect the coil-surface reaction forces and pass them to
    :meth:`support.solve() <coil_fem.coupling.supports.Support.solve>`.
-3. Query :meth:`support.displacement_at()
-   <coil_fem.coupling.supports.Support.displacement_at>` to obtain the updated
-   attachment displacement.
-4. Repeat until the interface displacement converges (or a fixed number of
+3. Repeat until the interface displacement converges (or a fixed number of
    sweeps is reached).
-5. The entire sweep loop is wrapped in ``jax.lax.custom_root`` / a
-   ``custom_vjp`` so that ``jax.grad`` differentiates through the **converged
-   fixed point** via the implicit function theorem — not through the unrolled
-   loop.  This keeps the gradient cost independent of the number of sweeps.
+4. The entire sweep loop is wrapped in a ``custom_vjp`` so that ``jax.grad``
+   differentiates through the **converged fixed point** via the implicit
+   function theorem — not through the unrolled loop.  This keeps the gradient
+   cost independent of the number of sweeps.
 
 .. mermaid::
 
@@ -122,7 +119,7 @@ The iteration proceeds as follows:
        P1 --> M1[CoilMesh]
        P1 --> L1[LinearElasticity3D]
        Driver -.->|"u_attach → support.solve()"| Sup
-       Sup -.->|"support.displacement_at() → u_attach"| Driver
+       Sup -.->|"u_attach from support.compute_attach()"| Driver
 
 **Key properties:**
 
@@ -174,14 +171,14 @@ The three key objects are:
 - :class:`Support <coil_fem.coupling.supports.Support>`
   (``src/coil_fem/coupling/supports.py``) — abstract base class for any support
   model.  Exposes :meth:`~coil_fem.coupling.supports.Support.solve`,
-  :meth:`~coil_fem.coupling.supports.Support.displacement_at`, and optionally
+  :meth:`~coil_fem.coupling.supports.Support.compute_attach`, and optionally
   :meth:`~coil_fem.coupling.supports.Support.coo`.
 
-- **Coupling drivers** (``src/coil_fem/coupling/drivers.py``, to be
-  implemented) — pure functions ``solve_staggered`` and ``solve_monolithic``
-  that orchestrate iteration between pipelines and supports.  They are
-  functions, not classes: all persistent state (factorizations, meshes) lives
-  inside the pipelines and supports they receive as arguments.
+- **Coupling drivers** (``src/coil_fem/coupling/drivers.py``) — pure functions
+  ``solve_uncoupled``, ``solve_staggered``, and ``solve_monolithic`` that
+  orchestrate iteration between pipelines and supports.  They are functions,
+  not classes: all persistent state (factorizations, meshes) lives inside the
+  pipelines and supports they receive as arguments.
 
 The :class:`Support <coil_fem.coupling.supports.Support>` ABC standardises the
 interface so that coupling strategies and support implementations are
@@ -229,10 +226,9 @@ it will contain the coil-side interface reaction forces (the spring load
 support attachment points).  Your implementation should:
 
 - Accept the load and solve the support's internal FEM / beam / etc. problem.
-- Return a ``state`` dict containing whatever :meth:`displacement_at` needs to
-  sample the solution.
+- Return a ``state`` dict with at least ``'u_s'`` (the support DOF solution).
 - Be **differentiable**: use ``jax_fem.solver.ad_wrapper`` (for a FEM-based
-  support) or ``lineax`` (for a beam network or dense system) so that
+  support) or ``jnp.linalg.solve`` / any JAX-compatible solver so that
   ``jax.grad`` can flow through this call.
 
 .. code-block:: python
@@ -242,26 +238,7 @@ support attachment points).  Your implementation should:
        # ... build RHS, call ad_wrapper / lineax ...
        return {"sol": sol}                 # sol is a differentiable jax.Array
 
-Step 4 — Implement ``displacement_at(state, points)``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Sample the displacement field computed in ``solve`` at the given physical
-coordinates ``points`` (shape ``(N, 3)``).  The return value must be a
-``jax.Array`` of shape ``(N, 3)``.
-
-- For a FEM support this is standard finite-element interpolation (evaluate
-  shape functions at the query points).
-- For a beam network it is Hermite shape-function evaluation along elements.
-- All operations must be pure JAX so that the function is differentiable.
-
-.. code-block:: python
-
-   def displacement_at(self, state: dict, points: jax.Array) -> jax.Array:
-       sol = state["sol"]
-       # ... interpolate sol at points using JAX ops ...
-       return displacements   # shape (N, 3)
-
-Step 5 — Optionally implement ``coo()`` for monolithic coupling
+Step 4 — Optionally implement ``coo()`` for monolithic coupling
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 If the support is to be used with ``solve_monolithic``, override
@@ -279,7 +256,7 @@ description of the block structure and COO format.
        # Return (I, J, V, n_dofs) for the K_ss block
        return self.problem.I_jax, self.problem.J_jax, self.problem.V_jax, self.n_dofs
 
-Step 6 — Register in ``coupling/__init__.py``
+Step 5 — Register in ``coupling/__init__.py``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Export the new class from ``src/coil_fem/coupling/__init__.py`` so users can
@@ -289,16 +266,16 @@ import it with a single statement:
 
    from coil_fem.coupling import MySupport
 
-Step 7 — Write tests
+Step 6 — Write tests
 ~~~~~~~~~~~~~~~~~~~~~
 
 Add tests in ``tests/test_support_<name>.py``:
 
 - Construct the support with a small toy mesh / geometry.
-- Verify that :meth:`displacement_at` returns the correct shape and contains
-  finite values.
+- Verify that :meth:`solve` returns ``'u_s'`` with the correct shape and
+  contains finite values.
 - Verify that :meth:`solve` is differentiable by calling ``jax.grad`` on a
-  scalar that depends on the returned state.
+  scalar that depends on the returned ``'u_s'``.
 - If :meth:`coo` is implemented, verify that the returned matrix is symmetric
   and positive semi-definite on a small example.
 

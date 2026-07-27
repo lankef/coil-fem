@@ -1,13 +1,12 @@
-"""Tests for the staggered and monolithic coupled solver drivers.
+"""Tests for the coupled solver drivers.
 
 Tests cover:
 
 * ``solve_monolithic`` raises ``NotImplementedError`` on CPU backends.
+* ``solve_staggered`` raises ``NotImplementedError`` (retired).
 * ``CoilFEM`` validates the ``coupling`` keyword argument.
 * ``CoilFEM`` dispatches to ``solve_staggered`` vs ``solve_monolithic`` based
   on the ``coupling`` option (verified via monkeypatching).
-* ``solve_staggered`` converges to a consistent fixed point on a trivially
-  decoupled system (mock support that always returns ``u_s = 0``).
 * The uncoupled ``_solve_all`` path produces the same result as the old
   per-coil loop.
 """
@@ -87,7 +86,7 @@ class _TrivialCoupledSupport(Support):
 
     is_coupled = True
     n_support_dofs = 1
-    k_lin = 1e9
+    k_attachment = 1e9
     # Static K_ss pattern (1×1 diagonal), required by build_monolithic_static.
     _coo_I = np.zeros(1, dtype=np.int32)
     _coo_J = np.zeros(1, dtype=np.int32)
@@ -197,7 +196,11 @@ def test_coilfem_invalid_coupling_raises():
 # ============================================================================
 
 def test_coilfem_dispatch_calls_staggered(monkeypatch):
-    """CoilFEM._solve_all should call solve_staggered when coupling='staggered'."""
+    """CoilFEM._solve_all dispatches to solve_staggered when coupling='staggered'.
+
+    Note: solve_staggered itself raises NotImplementedError (retired).
+    This test monkeypatches to verify the dispatch logic independently.
+    """
     calls = []
 
     def mock_staggered(pipelines, support, params, *, options=None):
@@ -284,54 +287,22 @@ def test_uncoupled_solve_all_backward_compatible():
 
 
 # ============================================================================
-# 5. solve_staggered fixed-point smoke test
+# 5. solve_staggered is retired
 # ============================================================================
 
-def test_staggered_fixed_point_trivial():
-    """solve_staggered converges in one iteration for a trivially decoupled system.
-
-    The trivial support always returns u_s = 0 and compute_attach returns
-    zeros, so the coil FEM and support system are fully decoupled.  The
-    staggered loop should detect convergence after the first sweep.
-    """
-    pipeline = _make_tiny_pipeline()
-    support  = _TrivialCoupledSupport()
-    pts      = pipeline.mesh.mesh_points_from_dofs(_make_circle(N=4).dofs)
-    n_cells  = pipeline.problem.num_cells
-    n_quads  = pipeline.problem.fes[0].num_quads
-    n_sq     = pipeline.n_surface_quads
-    curve    = _make_circle(N=4)
-
-    params = {
-        'mesh_points_by_coil': [pts],
-        'body_force_by_coil':  [jnp.zeros((n_cells, n_quads, 3))],
-        'weights_by_coil':     [jnp.ones(n_sq)],
-        'curves_by_coil':      [curve],
-        'base_curves_dofs':    [curve.dofs],
-        'support_dofs':        {},
-    }
-
-    result = solve_staggered(
-        [pipeline], support, params,
-        options={'max_iters': 50, 'atol': 1e-10},
-    )
-
-    assert 'sol_list_by_coil' in result
-    assert 'u_s' in result
-    assert result['u_s'].shape == (1,)
-
-    u_coil = result['sol_list_by_coil'][0][0]
-    assert u_coil.shape[-1] == 3
-    assert jnp.all(jnp.isfinite(u_coil)), "Displacement should be finite."
+def test_staggered_raises_not_implemented():
+    """solve_staggered raises NotImplementedError (retired; use 'monolithic')."""
+    with pytest.raises(NotImplementedError, match="solve_staggered"):
+        solve_staggered([], None, {})
 
 
 # ============================================================================
-# 6. winkler_k / k_lin mismatch guard
+# 6. winkler_k / k_attachment mismatch guard
 # ============================================================================
 
 def test_winkler_k_mismatch_raises():
-    """CoilFEM should raise ValueError when winkler_k != support.k_lin."""
-    support = _TrivialCoupledSupport()  # k_lin = 1e9
+    """CoilFEM should raise ValueError when winkler_k != support.k_attachment."""
+    support = _TrivialCoupledSupport()  # k_attachment = 1e9
 
     curve = _make_circle(N=4)
     with pytest.raises(ValueError, match="winkler_k"):
