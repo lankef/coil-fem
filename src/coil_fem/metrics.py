@@ -1,4 +1,4 @@
-"""Von Mises stress and strain-energy metrics on JAX-FEM solutions.
+"""Metrics for evaluating the FEM solutions.
 
 All public functions accept optional ``shape_grads`` and ``JxW`` keyword
 arguments.  When provided (as recomputed by :meth:`~coil_fem.CoilFEM.objective`
@@ -25,8 +25,9 @@ def cauchy_stress_small_strain(
     ----------
     u_grad : jnp.ndarray, shape (..., 3, 3)
         Displacement gradient at each quadrature point.
-    lam, mu : float
-        Lamé parameters.
+    lam, mu : float or jnp.ndarray broadcastable to ``(...,)``
+        Lamé parameters.  Scalars (uniform material) and per-quad arrays of
+        shape ``(n_cells, n_quads)`` are both accepted.
     epsilon_th : jnp.ndarray or None
         Constant thermal eigenstrain ``(3, 3)``; ``None`` for isothermal.
 
@@ -35,6 +36,10 @@ def cauchy_stress_small_strain(
     jnp.ndarray, shape (..., 3, 3)
         Cauchy stress tensor.
     """
+    # Promote to (..., 1, 1) so scalars and (n_cells, n_quads) arrays both
+    # broadcast correctly against eps_m of shape (..., 3, 3).
+    lam = jnp.asarray(lam)[..., None, None]
+    mu  = jnp.asarray(mu)[..., None, None]
     eps = 0.5 * (u_grad + jnp.swapaxes(u_grad, -1, -2))
     eps_m = eps - epsilon_th if epsilon_th is not None else eps
     tr = jnp.trace(eps_m, axis1=-2, axis2=-1)
@@ -219,7 +224,7 @@ def max_von_mises_lse(
     vm = von_mises_on_quadrature(
         problem, sol_list, lam, mu, shape_grads=shape_grads, epsilon_th=epsilon_th,
     ).ravel()
-    return (1.0 / beta) * jax.nn.logsumexp(beta * vm)
+    return (1.0 / beta) * jax.scipy.special.logsumexp(beta * vm)
 
 
 def l2_von_mises(
@@ -255,6 +260,34 @@ def l2_von_mises(
     return jnp.sum(vm**2 * jxw)
 
 
+def strain_energy_density(
+    u_grad: jnp.ndarray, lam: float, mu: float, *, epsilon_th=None
+) -> jnp.ndarray:
+    """0.5 σ : ε_m — elastic (mechanical) strain-energy density per quad point.
+
+    Uses the mechanical strain ``ε_m = ε − ε_th`` when ``epsilon_th`` is
+    provided, so thermal pre-strain does not spuriously contribute to the
+    elastic energy.
+
+    Parameters
+    ----------
+    u_grad : jnp.ndarray, shape ``(..., 3, 3)``
+        Displacement gradient at each quadrature point.
+    lam, mu : float
+        Lamé parameters.
+    epsilon_th : jnp.ndarray or None
+        Constant thermal eigenstrain ``(3, 3)``; ``None`` for isothermal.
+
+    Returns
+    -------
+    jnp.ndarray, shape ``(...,)``
+    """
+    eps = 0.5 * (u_grad + jnp.swapaxes(u_grad, -1, -2))
+    eps_m = eps - epsilon_th if epsilon_th is not None else eps
+    sig = cauchy_stress_small_strain(u_grad, lam, mu, epsilon_th=epsilon_th)
+    return 0.5 * jnp.sum(sig * eps_m, axis=(-2, -1))
+
+
 def total_strain_energy(
     problem, sol_list, lam: float, mu: float,
     *, shape_grads=None, JxW=None, epsilon_th=None,
@@ -275,13 +308,9 @@ def total_strain_energy(
     jnp.ndarray
         Scalar strain energy [J].
     """
-    # Lazy import to avoid a module-load cycle: coil_fem imports metrics at the
-    # top level, while the strain-energy-density kernel lives on CoilFEM.
-    from .coil_fem import CoilFEM
-
     sol = jnp.asarray(sol_list[0])
     u_grad = displacement_gradient_at_quads(sol, problem, shape_grads=shape_grads)
     eps_th = _resolve_epsilon_th(problem, epsilon_th)
-    psi = CoilFEM.strain_energy_density(u_grad, lam, mu, epsilon_th=eps_th)
+    psi = strain_energy_density(u_grad, lam, mu, epsilon_th=eps_th)
     jxw = _resolve_JxW(problem, JxW)
     return jnp.sum(psi * jxw)

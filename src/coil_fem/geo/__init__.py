@@ -1,4 +1,4 @@
-"""Curve geometry, framed curves, and symmetry helpers for stellarator coils."""
+"""JAX implementations of geometry objects, such as curves, moving frame and symmetry/field-period helpers."""
 
 from .curve_jax import CurveXYZFourierJAX
 from .framed_curve_jax import (
@@ -14,6 +14,9 @@ from .symmetries import (
     apply_symmetries_to_gammadashs,
     apply_symmetries_to_currents,
     n_coils_total,
+    rodrigues,
+    rotate_points_z,
+    flip_points,
 )
 
 __all__ = [
@@ -28,4 +31,7 @@ __all__ = [
     "apply_symmetries_to_gammadashs",
     "apply_symmetries_to_currents",
     "n_coils_total",
+    "rodrigues",
+    "rotate_points_z",
+    "flip_points",
 ]

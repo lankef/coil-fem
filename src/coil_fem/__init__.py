@@ -5,7 +5,7 @@ magnetic helpers :func:`~coil_fem.biot_savart`,
 :func:`~coil_fem.B_self_quadrature`, and
 :func:`~coil_fem.lorentz_body_force`.  Curve geometry lives in
 :mod:`coil_fem.geo`, simsopt interop in :mod:`coil_fem.simsopt`, and the
-optional GPU cuDSS backend in :mod:`coil_fem.solver`.
+optional GPU cuDSS backend in :mod:`coil_fem.solvers`.
 """
 
 from .coil_fem import CoilFEM

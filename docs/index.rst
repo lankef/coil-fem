@@ -91,6 +91,7 @@ are:
    theory/index
    tutorial/index
    api/index
+   developers/index
 
 Indices and tables
 ==================
