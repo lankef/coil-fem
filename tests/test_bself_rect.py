@@ -220,6 +220,43 @@ class TestBSelfRectFullConsistency:
             ),
         )
 
+    def test_finite_on_conductor_boundary(self):
+        """B_self must stay finite at |u| = 1 / |v| = 1 (faces, edges, corners).
+
+        Sampling the field at mesh *nodes* rather than interior quadrature
+        points puts query points exactly on the conductor surface, where the
+        ``G`` and ``K`` helpers would otherwise evaluate ``0 * inf``.
+        """
+        N  = 16
+        w1, w2 = 0.05, 0.03
+        I  = 1e4
+
+        fc    = _make_circle_framed(N=N)
+        cs    = {'shape': 'rect', 'w1': w1, 'w2': w2}
+        phi_q = fc.curve.quadpoints[:, None]          # (N, 1)
+
+        # Faces, edge midpoints and all four corners of the cross-section.
+        uv_cases = [
+            (1.0, 0.3), (-1.0, 0.3), (0.3, 1.0), (0.3, -1.0),
+            (1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0),
+        ]
+        for u, v in uv_cases:
+            uv_q = jnp.broadcast_to(jnp.array([u, v]), (N, 1, 2))
+            B = B_self_quadrature(fc, I, cs, phi_q, uv_q)
+            assert jnp.all(jnp.isfinite(B)), (
+                f"B_self is not finite at (u, v) = ({u}, {v})"
+            )
+
+        # The boundary value must be the limit of the interior, not an artefact.
+        uv_in  = jnp.broadcast_to(jnp.array([1.0 - 1e-9, 0.3]), (N, 1, 2))
+        uv_on  = jnp.broadcast_to(jnp.array([1.0, 0.3]), (N, 1, 2))
+        np.testing.assert_allclose(
+            np.asarray(B_self_quadrature(fc, I, cs, phi_q, uv_on)),
+            np.asarray(B_self_quadrature(fc, I, cs, phi_q, uv_in)),
+            rtol=1e-6,
+            err_msg="B_self at u = 1 does not match its interior limit",
+        )
+
     def test_disk_raises_not_implemented(self):
         """B_self_quadrature for a disk cross-section must raise NotImplementedError."""
         fc = _make_circle_framed(N=16)

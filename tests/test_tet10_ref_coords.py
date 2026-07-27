@@ -49,7 +49,7 @@ def _build_prob_dict(mesh_type, N=32, R=1.0, w1=0.05, w2=0.03):
     ``mesh.attach_ref_coords(prob)`` populates ``mesh.phi_quad``/``mesh.uv_quad``
     in place, mirroring what :class:`~coil_fem.CoilFEM` does at construction.
     """
-    from coil_fem.problem import LinearElasticity3D
+    from coil_fem.problems import LinearElasticity3D
 
     curve = _make_circle(N=N, R=R)
     fc = make_rmf_frame(curve)

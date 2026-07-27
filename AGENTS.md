@@ -55,20 +55,30 @@ src/coil_fem/                  # main package (Hatchling src-layout)
   magnetic.py                  # B-field helpers (biot_savart, B_self_quadrature) + lorentz_body_force
   metrics.py                   # Von Mises / strain metrics on FEM solutions
   meshing.py                   # Fixed-topology hex/tet meshing (rectangle/disk sweep, curved-sided TET10)
-  problem/                     # FEM Problem subpackage
+  pipelines.py                 # ElasticPipeline / ThermoElasticPipeline — per-coil FEM state
+  problems/                    # FEM Problem subpackage
     __init__.py                # re-exports LinearElasticity3D, DeviceProblem (+ elasticity helpers)
-    linear_elasticity.py       # LinearElasticity3D — JAX-FEM Problem subclass; itc_strain thermal eigenstrain
+    linear_elasticity.py       # LinearElasticity3D — JAX-FEM Problem subclass; itc_strain thermal eigenstrain; support_attach shifted Winkler
     device_problem.py          # DeviceProblem — JAX device-assembly Problem subclass
+    heat_conduction.py         # HeatConduction3D stub (future thermoelastic coupling)
+  presets/                     # Named material / cross-section factory helpers
+    __init__.py
+    cross_section_fns.py       # solid/hollow circle & rectangle section factories
   geo/                         # Curve geometry and symmetry subpackage
     __init__.py                # re-exports CurveXYZFourierJAX, framed curves, symmetry helpers
     curve_jax.py               # CurveXYZFourierJAX — JAX pytree, simsopt interop
     framed_curve_jax.py        # FramedCurveCentroidJAX / FramedCurveRMFJAX
     symmetries.py              # Stellarator symmetry expansion (pure JAX)
+  coupling/                    # Support structure coupling subpackage
+    __init__.py                # re-exports Support, SupportBeams, solve_staggered, solve_monolithic
+    supports.py                # Support (concrete grounded Winkler/Robin BC)
+    beam_network.py            # SupportBeams — bisymmetric beam-network support (coil-coil + coil-foundation)
+    drivers.py                 # solve_staggered (BG-S + Aitken + IFT grad), solve_monolithic (cuDSS-only)
   simsopt/                     # simsopt Optimizable interop subpackage
-    __init__.py                # re-exports CoilFEMObjective, CoilSupport family
-    objective.py               # CoilFEMObjective — simsopt Optimizable wrapper
-    support.py                 # CoilSupport, CoilSupportDiscrete, CoilSupportTopBottom
-  solver/                      # Optional GPU solver subpackage
+    __init__.py                # re-exports CoilFEMObjective, CoilSupport, CoilSupportFixed, CoilSupportTopBottom
+    objectives.py              # CoilFEMObjective — simsopt Optimizable wrapper
+    optimizables.py            # CoilSupport (base), CoilSupportFixed, CoilSupportTopBottom
+  solvers/                     # Optional GPU solver subpackage
     __init__.py
     cudss.py                   # GPU sparse direct solver (spineax + NVIDIA cuDSS)
 pyproject.toml                 # Hatchling build, deps, pytest config
@@ -170,6 +180,21 @@ Do **not** use `# ── Title ──────`, `# --- Title ---`, `# ---- #
 - `__init__.py` re-exports `CoilFEM`, `biot_savart`, `B_self_quadrature`, `lorentz_body_force`. Other modules are imported by explicit submodule path (e.g. `from coil_fem.meshing import rectangle_sweep`, `from coil_fem.geo import CurveXYZFourierJAX`).
 - simsopt interop lives in `coil_fem.simsopt` — keep pure-JAX code simsopt-free where possible.
 
+### Static vs. traced container convention
+
+Two kinds of data bundles appear in this codebase; use the correct container for each.
+
+**Traced bundles** (vary per optimisation step, flow through JAX autodiff):
+- Use plain `dict` or `NamedTuple`.  Both are JAX pytrees.
+- Example: `geom` dict returned by `SupportBeams.geometry(curves_jax, support_dofs)` contains endpoint positions, lengths, and DCMs — all traced arrays.
+- Example: `support_dofs` passed to solvers and metrics.
+
+**Static bundles** (fixed at construction, never traced):
+- Use `@dataclasses.dataclass(frozen=True, eq=False)`.  The `eq=False` flag prevents JAX from treating the dataclass as a pytree leaf during hashing; the `frozen=True` flag enforces immutability.
+- Example: `MonolithicStatic` in `coupling/drivers.py` — holds CSR patterns, cuDSS solver handles, and the pre-built `merged_solve` callable.
+- **Never store traced JAX arrays on `self`.**  Traced values must always be passed as arguments so that JAX's tracing and autodiff machinery can see them.
+- `CoilFEM.build_monolithic_static(solver)` is the canonical construction entry point for the monolithic static bundle; it is called once at `__init__` when `coupling == 'monolithic'` and `support.is_coupled`.
+
 ## Build and Packaging
 
 - **Build system:** Hatchling (`pyproject.toml`).
@@ -185,3 +210,80 @@ Do **not** use `# ── Title ──────`, `# --- Title ---`, `# ---- #
 - Do not commit data files (covered by `.gitignore`: `data/`, `*.npy`, `*.npz`, `*.h5`).
 - Do not commit Jupyter checkpoints or build artifacts.
 - When adding new modules, consider whether they need an optional-dependency guard.
+
+## Support Structure Architecture
+
+The coupling between coil FEM and support structures is split across three layers.
+
+### `Support` ABC (`coupling/supports.py`)
+
+`Support` is the abstract base class all support models must implement:
+
+| Method | Required | Description |
+|--------|----------|-------------|
+| `is_coupled` | property | `True` when the support has its own DOFs |
+| `solve(inputs)` | abstract | Advance support state; returns dict with `'u_s'` |
+| `compute_weights(coil_idx, surf_pts, curves_jax, dofs)` | default=1 | Per-surface-node Winkler weights; `curves_jax` is the full list of all base-coil curves |
+| `compute_attach(coil_idx, surf_pts, curves_jax, dofs, state)` | default=0 | Beam attachment displacement at surface nodes; same full-list signature |
+| `coupling_pattern(coil_dof_offsets, support_dof_offset, surface_node_indices_by_coil)` | default=empty | Static numpy I/J index arrays for K_cs / K_sc coupling blocks |
+| `coupling_values(curves_jax, sdofs, surf_pts_by_coil, *, jxw_by_coil, geom)` | default=empty | Traced V arrays for K_cs / K_sc coupling blocks |
+| `coo(curves_jax, sdofs, surf_pts, *, geom, jxw_by_coil)` | default stub | Support stiffness K_ss in COO format |
+| `n_support_dofs` | attribute | Required when `is_coupled=True` |
+| `k_attachment` | property | Required when `is_coupled=True` (must match `winkler_k`) |
+
+`Support` is the built-in uncoupled (grounded) support (`is_coupled=False`): it holds attachment points at zero displacement through a Winkler spring field whose spatial distribution is controlled by an optional `fixed_clamp_fn` callable.
+
+### `SupportBeams` (`coupling/beam_network.py`)
+
+`SupportBeams` extends `Support` with a bisymmetric beam-network model.  It overrides `compute_weights`, `compute_attach`, `coupling_pattern`, `coupling_values`, `coo`, and `solve`.
+
+Key constructor arguments (all static; set once at construction):
+
+- `n_beam_cc`, `n_beam_cf` — beam counts. CC beams have one entry per CC *group*: `n_base + 1` when `stellsym=True` (the extra last entry is the coil-0 `phi = 0` wrap group), else `n_base`. CF beams have one entry per base coil.
+- `E`, `nu` — Young's modulus and Poisson's ratio.
+- `cross_section_fn(support_dofs) -> (A, Iy, Iz, J)` — cross-section properties.
+- `attachment_fn(surface_pts_beam_frame, dofs, sign_x, beam_options) -> weights` — selects coil surface points for coupling.
+ - `surface_pts_beam_frame`: `(N, 3)` — query points in the beam's local frame, origin at the endpoint, computed as `(pts − x_endpoint) @ Gamma_3` (column 0 is the true beam tangent).  During solves, `pts` are surface **quadrature** points `(n_surface_quads, 3)`; during visualisation they may be surface node positions.
+ - `sign_x`: `True` at the node-1 end (beam extends toward `+x_local`), `False` at node-2.
+- `k_attachment` — unified spring stiffness for endpoint-to-mesh coupling (translational and torsional).
+
+Optimisable quantities live in `support_dofs` (passed at solve time, never stored):
+
+- `phis_start_cc`, `phis_end_cc` — attachment angles for CC beams: per-group lists, entry `g` of shape `(n_beam_cc[g],)` (`n_base + 1` entries when `stellsym=True`, else `n_base`).
+- **Note:** `support_weights` and `support_attach` in `params` are per-surface **quad** point (`(n_surface_quads,)` and `(n_surface_quads, 3)`), not per surface node.  Obtain them via `pipeline.surface_quad_points(pts)` → `support.compute_weights` / `compute_attach`.
+- `phis_start_cf` — attachment angles for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i],)`.
+- `x_foundation` — foundation anchor positions for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i], 3)`.
+- `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam (same per-group / per-coil list layout as the attachment angles).
+
+### Solver drivers (`coupling/drivers.py`)
+
+Two module-level driver functions replace the uncoupled per-coil loop in `CoilFEM` when `support.is_coupled=True`:
+
+- **`solve_staggered`** — Block Gauss-Seidel with Aitken relaxation.  Works on all backends (CPU and GPU).  Gradients are computed via a `@jax.custom_vjp` that applies the implicit-function theorem (IFT): the GMRES solve of `(I − dT/du_s)ᵀ λ = g` provides the correct adjoint without differentiating through the iteration history.  *Note:* the Python-loop forward pass is concrete (not JIT-compiled); wrapping the caller with `jax.jit` will fail.
+
+- **`solve_monolithic`** — Assembles a single merged block matrix `[K_cc | K_cs; K_sc | K_ss]` and solves it with cuDSS in one shot.  Raises `NotImplementedError` when `solver != 'cudss'`.
+
+### `CoilFEM` dispatch
+
+`CoilFEM.__init__` accepts a `coupling='staggered'|'monolithic'|'uncoupled'` keyword (default `'monolithic'`).  The internal `_solve_all` helper:
+
+1. Builds per-coil mesh points, body forces, and Winkler weights.
+2. Dispatches to `solve_staggered` or `solve_monolithic` when `support.is_coupled=True`.
+3. Falls back to an independent per-coil loop when `support.is_coupled=False`.
+
+When `is_coupled=True`, `CoilFEM` enforces `problem_options['winkler_k'] == support.k_attachment` at construction.
+
+### simsopt interop (`simsopt/optimizables.py`)
+
+`CoilSupport` is the simsopt `Optimizable` base class that holds `base_coils`, `nfp`, `stellsym`, and the `Support` instance.  `CoilSupportFixed` and `CoilSupportTopBottom` are concrete subclasses.  `CoilFEMObjective` takes a single `CoilSupport` as its primary argument.
+
+### Adding a new `Support` subclass
+
+1. Subclass `Support` (to inherit the `fixed_clamp_fn` weight logic).
+2. Set `is_coupled = True` (property) and declare `n_support_dofs` and `k_attachment`.
+3. Implement `solve(inputs) -> {'u_s': ...}` using any JAX-compatible solver.
+4. Override `compute_weights` to return per-surface-quad Winkler weights.
+5. Override `compute_attach` to return the beam displacement at coil surface quad points (shifts the Winkler spring attachment point in the staggered driver).
+6. Implement `coupling_pattern` and `coupling_values` to return the static COO indices and traced V values for the off-diagonal K_cs / K_sc blocks (used by the monolithic driver).
+7. Implement `coo` to return the support-local K_ss block in COO format (used by the monolithic driver).
+8. Add tests in `tests/test_<subclass>.py`.

@@ -41,6 +41,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+from .symmetries import rodrigues as _rodrigues_unit
 
 
 # ============================================================================
@@ -95,25 +96,8 @@ def _safe_norm(x, axis=-1):
 
 
 def _angle_axis_rotation_matrix(axis, angle):
-    """Rodrigues rotation matrix for a single (axis, angle) pair.
-
-    Parameters
-    ----------
-    axis : jnp.ndarray, shape (3,)  — unit vector
-    angle : scalar
-
-    Returns
-    -------
-    jnp.ndarray, shape (3, 3)
-    """
-    axis = axis / jnp.linalg.norm(axis)
-    ux, uy, uz = axis[0], axis[1], axis[2]
-    K = jnp.array([
-        [0.,   -uz,  uy],
-        [uz,   0., -ux],
-        [-uy,  ux,  0.],
-    ])
-    return jnp.eye(3) + jnp.sin(angle) * K + (1. - jnp.cos(angle)) * (K @ K)
+    """Rodrigues rotation matrix; normalises axis before delegating."""
+    return _rodrigues_unit(axis / jnp.linalg.norm(axis), angle)
 
 
 _angle_axis_rotation_matrix_vmap = jax.jit(jax.vmap(

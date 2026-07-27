@@ -18,6 +18,8 @@ Landreman, Hurwitz & Antonsen, Nucl. Fusion 65, 036008 (2025)
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax import vmap
@@ -29,7 +31,10 @@ from simsopt.field.selffield import B_regularized_pure
 # keeps its normal backend auto-selection (GPU when available). This runs at
 # import time, before any JAX computation, so it has no effect on an already
 # initialised backend.
-jax.config.update("jax_platform_name", None)
+# Only reset when the user has not set JAX_PLATFORMS explicitly: overwriting a
+# deliberate JAX_PLATFORMS=cpu setting would silently break GPU-free installs.
+if os.environ.get("JAX_PLATFORMS") is None:
+    jax.config.update("jax_platform_name", None)
 
 # mu_0 / (4 pi)
 _BIOT_SAVART_PREFACTOR = 1e-7
@@ -72,9 +77,22 @@ def _G_rect(x, y):
         G(x, y) = y\,\arctan\frac{x}{y}
                 + \frac{x}{2}\ln\!\left(1 + \frac{y^2}{x^2}\right)
 
-    Works element-wise for scalar or array inputs.
+    Works element-wise for scalar or array inputs.  Both terms vanish in the
+    limit as their prefactor does, but ``y / x`` overflows for ``x == 0``, so
+    the naive form evaluates ``0 * inf`` and returns NaN.  ``x == 0`` occurs
+    whenever a query point lies exactly on a conductor face (``|u| == 1`` or
+    ``|v| == 1``), which happens when the field is sampled at mesh nodes rather
+    than interior quadrature points.  The double-``where`` guard returns the
+    correct limits and keeps gradients finite.
     """
-    return y * jnp.arctan(x / y) + 0.5 * x * jnp.log1p((y / x) ** 2)
+    x_zero = x == 0
+    y_zero = y == 0
+    x_safe = jnp.where(x_zero, 1.0, x)
+    y_safe = jnp.where(y_zero, 1.0, y)
+    return (
+        jnp.where(y_zero, 0.0, y * jnp.arctan(x / y_safe))
+        + jnp.where(x_zero, 0.0, 0.5 * x * jnp.log1p((y / x_safe) ** 2))
+    )
 
 
 def _K_rect_flat(U, V, a, b, kappa1, kappa2, p, q):
@@ -98,7 +116,16 @@ def _K_rect_flat(U, V, a, b, kappa1, kappa2, p, q):
     V1 = V[:, None]
 
     S  = a * U1**2 / b + b * V1**2 / a      # (n_pts, 1)
-    L  = jnp.log(S)                          # (n_pts, 1)
+
+    # S vanishes only at a cross-section corner (U == V == 0), where every term
+    # below tends to zero but evaluates as 0 * inf.  Guard the log and the two
+    # arctan denominators, then return the limit.  Away from the corner a zero
+    # denominator is harmless: arctan saturates at +/- pi/2 as intended.
+    at_corner = S == 0.0
+    S_safe = jnp.where(at_corner, 1.0, S)
+    U_safe = jnp.where(at_corner, 1.0, U1)
+    V_safe = jnp.where(at_corner, 1.0, V1)
+    L  = jnp.log(S_safe)                     # (n_pts, 1)
 
     k1q_m_k2p = kappa1[:, None] * q - kappa2[:, None] * p   # (n_pts, 3)
     k2q_m_k1p = kappa2[:, None] * q - kappa1[:, None] * p
@@ -108,13 +135,13 @@ def _K_rect_flat(U, V, a, b, kappa1, kappa2, p, q):
     # Eq. (20) line 2: (kappa2 q - kappa1 p) S ln S
     term2 = S * L * k2q_m_k1p
     # Eq. (20) line 3: (4 a U^2 / b) kappa2 p arctan(bV / (aU))
-    atan_bV_aU = jnp.arctan(b * V1 / (a * U1))
+    atan_bV_aU = jnp.arctan(b * V1 / (a * U_safe))
     term3 = (4.0 * a * U1**2 / b) * atan_bV_aU * kappa2[:, None] * p
     # Eq. (20) line 4: -(4 b V^2 / a) kappa1 q arctan(aU / (bV))
-    atan_aU_bV = jnp.arctan(a * U1 / (b * V1))
+    atan_aU_bV = jnp.arctan(a * U1 / (b * V_safe))
     term4 = -(4.0 * b * V1**2 / a) * atan_aU_bV * kappa1[:, None] * q
 
-    return term1 + term2 + term3 + term4
+    return jnp.where(at_corner, 0.0, term1 + term2 + term3 + term4)
 
 
 # ============================================================================
@@ -159,7 +186,9 @@ def biot_savart(
     """
     n_quad = source_gammas.shape[1]
 
-    def field_from_one_source(gamma_j, gammadash_j, I_j):
+    def _one_source(B_acc, args):
+        gamma_j, gammadash_j, I_j = args
+
         def at_one_target(pt):
             r = pt[None, :] - gamma_j                       # (n_quad, 3)
             r_norm = jnp.sqrt(
@@ -170,15 +199,14 @@ def biot_savart(
             dB = cross / r_norm_safe ** 3
             return I_j * jnp.sum(dB, axis=0)               # (3,)
 
-        return vmap(at_one_target)(target_points)           # (n_targets, 3)
+        return B_acc + vmap(at_one_target)(target_points), None  # (n_targets, 3)
 
-    def contrib_i(args):
-        return field_from_one_source(*args)
-
-    contribs = vmap(contrib_i)(
-        (source_gammas, source_gammadashs, source_currents)
-    )  # (n_src, n_targets, 3)
-    return _BIOT_SAVART_PREFACTOR / n_quad * jnp.sum(contribs, axis=0)
+    B, _ = jax.lax.scan(
+        _one_source,
+        jnp.zeros_like(target_points),
+        (source_gammas, source_gammadashs, source_currents),
+    )
+    return _BIOT_SAVART_PREFACTOR / n_quad * B
 
 
 # ============================================================================

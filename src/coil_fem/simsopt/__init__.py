@@ -1,11 +1,12 @@
-"""simsopt interop: Optimizable wrappers for coil-fem."""
+"""Simsopt integration."""
 
-from .objective import CoilFEMObjective
-from .support import CoilSupport, CoilSupportDiscrete, CoilSupportTopBottom
+from .objectives import CoilFEMObjective
+from .optimizables import CoilSupport, CoilSupportFixed, CoilSupportTopBottom, CoilSupportBeams
 
 __all__ = [
     "CoilFEMObjective",
     "CoilSupport",
-    "CoilSupportDiscrete",
+    "CoilSupportFixed",
     "CoilSupportTopBottom",
+    "CoilSupportBeams",
 ]

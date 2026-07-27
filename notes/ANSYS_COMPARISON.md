@@ -46,7 +46,7 @@ fem = CoilFEM(
     stellsym         = stellsym,
     mesh_options     = mesh_options,
     material_options = material_options,
-    support_fn       = support_fn,
+    fixed_clamp_fn   = fixed_clamp_fn,
     support_dofs     = support_dofs,
     problem_options  = problem_options,
 )
@@ -782,7 +782,7 @@ Work through this list before trusting the comparison.
 - [ ] Spring stiffness field `spring_k_Npm3` is imported unchanged (N/m³).
 - [ ] Elastic Foundation is applied on the **outer surface only**, weighted by
   the spatially varying stiffness.
-- [ ] If `support_fn = None` was used in coil-fem, apply a Fixed Constraint on
+- [ ] If `fixed_clamp_fn = None` was used in coil-fem, apply a Fixed Constraint on
   the intended support faces instead.
 - [ ] Gravity is enabled in Mechanical only if `fem.gravity_options` is not
   `None`.  Use `g_vec = fem.gravity_options.get('g_vec', [0, 0, -9.80665])`.

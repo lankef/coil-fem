@@ -1,4 +1,4 @@
-"""Structured volume meshes for coil cross-sections.
+"""Structured volume meshes and meshing routines for finite-build coils.
 
 Sweeps a rectangular (:class:`CoilMeshRectangle`) or disk
 (:class:`CoilMeshDisk`) cross-section grid along a framed centerline curve
@@ -173,12 +173,6 @@ def _build_disk_o_grid_topology_np(n_center: int, n_radial: int):
             n2 = -s - (j / (Nr - 1)) * (ro - s)
             oxy[k] = (n1, n2)
 
-    n1min, n1max = oxy[:, 0].min(), oxy[:, 0].max()
-    n2min, n2max = oxy[:, 1].min(), oxy[:, 1].max()
-    span1 = n1max - n1min
-    span2 = n2max - n2min
-    # mu_log = (oxy[:, 0] - n1min) / (span1 if span1 > 1e-15 else 1.0)
-    # nu_log = (oxy[:, 1] - n2min) / (span2 if span2 > 1e-15 else 1.0)
     return quads, oxy, n2d
 
 
@@ -187,68 +181,6 @@ def _build_disk_o_grid_topology_np(n_center: int, n_radial: int):
 # ============================================================================
 
 # JIT notes:
-#   - The arithmetic (cross products, einsum) is fully JIT-safe.
-#   - The *diagnostic prints* are NOT: never put Python `if traced_val` in
-#     jitted code. We use jax.debug.print instead, which is JIT-safe and
-#     executes at runtime (not trace time).
-#   - If you want to use the returned `vols` inside a jitted caller, that is
-#     fine — only the debug prints have side effects.
-
-def validate_mesh(mesh) -> jax.Array:
-    """
-    Compute signed tet volumes and print a diagnostic summary.
-    
-    Works for both TET4 and TET10 — only the first 4 columns (corner nodes)
-    are used.  Uses jax.debug.print so output appears at runtime, not trace time.
-
-    Parameters
-    ----------
-    mesh : CoilMesh
-        Mesh to validate.
-
-    Returns
-    -------
-    vols : jax.Array
-        Signed volumes, shape (num_tets,).
-    """
-    points = jnp.asarray(mesh.points)
-    cells = jnp.asarray(mesh.cells)
-    
-    c = cells[:, :4]  # corners only — TET10-safe
-    v0 = points[c[:, 0]]
-    v1 = points[c[:, 1]]
-    v2 = points[c[:, 2]]
-    v3 = points[c[:, 3]]
-
-    a = v1 - v0
-    b = v2 - v0
-    c_vec = v3 - v0
-
-    # Signed volume = det([a,b,c]) / 6 via scalar triple product
-    vols = jnp.einsum('ij,ij->i', a, jnp.cross(b, c_vec)) / 6.0
-
-    n_neg = jnp.sum(vols < 0).astype(jnp.int32)
-    n_zero = jnp.sum(vols == 0).astype(jnp.int32)
-
-    # jax.debug.print is JIT-safe: deferred to runtime, not trace time
-    jax.debug.print(
-        "Volume check: min={mn:.3e}  max={mx:.3e}  "
-        "negative={ng}  degenerate={nz}",
-        mn=jnp.min(vols), mx=jnp.max(vols), ng=n_neg, nz=n_zero,
-    )
-    jax.debug.print(
-        "  {status}",
-        status=jnp.where(
-            n_neg + n_zero == 0,
-            jnp.int32(0),  # sentinel: 0 = all good
-            jnp.int32(1),  # sentinel: 1 = problems
-        )
-    )
-
-    return vols
-
-
-
 def _rect_sweep_topology(M: int, N: int, O: int, mesh_type: str):
     """Build rectangle-sweep mesh topology in (phi, u, v) parametric space.
 
@@ -364,7 +296,6 @@ def _rect_sweep_topology(M: int, N: int, O: int, mesh_type: str):
         key, axis=0, return_index=True, return_inverse=True
     )
     inv = inv.ravel()
-    n_mid = uniq_key.shape[0]
 
     a = uniq_key[:, 0]
     b = uniq_key[:, 1]
@@ -753,11 +684,6 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
         return None
 
     @property
-    def mesh_type(self):
-        """Alias for ele_type for backward compatibility."""
-        return self.ele_type
-
-    @property
     def meshio_cell_type(self) -> str:
         """meshio cell-type string corresponding to this element type.
 
@@ -783,19 +709,6 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
                 f"No meshio cell-type mapping for ele_type={self.ele_type!r}. "
                 f"Known: {list(_MAP)}"
             ) from None
-
-    def to_vtu(self, path: str = "beam_mesh.vtu"):
-        """
-        Export mesh to VTU format for ParaView visualization.
-        
-        Parameters
-        ----------
-        path : str
-            Output file path (should end in .vtu).
-        """
-        import meshio
-        meshio_type = 'tetra' if self.ele_type == 'TET4' else 'tetra10'
-        meshio.Mesh(points=self.points, cells=[(meshio_type, self.cells)]).write(path)
 
     def mesh_edge_length_sum(self, func=lambda x: jnp.sum(x**2)) -> jax.Array:
         """
@@ -833,48 +746,6 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
         edge_vecs = edge_pts[:, :, 1, :] - edge_pts[:, :, 0, :]  # (N_tets, 6, 3)
         
         return func(edge_vecs)
-
-    def mesh_longest_edge_volume_ratio(self) -> jax.Array:
-        r"""
-        Maximum edge-length-to-volume ratio across all tetrahedra.
-
-        For each tet with corners ``(v0, v1, v2, v3)``, let
-        :math:`\mathbf{a} = \mathbf{v}_1 - \mathbf{v}_0`,
-        :math:`\mathbf{b} = \mathbf{v}_2 - \mathbf{v}_0`,
-        :math:`\mathbf{c} = \mathbf{v}_3 - \mathbf{v}_0`. The metric is
-
-        .. math::
-
-            \frac{6\,|\mathbf{a}|\,|\mathbf{b}|\,|\mathbf{c}|}
-                 {|\det[\mathbf{a},\mathbf{b},\mathbf{c}]|}
-
-        The same three edges define both the numerator and the denominator
-        (via the scalar triple product), so no sorting is needed.
-
-        Works for both TET4 and TET10; only the first 4 columns of ``cells``
-        (corner nodes) are used.
-
-        Returns
-        -------
-        jax.Array
-            Scalar: maximum ratio across all elements.
-        """
-        points = self._points_jax
-        cells = self._cells_jax
-        corners = cells[:, :4]  # (N_tets, 4)
-
-        v0 = points[corners[:, 0]]  # (N_tets, 3)
-        a = points[corners[:, 1]] - v0
-        b = points[corners[:, 2]] - v0
-        c = points[corners[:, 3]] - v0
-
-        prod3 = (jnp.linalg.norm(a, axis=-1) * 
-                 jnp.linalg.norm(b, axis=-1) * 
-                 jnp.linalg.norm(c, axis=-1))  # (N_tets,)
-        vol = jnp.abs(jnp.einsum('ij,ij->i', a, jnp.cross(b, c))) / 6.0  # (N_tets,)
-
-        return jnp.max(prod3 / vol)
-
 
 # ============================================================================
 # Concrete cross-section meshes

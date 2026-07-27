@@ -137,7 +137,7 @@ class TestInitForwardParity:
     ``_rect_sweep_points``; the resulting points must be bit-identical.
 
     We drive ``mesh.mesh_points_from_dofs(dofs)`` directly rather than build a
-    full ``CoilFEM`` so the test doesn't need a FEM problem / support_fn /
+    full ``CoilFEM`` so the test doesn't need a FEM problem / fixed_clamp_fn /
     boundary conditions.
     """
 
