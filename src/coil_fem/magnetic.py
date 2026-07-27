@@ -77,9 +77,22 @@ def _G_rect(x, y):
         G(x, y) = y\,\arctan\frac{x}{y}
                 + \frac{x}{2}\ln\!\left(1 + \frac{y^2}{x^2}\right)
 
-    Works element-wise for scalar or array inputs.
+    Works element-wise for scalar or array inputs.  Both terms vanish in the
+    limit as their prefactor does, but ``y / x`` overflows for ``x == 0``, so
+    the naive form evaluates ``0 * inf`` and returns NaN.  ``x == 0`` occurs
+    whenever a query point lies exactly on a conductor face (``|u| == 1`` or
+    ``|v| == 1``), which happens when the field is sampled at mesh nodes rather
+    than interior quadrature points.  The double-``where`` guard returns the
+    correct limits and keeps gradients finite.
     """
-    return y * jnp.arctan(x / y) + 0.5 * x * jnp.log1p((y / x) ** 2)
+    x_zero = x == 0
+    y_zero = y == 0
+    x_safe = jnp.where(x_zero, 1.0, x)
+    y_safe = jnp.where(y_zero, 1.0, y)
+    return (
+        jnp.where(y_zero, 0.0, y * jnp.arctan(x / y_safe))
+        + jnp.where(x_zero, 0.0, 0.5 * x * jnp.log1p((y / x_safe) ** 2))
+    )
 
 
 def _K_rect_flat(U, V, a, b, kappa1, kappa2, p, q):
@@ -103,7 +116,16 @@ def _K_rect_flat(U, V, a, b, kappa1, kappa2, p, q):
     V1 = V[:, None]
 
     S  = a * U1**2 / b + b * V1**2 / a      # (n_pts, 1)
-    L  = jnp.log(S)                          # (n_pts, 1)
+
+    # S vanishes only at a cross-section corner (U == V == 0), where every term
+    # below tends to zero but evaluates as 0 * inf.  Guard the log and the two
+    # arctan denominators, then return the limit.  Away from the corner a zero
+    # denominator is harmless: arctan saturates at +/- pi/2 as intended.
+    at_corner = S == 0.0
+    S_safe = jnp.where(at_corner, 1.0, S)
+    U_safe = jnp.where(at_corner, 1.0, U1)
+    V_safe = jnp.where(at_corner, 1.0, V1)
+    L  = jnp.log(S_safe)                     # (n_pts, 1)
 
     k1q_m_k2p = kappa1[:, None] * q - kappa2[:, None] * p   # (n_pts, 3)
     k2q_m_k1p = kappa2[:, None] * q - kappa1[:, None] * p
@@ -113,13 +135,13 @@ def _K_rect_flat(U, V, a, b, kappa1, kappa2, p, q):
     # Eq. (20) line 2: (kappa2 q - kappa1 p) S ln S
     term2 = S * L * k2q_m_k1p
     # Eq. (20) line 3: (4 a U^2 / b) kappa2 p arctan(bV / (aU))
-    atan_bV_aU = jnp.arctan(b * V1 / (a * U1))
+    atan_bV_aU = jnp.arctan(b * V1 / (a * U_safe))
     term3 = (4.0 * a * U1**2 / b) * atan_bV_aU * kappa2[:, None] * p
     # Eq. (20) line 4: -(4 b V^2 / a) kappa1 q arctan(aU / (bV))
-    atan_aU_bV = jnp.arctan(a * U1 / (b * V1))
+    atan_aU_bV = jnp.arctan(a * U1 / (b * V_safe))
     term4 = -(4.0 * b * V1**2 / a) * atan_aU_bV * kappa1[:, None] * q
 
-    return term1 + term2 + term3 + term4
+    return jnp.where(at_corner, 0.0, term1 + term2 + term3 + term4)
 
 
 # ============================================================================
