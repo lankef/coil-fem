@@ -96,14 +96,6 @@ def test_support_solve_returns_empty_dict():
     assert state == {}
 
 
-def test_support_displacement_at_zeros():
-    """Support.displacement_at returns zero array of the correct shape."""
-    pts = jnp.ones((5, 3))
-    u   = Support().displacement_at({}, pts)
-    assert u.shape == (5, 3)
-    assert jnp.all(u == 0.0)
-
-
 def test_support_coo_raises():
     """Support.coo() raises NotImplementedError."""
     with pytest.raises(NotImplementedError):
@@ -227,3 +219,46 @@ def test_thermo_elastic_pipeline_solve_raises():
 
     with pytest.raises(NotImplementedError, match="not yet implemented"):
         stub.solve(points, body_force)
+
+
+# ---------------------------------------------------------------------------
+# 5. solve_uncoupled driver
+# ---------------------------------------------------------------------------
+
+def test_solve_uncoupled_matches_inline():
+    """solve_uncoupled returns same sol_list_by_coil as direct pipeline.solve calls."""
+    from coil_fem.coupling import solve_uncoupled
+
+    p1 = _make_tiny_pipeline(R=1.0)
+    p2 = _make_tiny_pipeline(R=1.5)
+    support = Support()
+
+    fe1, fe2 = p1.problem.fes[0], p2.problem.fes[0]
+    pts1 = jnp.asarray(fe1.points)
+    pts2 = jnp.asarray(fe2.points)
+    bf1 = jnp.zeros((fe1.num_cells, fe1.num_quads, 3))
+    bf2 = jnp.zeros((fe2.num_cells, fe2.num_quads, 3))
+
+    wt1 = jnp.ones(p1.n_surface_quads)
+    wt2 = jnp.ones(p2.n_surface_quads)
+
+    params = {
+        'mesh_points_by_coil': [pts1, pts2],
+        'body_force_by_coil':  [bf1, bf2],
+        'weights_by_coil':     [wt1, wt2],
+        'curves_by_coil':      [],  # not used by solve_uncoupled
+        'support_dofs':        {},
+    }
+    result = solve_uncoupled([p1, p2], support, params)
+
+    # Check keys
+    assert set(result.keys()) == {'sol_list_by_coil', 'u_s', 'diagnostics'}
+    assert result['u_s'] is None
+    assert result['diagnostics'] == {}
+    assert len(result['sol_list_by_coil']) == 2
+
+    # Verify same result as direct calls
+    sol1_direct = p1.solve(pts1, bf1, wt1)['sol_list']
+    sol2_direct = p2.solve(pts2, bf2, wt2)['sol_list']
+    assert jnp.allclose(result['sol_list_by_coil'][0][0], sol1_direct[0], atol=1e-12)
+    assert jnp.allclose(result['sol_list_by_coil'][1][0], sol2_direct[0], atol=1e-12)

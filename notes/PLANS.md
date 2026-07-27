@@ -93,13 +93,21 @@ base `Support` claim unconditionally rather than compare `k_tor == k_lin` at
 runtime — one fewer method on `SupportBeams`. See `REVIEW_2026_JULY.md` A2
 and A5a.
 
-**Unification does not fix the two contributing defects above** — they are
-about the CF foundation's zero moment arm and a missing area factor, neither
-of which depends on which constant (or how many) multiply them. Both remain
-open and need their own fix, alongside an assembly-time guard
-(`min(svd(K_ss))`, or surface the cuDSS inertia currently discarded at
-`cudss.py:408` / `drivers.py:559`) so a future zero-energy mode fails loudly
-rather than silently.
+**Resolved (Phase 1).** Both contributing defects above are fixed by the
+CF-foundation hard-clamp introduced in `SupportBeams.coo()`:
+
+- The CF foundation node-2 DOFs (rows and columns 6–11 of every CF beam's
+  `12×12` stiffness block) are Dirichlet-eliminated with a unit diagonal,
+  making the foundation a rigid anchor without any spring or moment-arm
+  dependence. `r_fnd` and the area-integral inconsistency no longer appear.
+- `K_ss` is now symmetric to machine precision for every configuration, and
+  `min(svd(K_ss)) > 0` for any network with at least one CF beam.
+
+The assembly-time guard requested above is also in place: the cuDSS inertia
+that was silently discarded at `cudss.py` / `drivers.py` is now threaded
+back into the diagnostics dict returned by `solve_monolithic`, and a new
+`test_k_ss_symmetry` + `test_cf_beam_cantilever_analytic` test pair in
+`tests/test_beam_networks.py` validates the fix.
 
 ### Issue: `winkler_k` may be ignored for CF-beam-only supports
 

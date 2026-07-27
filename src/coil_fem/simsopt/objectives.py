@@ -124,6 +124,8 @@ class CoilFEMObjective(Optimizable):
         self._material_options = material_options
         self._problem_options  = problem_options
         self._gravity_options  = gravity_options
+        self._physics_options  = physics_options
+        self._coupling         = coupling
         self._verbose          = verbose
 
         # ============================================================================
@@ -170,10 +172,8 @@ class CoilFEMObjective(Optimizable):
         _vg = value_and_grad(self._weighted_J, argnums=(0, 1, 2))
         if _use_jit:
             self._jit_vg: object = jax.jit(_vg)
-            self._jit_J:  object = jax.jit(self._weighted_J)
         else:
             self._jit_vg = _vg
-            self._jit_J  = self._weighted_J
 
         # Caches invalidated via recompute_bell() when any DOFs change.
         self._needs_J: bool = True
@@ -220,7 +220,8 @@ class CoilFEMObjective(Optimizable):
         if not self._needs_J:
             return
         cdofs, idofs, sdofs = self._read_dofs()
-        self._J_cache = float(self._jit_J(cdofs, idofs, sdofs))
+        J_val, _ = self._jit_vg(cdofs, idofs, sdofs)
+        self._J_cache = float(J_val)
         self._needs_J = False
 
     def _compute_dJ(self):

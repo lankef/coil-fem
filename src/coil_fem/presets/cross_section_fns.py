@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import math
 
 from ..utils import clamp_sigmoid
 from typing import Callable

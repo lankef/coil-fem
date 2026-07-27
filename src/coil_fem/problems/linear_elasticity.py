@@ -17,6 +17,11 @@ import numpy as onp
 import jax
 import jax.numpy as jnp
 from .device_problem import DeviceProblem
+from ..metrics import (
+    cauchy_stress_small_strain,
+    displacement_gradient_at_quads,
+    von_mises_on_quadrature,
+)
 
 
 # ============================================================================
@@ -74,53 +79,6 @@ def itc_strain(itc: jnp.ndarray) -> jnp.ndarray:
     """
     s = jnp.asarray(itc, dtype=float).reshape(())
     return -s * jnp.eye(3, dtype=jnp.float64)
-
-
-# ============================================================================
-# Boundary Condition Helpers
-# ============================================================================
-
-def dirichlet_bc(
-    mesh,
-    selection_rule: Callable[[onp.ndarray], onp.ndarray],
-    value: float = 0.0,
-) -> list:
-    """Build Dirichlet BC info from a node-selection callable.
-
-    The selection rule is evaluated **once** at construction time against the
-    current mesh points and the resulting boolean mask is closed over, so the
-    returned location functions are cheap to evaluate during JAX-FEM init.
-
-    Parameters
-    ----------
-    mesh : jax_fem.generate_mesh.Mesh
-        Mesh whose ``points`` array is used to evaluate the rule.
-    selection_rule : callable
-        Maps ``(N, 3)`` node coordinates to a ``(N,)`` bool array.
-    value : float
-        Fixed displacement value applied to all three components (default 0).
-
-    Returns
-    -------
-    list
-        ``[location_fns, vecs, value_fns]`` in JAX-FEM Dirichlet format.
-        All three displacement components (x, y, z) are fixed to ``value``.
-
-    Example
-    -------
-    ::
-
-        rule = lambda pts: pts[:, 2] < pts[:, 2].min() + 1e-5
-        dbc = dirichlet_bc(mesh, rule)
-        problem = LinearElasticity3D(..., dirichlet_bc_info=dbc)
-    """
-    flags = jnp.asarray(selection_rule(onp.asarray(mesh.points)), dtype=bool)
-
-    def loc(p, ind):
-        return flags[ind]
-
-    val_fn = lambda p: float(value)
-    return [[loc, loc, loc], [0, 1, 2], [val_fn, val_fn, val_fn]]
 
 
 # ============================================================================
@@ -263,6 +221,17 @@ class LinearElasticity3D(DeviceProblem):
         sol = fwd_pred(params)
     """
 
+    #: Symmetry claim for the assembled stiffness matrix.
+    #: Elasticity tangent, Winkler surface-mass term, and symmetric Dirichlet
+    #: elimination are all symmetric unconditionally.
+    matrix_symmetry: str = 'symmetric'
+
+    #: Linearity claim: ``R(u) = K u - f`` exactly (affine in ``u``), so a
+    #: single Newton step from ``u=0`` is the exact solution.  Curvature
+    #: enters only through ``params['points']``, which is a parameter, not the
+    #: unknown.
+    is_linear: bool = True
+
     def custom_init(
         self,
         E: float,
@@ -354,9 +323,8 @@ class LinearElasticity3D(DeviceProblem):
             # under-integrates degree-4 products of quadratic shape functions and
             # yields a rank-deficient surface stiffness.
             if _ele_type == 'TET10':
-                from jax_fem.basis import get_face_shape_vals_and_grads
                 face_sv, face_sg, face_qw, face_normals, _ = \
-                    get_face_shape_vals_and_grads('TET10', gauss_order=4)
+                    _gfsv('TET10', gauss_order=4)
                 fe.face_shape_vals    = face_sv
                 fe.face_shape_grads_ref = face_sg
                 fe.face_quad_weights  = face_qw
@@ -574,6 +542,52 @@ class LinearElasticity3D(DeviceProblem):
         )  # (n_sel, n_fq, 3)
         return spqp.reshape(-1, 3)                         # (n_sq, 3)
 
+    def surface_jxw(self, points: jnp.ndarray) -> jnp.ndarray:
+        """Jacobian-times-quadrature-weight at every surface quadrature point.
+
+        Returns the area measure ``|J| × w_q`` (Nanson scale × quad weight)
+        for each face-quad pair on the Winkler surface.  Differentiable with
+        respect to ``points``.
+
+        Parameters
+        ----------
+        points : jnp.ndarray, shape ``(n_nodes, 3)``
+            Current mesh node positions.
+
+        Returns
+        -------
+        jnp.ndarray, shape ``(num_sel, n_fq)``
+            JxW values, one per selected face per face quadrature point.
+
+        Raises
+        ------
+        ValueError
+            If no Winkler surface is configured (``winkler_k_scalar`` was not
+            set at construction).
+        """
+        if self._winkler_k_scalar is None or self._sel_face_sv is None:
+            raise ValueError(
+                "surface_jxw requires a Winkler surface (winkler_k_scalar must "
+                "be set at construction)."
+            )
+        bi = self.boundary_inds_list[0]
+        physical_coos = points[self._cells_jnp]            # (n_cells, n_nodes, 3)
+        selected_coos = physical_coos[bi[:, 0]]             # (num_sel, n_nodes, 3)
+        sel_grads_ref = self._face_sg_ref[bi[:, 1]]         # (num_sel, n_fq, n_nodes, 3)
+        sel_normals   = self._face_normals[bi[:, 1]]        # (num_sel, 3)
+
+        jacobian = jnp.sum(
+            selected_coos[:, None, :, :, None] * sel_grads_ref[:, :, :, None, :],
+            axis=2,
+        )  # (num_sel, n_fq, 3, 3)
+        det_J = jnp.linalg.det(jacobian)                   # (num_sel, n_fq)
+        inv_J = jnp.linalg.inv(jacobian)                   # (num_sel, n_fq, 3, 3)
+        ns_geom = jnp.linalg.norm(
+            (sel_normals[:, None, None, :] @ inv_J)[:, :, 0, :], axis=-1
+        )  # (num_sel, n_fq)
+        sel_weights = self._face_qw[bi[:, 1]]
+        return ns_geom * det_J * sel_weights               # (num_sel, n_fq)
+
     def interp_surface_nodal_to_quads(self, field: jnp.ndarray) -> jnp.ndarray:
         """Interpolate a compact surface-node field to surface quad points.
 
@@ -620,10 +634,7 @@ class LinearElasticity3D(DeviceProblem):
             (consumed by :meth:`get_mass_map`).
         """
         def stress(u_grad, bf, lam, mu, eps_th):
-            eps = 0.5 * (u_grad + u_grad.T)
-            eps_m = eps - eps_th
-            tr = jnp.trace(eps_m)
-            return lam * tr * jnp.eye(3, dtype=u_grad.dtype) + 2.0 * mu * eps_m
+            return cauchy_stress_small_strain(u_grad, lam, mu, epsilon_th=eps_th)
 
         return stress
 
@@ -723,9 +734,15 @@ class LinearElasticity3D(DeviceProblem):
         points = params['points']
 
         # Recompute all geometry arrays in JAX so AD can trace through points.
-        sg, jxw, vgj, pqp = recompute_fe_geometry(
-            points, self._cells_jnp, self._sg_ref, self._sv, self._qw,
-        )
+        # Use pre-computed geometry from the caller when available, avoiding a
+        # redundant call on the CPU path (review item 2d / p5f).
+        _fe_geom = params.get('_fe_geom')
+        if _fe_geom is not None:
+            sg, jxw, vgj, pqp = _fe_geom
+        else:
+            sg, jxw, vgj, pqp = recompute_fe_geometry(
+                points, self._cells_jnp, self._sg_ref, self._sv, self._qw,
+            )
         self.shape_grads = sg
         self.JxW = jxw[:, None, :]   # (num_cells, 1, num_quads) — num_vars=1
         self.v_grads_JxW = vgj
@@ -843,27 +860,7 @@ class LinearElasticity3D(DeviceProblem):
         jnp.ndarray, (num_cells, num_quads)
             Von Mises stress [Pa].
         """
-        fe = self.fes[0]
-        cells_sol = sol_list[0][fe.cells]  # (num_cells, num_nodes, 3)
-        shape_grads = self.shape_grads  # (num_cells, num_quads, num_nodes, dim)
-
-        # u_grads[c, q, i, j] = du_i/dx_j
-        u_grads = jnp.sum(
-            cells_sol[:, None, :, :, None] * shape_grads[:, :, :, None, :], axis=2
-        )  # (num_cells, num_quads, 3, 3)
-
-        lam, mu = self.lam, self.mu
-        epsilon_th = getattr(self, 'epsilon_th', None)  # None or constant (3, 3)
-
-        def vm_at_point(u_grad):
-            eps = 0.5 * (u_grad + u_grad.T)
-            eps_m = eps - epsilon_th if epsilon_th is not None else eps
-            tr = jnp.trace(eps_m)
-            sigma = lam * tr * jnp.eye(3, dtype=u_grad.dtype) + 2.0 * mu * eps_m
-            s = sigma - (jnp.trace(sigma) / 3.0) * jnp.eye(3, dtype=u_grad.dtype)
-            return jnp.sqrt(1.5 * jnp.sum(s * s) + 1e-30)
-
-        return jax.vmap(jax.vmap(vm_at_point))(u_grads)  # (num_cells, num_quads)
+        return von_mises_on_quadrature(self, sol_list, self.lam, self.mu)
 
     def strain_tensors(
         self,
@@ -903,16 +900,7 @@ class LinearElasticity3D(DeviceProblem):
             from ``eps_total`` (broadcasts automatically) to obtain the elastic
             strain.
         """
-        fe = self.fes[0]
-        cells_sol = sol_list[0][fe.cells]  # (num_cells, num_nodes, 3)
-        if shape_grads is None:
-            shape_grads = self.shape_grads  # (num_cells, num_quads, num_nodes, dim)
-
-        # u_grads[c, q, i, j] = du_i/dx_j
-        u_grads = jnp.sum(
-            cells_sol[:, None, :, :, None] * shape_grads[:, :, :, None, :], axis=2
-        )  # (num_cells, num_quads, 3, 3)
-
+        u_grads = displacement_gradient_at_quads(sol_list[0], self, shape_grads=shape_grads)
         eps_total = 0.5 * (u_grads + jnp.swapaxes(u_grads, -1, -2))
 
         eps_th = getattr(self, 'epsilon_th', None)

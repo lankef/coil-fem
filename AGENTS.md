@@ -72,7 +72,7 @@ src/coil_fem/                  # main package (Hatchling src-layout)
   coupling/                    # Support structure coupling subpackage
     __init__.py                # re-exports Support, SupportBeams, solve_staggered, solve_monolithic
     supports.py                # Support (concrete grounded Winkler/Robin BC)
-    beam_networks.py           # SupportBeams — bisymmetric beam-network support (coil-coil + coil-foundation)
+    beam_network.py            # SupportBeams — bisymmetric beam-network support (coil-coil + coil-foundation)
     drivers.py                 # solve_staggered (BG-S + Aitken + IFT grad), solve_monolithic (cuDSS-only)
   simsopt/                     # simsopt Optimizable interop subpackage
     __init__.py                # re-exports CoilFEMObjective, CoilSupport, CoilSupportFixed, CoilSupportTopBottom
@@ -223,29 +223,29 @@ The coupling between coil FEM and support structures is split across three layer
 |--------|----------|-------------|
 | `is_coupled` | property | `True` when the support has its own DOFs |
 | `solve(inputs)` | abstract | Advance support state; returns dict with `'u_s'` |
-| `displacement_at(state, points)` | abstract | Support displacement at query points |
 | `compute_weights(coil_idx, surf_pts, curves_jax, dofs)` | default=1 | Per-surface-node Winkler weights; `curves_jax` is the full list of all base-coil curves |
 | `compute_attach(coil_idx, surf_pts, curves_jax, dofs, state)` | default=0 | Beam attachment displacement at surface nodes; same full-list signature |
-| `coupling_terms(bcd, sdofs, surf_pts, coil_offsets, s_offset, surf_idx)` | default=empty | COO triplets for off-diagonal K_cs / K_sc blocks |
-| `coo(bcd, sdofs, surf_pts)` | default stub | Support stiffness K_ss in COO format |
+| `coupling_pattern(coil_dof_offsets, support_dof_offset, surface_node_indices_by_coil)` | default=empty | Static numpy I/J index arrays for K_cs / K_sc coupling blocks |
+| `coupling_values(curves_jax, sdofs, surf_pts_by_coil, *, jxw_by_coil, geom)` | default=empty | Traced V arrays for K_cs / K_sc coupling blocks |
+| `coo(curves_jax, sdofs, surf_pts, *, geom, jxw_by_coil)` | default stub | Support stiffness K_ss in COO format |
 | `n_support_dofs` | attribute | Required when `is_coupled=True` |
-| `k_lin` | attribute | Required when `is_coupled=True` (must match `winkler_k`) |
+| `k_attachment` | property | Required when `is_coupled=True` (must match `winkler_k`) |
 
 `Support` is the built-in uncoupled (grounded) support (`is_coupled=False`): it holds attachment points at zero displacement through a Winkler spring field whose spatial distribution is controlled by an optional `fixed_clamp_fn` callable.
 
-### `SupportBeams` (`coupling/beam_networks.py`)
+### `SupportBeams` (`coupling/beam_network.py`)
 
-`SupportBeams` extends `Support` with a bisymmetric beam-network model.  It overrides `compute_weights`, `compute_attach`, `coupling_terms`, `coo`, and `solve`.
+`SupportBeams` extends `Support` with a bisymmetric beam-network model.  It overrides `compute_weights`, `compute_attach`, `coupling_pattern`, `coupling_values`, `coo`, and `solve`.
 
 Key constructor arguments (all static; set once at construction):
 
 - `n_beam_cc`, `n_beam_cf` — beam counts. CC beams have one entry per CC *group*: `n_base + 1` when `stellsym=True` (the extra last entry is the coil-0 `phi = 0` wrap group), else `n_base`. CF beams have one entry per base coil.
 - `E`, `nu` — Young's modulus and Poisson's ratio.
 - `cross_section_fn(support_dofs) -> (A, Iy, Iz, J)` — cross-section properties.
-- `clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights` — selects coil surface points for coupling.
+- `attachment_fn(surface_pts_beam_frame, dofs, sign_x, beam_options) -> weights` — selects coil surface points for coupling.
  - `surface_pts_beam_frame`: `(N, 3)` — query points in the beam's local frame, origin at the endpoint, computed as `(pts − x_endpoint) @ Gamma_3` (column 0 is the true beam tangent).  During solves, `pts` are surface **quadrature** points `(n_surface_quads, 3)`; during visualisation they may be surface node positions.
  - `sign_x`: `True` at the node-1 end (beam extends toward `+x_local`), `False` at node-2.
-- `k_lin`, `k_tor` — translational and torsional spring stiffness for endpoint-to-mesh coupling.
+- `k_attachment` — unified spring stiffness for endpoint-to-mesh coupling (translational and torsional).
 
 Optimisable quantities live in `support_dofs` (passed at solve time, never stored):
 
@@ -265,13 +265,13 @@ Two module-level driver functions replace the uncoupled per-coil loop in `CoilFE
 
 ### `CoilFEM` dispatch
 
-`CoilFEM.__init__` accepts a `coupling='staggered'|'monolithic'` keyword (default `'staggered'`).  The internal `_solve_all` helper:
+`CoilFEM.__init__` accepts a `coupling='staggered'|'monolithic'|'uncoupled'` keyword (default `'monolithic'`).  The internal `_solve_all` helper:
 
 1. Builds per-coil mesh points, body forces, and Winkler weights.
 2. Dispatches to `solve_staggered` or `solve_monolithic` when `support.is_coupled=True`.
 3. Falls back to an independent per-coil loop when `support.is_coupled=False`.
 
-When `is_coupled=True`, `CoilFEM` enforces `problem_options['winkler_k'] == support.k_lin` at construction.
+When `is_coupled=True`, `CoilFEM` enforces `problem_options['winkler_k'] == support.k_attachment` at construction.
 
 ### simsopt interop (`simsopt/optimizables.py`)
 
@@ -280,10 +280,10 @@ When `is_coupled=True`, `CoilFEM` enforces `problem_options['winkler_k'] == supp
 ### Adding a new `Support` subclass
 
 1. Subclass `Support` (to inherit the `fixed_clamp_fn` weight logic).
-2. Set `is_coupled = True` (property) and declare `n_support_dofs` and `k_lin`.
-3. Implement `solve(inputs) -> {'u_s': ...}` using `lineax` or any JAX-compatible solver.
-4. Override `compute_weights` to return per-surface-node Winkler weights.
-5. Override `compute_attach` to return the beam displacement at coil surface nodes (used by the staggered driver to shift the Winkler spring attachment point).
-6. Implement `coupling_terms` to return the COO triplets for the off-diagonal K_cs / K_sc blocks (used by the monolithic driver).
+2. Set `is_coupled = True` (property) and declare `n_support_dofs` and `k_attachment`.
+3. Implement `solve(inputs) -> {'u_s': ...}` using any JAX-compatible solver.
+4. Override `compute_weights` to return per-surface-quad Winkler weights.
+5. Override `compute_attach` to return the beam displacement at coil surface quad points (shifts the Winkler spring attachment point in the staggered driver).
+6. Implement `coupling_pattern` and `coupling_values` to return the static COO indices and traced V values for the off-diagonal K_cs / K_sc blocks (used by the monolithic driver).
 7. Implement `coo` to return the support-local K_ss block in COO format (used by the monolithic driver).
 8. Add tests in `tests/test_<subclass>.py`.
