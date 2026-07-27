@@ -24,6 +24,7 @@ from __future__ import annotations
 import numpy as np
 import jax
 import jax.numpy as jnp
+import warnings
 from jax.flatten_util import ravel_pytree
 from ..presets import cross_section_fns
 from ..utils import clamp_sigmoid
@@ -402,6 +403,8 @@ _REQUIRED_BEAM_OPTIONS = (
     'E',
     'nu',
     'k_attachment',
+    'cross_section_type',
+    'attachment_type',
 )
 
 
@@ -634,10 +637,16 @@ class CoilSupportBeams(CoilSupport):
         # ── Load the remaining beam options ───────────────────────────────────
         # Default sigmoid function weight
         beam_options.setdefault('sigmoid_eps', 0.1)  
-        missing_beam_options = [k for k in _REQUIRED_BEAM_OPTIONS + cross_section_option_keys if k not in beam_options]
+        beam_option_keys_req = _REQUIRED_BEAM_OPTIONS + cross_section_option_keys
+        missing_beam_options = [k for k in beam_option_keys_req if k not in beam_options]
+        unrecognized_beam_options = [k for k in beam_options if k not in beam_option_keys_req]
         if missing_beam_options:
             raise ValueError(
-                f"beam_options must contain {missing_beam_options}."
+                f"Missing keys in beam_options: {missing_beam_options}."
+            )
+        if unrecognized_beam_options:
+            warnings.warn(
+                f"Unrecognized keys in beam_options: {unrecognized_beam_options}."
             )
 
         # ── Optional fixed-sphere Winkler clamps ──────────────────────────────
@@ -736,6 +745,15 @@ class CoilSupportBeams(CoilSupport):
                 f"'{cross_section_dof_keys}' as keyword arguments for "
                 "CoilSupportBeams. No keyword arguments are detected."
             )
+        # By design, kwarg are the initial values for cross section 
+        # dofs.
+        for k in kwargs:
+            if k not in cross_section_dof_keys:
+                warnings.warn(
+                    f"Unrecognized key word argument: {k}. Key word arguments "
+                    "that are not CoilSupportBeam parameters are reserved"
+                    "for initial values for cross section dofs, such as beam widths."
+                )
         for k in cross_section_dof_keys:
             if k not in kwargs:
                 raise AttributeError(
