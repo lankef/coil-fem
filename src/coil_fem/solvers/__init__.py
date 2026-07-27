@@ -6,6 +6,7 @@ CPU/GPU solver selection that was previously inlined in :class:`~coil_fem.CoilFE
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -36,6 +37,11 @@ def build_fwd_pred(problem: LinearElasticity3D, problem_options: dict):
     ``cudss_ad_wrapper`` import is lazy so that CPU-only installs remain
     unaffected.
 
+    The cuDSS matrix type (``mtype_id``) is derived from
+    ``problem.matrix_symmetry`` (e.g. ``'symmetric'`` → 1).  Pass
+    ``problem_options['cudss_mtype_id']`` only to override the derived value;
+    a warning is emitted when the override disagrees with the derived claim.
+
     Parameters
     ----------
     problem : LinearElasticity3D
@@ -46,13 +52,9 @@ def build_fwd_pred(problem: LinearElasticity3D, problem_options: dict):
         ``'solver'`` : str, default ``'umfpack'``
         ``'adjoint_solver'`` : str, default ``'umfpack'``
         ``'cudss_device_id'`` : int, default ``0``
-        ``'cudss_mtype_id'``  : int, default ``1``
-        ``'cudss_tol'``       : float, default ``1e-6``
-        ``'cudss_rel_tol'``   : float, default ``1e-8``
-        ``'cudss_max_iter'``  : int, default ``50``
-        ``'cudss_linear'``    : bool, default ``False`` — set to ``True`` for
-            linear problems to skip the Newton iteration loop and avoid host
-            synchronisation (single assemble + single solve).
+        ``'cudss_mtype_id'``  : int, optional override — derived from
+            ``problem.matrix_symmetry`` by default; emits ``UserWarning``
+            when it disagrees with the derived value.
 
     Returns
     -------
@@ -61,21 +63,45 @@ def build_fwd_pred(problem: LinearElasticity3D, problem_options: dict):
         function that calls ``problem.set_params(params)`` and solves the
         linear system, returning ``sol_list`` in JAX-FEM's multi-physics
         convention.
+
+    Raises
+    ------
+    NotImplementedError
+        When ``solver='cudss'`` and ``problem.is_linear`` is ``False``.
+        Use jax-fem's CPU ``ad_wrapper`` for non-linear problems.
     """
     from jax_fem.solver import ad_wrapper
 
     _use_cudss = needs_gpu_assembly(problem_options)
 
     if _use_cudss:
-        from .cudss import cudss_ad_wrapper
+        from .cudss import cudss_ad_wrapper, _MTYPE_ID
+
+        if not getattr(problem, 'is_linear', False):
+            raise NotImplementedError(
+                f"{type(problem).__name__} does not declare is_linear=True. "
+                "The cuDSS path requires a linear problem (single-step solve). "
+                "Use solver='umfpack' or another CPU backend for non-linear problems."
+            )
+
+        # Derive mtype_id from problem's declared symmetry.
+        derived_sym = getattr(problem, 'matrix_symmetry', 'symmetric')
+        mtype_id = _MTYPE_ID[derived_sym]
+        if 'cudss_mtype_id' in problem_options:
+            override = int(problem_options['cudss_mtype_id'])
+            if override != mtype_id:
+                warnings.warn(
+                    f"cudss_mtype_id={override} overrides derived value "
+                    f"{mtype_id} (from matrix_symmetry={derived_sym!r}). "
+                    "Verify this is intentional.",
+                    stacklevel=2,
+                )
+            mtype_id = override
+
         return cudss_ad_wrapper(
             problem,
             device_id=int(problem_options.get('cudss_device_id', 0)),
-            mtype_id=int(problem_options.get('cudss_mtype_id', 1)),
-            tol=float(problem_options.get('cudss_tol', 1e-6)),
-            rel_tol=float(problem_options.get('cudss_rel_tol', 1e-8)),
-            max_iter=int(problem_options.get('cudss_max_iter', 50)),
-            linear=bool(problem_options.get('cudss_linear', False)),
+            mtype_id=mtype_id,
         )
 
     solver_name     = problem_options.get('solver', 'umfpack')

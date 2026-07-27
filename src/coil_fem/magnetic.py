@@ -18,6 +18,8 @@ Landreman, Hurwitz & Antonsen, Nucl. Fusion 65, 036008 (2025)
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax import vmap
@@ -29,7 +31,10 @@ from simsopt.field.selffield import B_regularized_pure
 # keeps its normal backend auto-selection (GPU when available). This runs at
 # import time, before any JAX computation, so it has no effect on an already
 # initialised backend.
-jax.config.update("jax_platform_name", None)
+# Only reset when the user has not set JAX_PLATFORMS explicitly: overwriting a
+# deliberate JAX_PLATFORMS=cpu setting would silently break GPU-free installs.
+if os.environ.get("JAX_PLATFORMS") is None:
+    jax.config.update("jax_platform_name", None)
 
 # mu_0 / (4 pi)
 _BIOT_SAVART_PREFACTOR = 1e-7
@@ -159,7 +164,9 @@ def biot_savart(
     """
     n_quad = source_gammas.shape[1]
 
-    def field_from_one_source(gamma_j, gammadash_j, I_j):
+    def _one_source(B_acc, args):
+        gamma_j, gammadash_j, I_j = args
+
         def at_one_target(pt):
             r = pt[None, :] - gamma_j                       # (n_quad, 3)
             r_norm = jnp.sqrt(
@@ -170,15 +177,14 @@ def biot_savart(
             dB = cross / r_norm_safe ** 3
             return I_j * jnp.sum(dB, axis=0)               # (3,)
 
-        return vmap(at_one_target)(target_points)           # (n_targets, 3)
+        return B_acc + vmap(at_one_target)(target_points), None  # (n_targets, 3)
 
-    def contrib_i(args):
-        return field_from_one_source(*args)
-
-    contribs = vmap(contrib_i)(
-        (source_gammas, source_gammadashs, source_currents)
-    )  # (n_src, n_targets, 3)
-    return _BIOT_SAVART_PREFACTOR / n_quad * jnp.sum(contribs, axis=0)
+    B, _ = jax.lax.scan(
+        _one_source,
+        jnp.zeros_like(target_points),
+        (source_gammas, source_gammadashs, source_currents),
+    )
+    return _BIOT_SAVART_PREFACTOR / n_quad * B
 
 
 # ============================================================================

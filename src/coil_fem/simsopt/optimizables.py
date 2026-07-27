@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from ..presets import cross_section_fns
-from ..utils import fetch_attr, clamp_sigmoid
+from ..utils import clamp_sigmoid
 from ..coupling import Support, SupportBeams
 
 
@@ -299,6 +299,18 @@ class CoilSupportFixed(CoilSupport):
         self._r_clamp = float(r_clamp)
         self._sig_eps  = float(sigmoid_eps)
 
+        # ── Stored for GSONable serialization ────────────────────────────────────
+        # GSONable.as_dict requires every __init__ parameter to be present as
+        # self.<param> or self._<param>.
+        self._fixed_clamp_options = {
+            'r_clamp': r_clamp, 'n_clamp': n_clamp, 'sigmoid_eps': sigmoid_eps,
+        }
+        # Serialization seeds only — actual clamp positions are restored from the
+        # Optimizable dofs object by simsopt on load.
+        self._phis  = phis
+        self._names = names
+        # ─────────────────────────────────────────────────────────────────────────
+
         super().__init__(
             base_coils, nfp, stellsym,
             support=Support(fixed_clamp_fns=self._clamp_fn),
@@ -362,6 +374,12 @@ class CoilSupportTopBottom(CoilSupport):
         self._r_clamp = float(r_clamp)
         self._sig_eps  = float(sigmoid_eps)
 
+        # ── Stored for GSONable serialization ────────────────────────────────────
+        # GSONable.as_dict requires every __init__ parameter to be present as
+        # self.<param> or self._<param>.
+        self._fixed_clamp_options = {'r_clamp': r_clamp, 'sigmoid_eps': sigmoid_eps}
+        # ─────────────────────────────────────────────────────────────────────────
+
         super().__init__(
             base_coils, nfp, stellsym,
             support=Support(fixed_clamp_fns=self._clamp_fn),
@@ -383,9 +401,75 @@ _REQUIRED_BEAM_OPTIONS = (
     'n_beam_cf',
     'E',
     'nu',
-    'k_lin',
-    'k_tor',
+    'k_attachment',
 )
+
+
+# ============================================================================
+# CoilSupportBeams construction helpers (used only during __init__)
+# ============================================================================
+
+def _uniform_list(counts, cc_stellsym=False, cc_end=False):
+    """Build a per-group list of uniformly spaced initial phi values.
+
+    Used during :class:`CoilSupportBeams` construction to initialise
+    ``phis_start_cc``, ``phis_end_cc``, and ``phis_start_cf`` when the caller
+    does not supply explicit values.
+
+    When ``cc_stellsym=True``, the last two entries (the stellsym wrap group
+    and its reflection) use a restricted range ``[0, 0.5)`` to avoid beam
+    overlap after the stellarator reflection.
+    """
+    out = []
+    for i in range(len(counts)):
+        c = counts[i]
+        if c == 0:
+            out.append(jnp.array([]))
+            continue
+        if not cc_stellsym or i < len(counts) - 2:
+            a, b = 0.0, 1.0
+            half_interval = 0.5 / c
+        else:
+            a, b = 0.0, 0.5
+            half_interval = 0.5 / c / 2
+        phi_init = jnp.linspace(a, b, c, endpoint=False) + half_interval
+        if cc_end and i >= len(counts) - 2:
+            phi_init = 1 - phi_init
+        out.append(phi_init)
+    return out
+
+
+def _zeros_list(counts, trailing=()):
+    """Build a per-group list of zero arrays with optional trailing shape."""
+    return [jnp.zeros((counts[i],) + trailing) for i in range(len(counts))]
+
+
+def _check_ragged_shape(value, counts, name, trailing=()):
+    """Validate and cast a user-supplied ragged DOF to a per-group list.
+
+    Returns ``None`` when ``value`` is ``None`` (caller should substitute a
+    default).  Raises ``ValueError`` when length or per-entry shapes disagree
+    with ``counts``.
+    """
+    if value is None:
+        return None
+    seq = list(value)
+    if len(seq) != len(counts):
+        raise ValueError(
+            f"{name} must be a length-{len(counts)} sequence (one entry "
+            f"per CC group for cc keys — n_base + 1 when stellsym=True "
+            f"— or per base coil for cf keys); got length {len(seq)}."
+        )
+    out = []
+    for i, v in enumerate(seq):
+        arr = jnp.asarray(v, dtype=float)
+        expected = (counts[i],) + trailing
+        if arr.shape != expected:
+            raise ValueError(
+                f"{name}[{i}] must have shape {expected}; got {arr.shape}."
+            )
+        out.append(arr)
+    return out
 
 
 class CoilSupportBeams(CoilSupport):
@@ -429,10 +513,10 @@ class CoilSupportBeams(CoilSupport):
         attachment_type : callable
             ``clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights``;
             selects coil surface nodes for beam endpoint coupling.
-        k_lin : float
-            Translational spring stiffness [N/m²].
-        k_tor : float
-            Torsional spring stiffness [N·m/m²].
+        k_attachment : float
+            Distributed attachment (Winkler) modulus [N/m³].  Governs both
+            translational and rotational spring coupling.  Must equal
+            ``problem_options['winkler_k']``.
         sigmoid_eps : float
             Sigmoid function widths of attachment points. Default is 0.1.
         and additional options needed by attachment_fn.
@@ -480,7 +564,7 @@ class CoilSupportBeams(CoilSupport):
         nfp: int,
         stellsym: bool,
         # Beam info
-        beam_options={},
+        beam_options=None,
         phis_start_cc=None,
         phis_end_cc=None,
         phis_start_cf=None,
@@ -488,7 +572,7 @@ class CoilSupportBeams(CoilSupport):
         thetas_orientation_cc=None,
         thetas_orientation_cf=None,
         # Clamp info
-        fixed_clamp_options={'enabled': False},
+        fixed_clamp_options=None,
         phis=None,
         # Simsopt info
         fixed_dof_names=None,
@@ -496,12 +580,33 @@ class CoilSupportBeams(CoilSupport):
         dofs=None,
         **kwargs,
     ):
-        from ..geo import CurveXYZFourierJAX
+        # ── Stored for GSONable serialization (structural params) ─────────────────
+        # GSONable.as_dict requires every __init__ parameter to be present as
+        # self.<param> or self._<param>.
+        self.beam_options         = dict(beam_options or {})           # copy before setdefault mutates
+        self._fixed_clamp_options = dict(fixed_clamp_options or {'enabled': False})
+        self._fixed_dof_names     = fixed_dof_names
+        self._names               = names
+        # ─────────────────────────────────────────────────────────────────────────
 
-        # ── Convert simsopt Coil objects to JAX curve objects ─────────────────
-        base_curves_jax = [
-            CurveXYZFourierJAX.from_simsopt(c.curve) for c in base_coils
-        ]
+        # ── Stored for GSONable serialization (initial DOF seeds) ─────────────────
+        # These are the construction-time seeds for the Optimizable DOF vector.
+        # Their actual values are overwritten by the Optimizable dofs object
+        # (self._dofs) restored by simsopt on load — these attributes only serve
+        # to satisfy GSONable's introspection.
+        self._phis_start_cc         = phis_start_cc
+        self._phis_end_cc           = phis_end_cc
+        self._phis_start_cf         = phis_start_cf
+        self._x_foundation          = x_foundation
+        self._thetas_orientation_cc = thetas_orientation_cc
+        self._thetas_orientation_cf = thetas_orientation_cf
+        self._phis                  = phis
+        self.kwargs                 = kwargs   # GSONable adds **self.kwargs to the dict
+        # ─────────────────────────────────────────────────────────────────────────
+
+        beam_options         = self.beam_options
+        fixed_clamp_options  = self._fixed_clamp_options
+
         n_base = len(base_coils)
 
         # ── Cross-section presets ─────────────────────────────────────────────
@@ -510,16 +615,21 @@ class CoilSupportBeams(CoilSupport):
         # The default type of attachment is direct 
         # (selecting only exterior nodes inside the beam volume)
         attachment_type = beam_options.get('attachment_type', 'direct')
-        cross_section_fn = fetch_attr(cross_section_type, cross_section_fns)
-        cross_section_dof_keys = fetch_attr(cross_section_type + '_dof_keys', cross_section_fns)
-        cross_section_option_keys = fetch_attr(cross_section_type + '_option_keys', cross_section_fns)
+        cross_section_fn = getattr(cross_section_fns, cross_section_type)
+        cross_section_dof_keys = getattr(cross_section_fns, cross_section_type + '_dof_keys')
+        cross_section_option_keys = getattr(cross_section_fns, cross_section_type + '_option_keys')
 
         # ── Attachment function preset ─────────────────────────────────────────
         if attachment_type == 'direct':
-            attachment_fn = fetch_attr(cross_section_type + '_attachment', cross_section_fns)
+            attachment_fn = getattr(cross_section_fns, cross_section_type + '_attachment')
         elif attachment_type == 'wrap':
             attachment_fn = cross_section_fns.wrap_attachment
             cross_section_option_keys += cross_section_fns.wrap_option_keys
+        else:
+            raise ValueError(
+                f"attachment_type={attachment_type!r} not recognized; "
+                "must be 'direct' or 'wrap'."
+            )
 
         # ── Load the remaining beam options ───────────────────────────────────
         # Default sigmoid function weight
@@ -591,61 +701,6 @@ class CoilSupportBeams(CoilSupport):
         # ravel_pytree flattens it deterministically even with ragged sizes).
         # CC keys have len(n_beam_cc) == n_groups_cc entries; CF keys have
         # len(n_beam_cf) == n_base entries.
-        def _uniform_list(counts, cc_stellsym=False, cc_end=False):
-            out = []
-            for i in range(len(counts)):
-                c = counts[i]
-                if c==0:
-                    out.append(jnp.array([]))
-                    continue
-                # When stellsym=True, cc beams' initial positions must be generated 
-                # carefully.
-                if not cc_stellsym or i < len(counts)-2:
-                    # The first counts-2 elements are initialized normally.
-                    a, b = 0.0, 1.0
-                    half_interval = 0.5/c
-                else:
-                    # The last two elements must use ranges from:
-                    # - 0 to 0.5       (beam start)
-                    # - 1 - (phi init) (beam end)
-                    # otherwise, after reflections, the beams will overlap.
-                    # or intersect, which are intuitively not good initial 
-                    # conditions.
-                    a, b = 0.0, 0.5
-                    half_interval = 0.5/c/2
-                # The 0.5/c factor behind all terms also serves to 
-                # prevent overlaps after reflections 
-                phi_init = jnp.linspace(a, b, c, endpoint=False) + half_interval
-                if cc_end and i >= len(counts)-2:
-                    phi_init = 1 - phi_init
-                out.append(phi_init)
-            return out
-
-        def _zeros_list(counts, trailing=()):
-            return [jnp.zeros((counts[i],) + trailing) for i in range(len(counts))]
-
-        def _check_ragged_shape(value, counts, name, trailing=()):
-            """Validate and cast a user-supplied ragged DOF to a per-group list."""
-            if value is None:
-                return None
-            seq = list(value)
-            if len(seq) != len(counts):
-                raise ValueError(
-                    f"{name} must be a length-{len(counts)} sequence (one entry "
-                    f"per CC group for cc keys — n_base + 1 when stellsym=True "
-                    f"— or per base coil for cf keys); got length {len(seq)}."
-                )
-            out = []
-            for i, v in enumerate(seq):
-                arr = jnp.asarray(v, dtype=float)
-                expected = (counts[i],) + trailing
-                if arr.shape != expected:
-                    raise ValueError(
-                        f"{name}[{i}] must have shape {expected}; got {arr.shape}."
-                    )
-                out.append(arr)
-            return out
-
         _phis_end_cc   = _check_ragged_shape(phis_end_cc,           n_beam_cc, 'phis_end_cc')
         _phis_start_cc = _check_ragged_shape(phis_start_cc,         n_beam_cc, 'phis_start_cc')
         _phis_start_cf = _check_ragged_shape(phis_start_cf,         n_beam_cf, 'phis_start_cf')
@@ -774,10 +829,5 @@ class CoilSupportBeams(CoilSupport):
         )
 
     def _clamp_fn(self, surface_pts, curve_jax, dofs_slice):
-        """Winkler weight for one coil; dispatched by Support.compute_weights."""
-        if not dofs_slice:
-            return jnp.zeros(surface_pts.shape[0])
-        return _clamp_spheres_weights(
-            surface_pts, curve_jax, dofs_slice['phis'],
-            self._r_clamp, self._sig_eps,
-        )
+        """Winkler weight for one coil; identical body to CoilSupportFixed._clamp_fn."""
+        return CoilSupportFixed._clamp_fn(self, surface_pts, curve_jax, dofs_slice)

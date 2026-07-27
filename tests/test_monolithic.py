@@ -248,7 +248,7 @@ def test_monolithic_matches_staggered():
     beam_options = {
         'n_beam_cc': 1, 'n_beam_cf': 1,
         'E': 200e9, 'nu': 0.3,
-        'k_lin': winkler_k, 'k_tor': winkler_k,
+        'k_attachment': winkler_k,
     }
     support = SupportBeams(
         nfp=1, stellsym=False,
