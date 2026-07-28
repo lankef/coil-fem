@@ -1593,6 +1593,7 @@ class CoilFEM:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
 
         curves_jax = self.curves_from_dofs(base_curves_dofs)
+        winkler_k  = float(self.problem_options['winkler_k'])
 
         result = self.run(
             base_curves_dofs=base_curves_dofs,
@@ -1631,7 +1632,17 @@ class CoilFEM:
             pt_data: dict = {"displacement_m": disp}
 
             pts_i    = jnp.asarray(pts_np)
-            weight_full = _support_weights_full(self, i, pts_i, curves_jax, base_support_dofs)
+            surf_idx = onp.asarray(
+                self.pipelines[i].surface_node_indices, dtype=onp.int32
+            )
+            weights_surf = onp.asarray(
+                self._compute_support_weights(
+                    i, pts_i, curves_jax, base_support_dofs, at='nodes'
+                ),
+                dtype=onp.float64,
+            )
+            weight_full = onp.zeros(n_nodes, dtype=onp.float64)
+            weight_full[surf_idx] = weights_surf
             pt_data["support_weights"] = weight_full
             pt_data["spring_k_Npm3"]  = weight_full * winkler_k
 
