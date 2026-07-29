@@ -62,17 +62,16 @@ def _tiny_mesh(R: float = 1.0) -> CoilMesh:
     )
 
 
-def _make_pipeline(mesh: CoilMesh, solver: str, winkler_k: float = 1e9):
+def _make_pipeline(mesh: CoilMesh, solver: str):
     return ElasticPipeline(
         mesh,
         E=200e9, nu=0.3, itc=None,
         gravity_bf=(0.0, 0.0, 0.0),
-        winkler_k=winkler_k,
-        problem_options={'winkler_k': winkler_k, 'solver': solver},
+        problem_options={'solver': solver},
     )
 
 
-def _gpu_problem(mesh: CoilMesh, winkler_k: float = 1e9) -> LinearElasticity3D:
+def _gpu_problem(mesh: CoilMesh) -> LinearElasticity3D:
     """A ``gpu_assembly=True`` problem, built without the cuDSS forward solver.
 
     Constructs the FEM problem directly (bypassing ``build_fwd_pred``) so the
@@ -80,7 +79,7 @@ def _gpu_problem(mesh: CoilMesh, winkler_k: float = 1e9) -> LinearElasticity3D:
     """
     problem = LinearElasticity3D(
         mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-        additional_info=(200e9, 0.3, (0.0, 0.0, 0.0), winkler_k, None),
+        additional_info=(200e9, 0.3, (0.0, 0.0, 0.0), None),
         gpu_assembly=True,
     )
     mesh.attach_ref_coords(problem)
@@ -106,8 +105,7 @@ def test_gpu_assembly_coo_linearity():
     params = {
         'points':          jnp.asarray(mesh.points),
         'body_force':      jnp.zeros((mesh.n_cells, mesh.n_quads, 3)),
-        'support_weights': jnp.ones(n_sq),
-        'support_attach':  jnp.zeros((n_sq, 3)),
+        'support_k': jnp.ones(n_sq) * 1e9,
     }
 
     problem.set_params(params)
@@ -201,8 +199,7 @@ def test_assemble_coo_requires_gpu_assembly():
     params = {
         'points':          jnp.asarray(mesh.points),
         'body_force':      jnp.zeros((mesh.n_cells, mesh.n_quads, 3)),
-        'support_weights': jnp.ones(n_sq),
-        'support_attach':  jnp.zeros((n_sq, 3)),
+        'support_k': jnp.ones(n_sq) * 1e9,
     }
     with pytest.raises(NotImplementedError, match="gpu_assembly=True"):
         pipeline.assemble_coo(params)
@@ -235,20 +232,20 @@ def _uniform_clamp_fn(surface_pts_beam_frame, dofs, sign_x, constants):
 @pytest.mark.skipif(not (_HAS_SPINEAX and _HAS_GPU), reason=_GPU_REASON)
 def test_monolithic_matches_staggered():
     """solve_monolithic and solve_staggered agree on a small coupled system."""
-    winkler_k = 1e8
+    k_attachment = 1e8
     n_base = 2
     radii = [1.0, 1.1]
     curves = [_make_circle(N=8, R=R) for R in radii]
 
     pipelines = [
-        _make_pipeline(_tiny_mesh(R), solver='cudss', winkler_k=winkler_k)
+        _make_pipeline(_tiny_mesh(R), solver='cudss')
         for R in radii
     ]
 
     beam_options = {
         'n_beam_cc': 1, 'n_beam_cf': 1,
         'E': 200e9, 'nu': 0.3,
-        'k_attachment': winkler_k,
+        'k_attachment': k_attachment,
     }
     support = SupportBeams(
         nfp=1, stellsym=False,
@@ -275,11 +272,11 @@ def test_monolithic_matches_staggered():
 
     pts = [jnp.asarray(p.mesh.points) for p in pipelines]
     bf = [jnp.zeros((p.mesh.n_cells, p.mesh.n_quads, 3)) for p in pipelines]
-    wt = [jnp.ones(p.n_surface_quads) for p in pipelines]
+    wt = [jnp.ones(p.n_surface_quads) * k_attachment for p in pipelines]
     params = {
         'mesh_points_by_coil': pts,
         'body_force_by_coil':  bf,
-        'weights_by_coil':     wt,
+        'stiffness_by_coil':   wt,
         'curves_by_coil':      curves,
         'base_curves_dofs':    [c.dofs for c in curves],
         'support_dofs':        support_dofs,

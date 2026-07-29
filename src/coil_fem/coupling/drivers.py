@@ -80,7 +80,7 @@ class MonolithicStatic:
     merged_solve : Callable or None
         ``custom_vjp``-wrapped merged-solve closure (cuDSS only).  Signature::
 
-            merged_solve(bcd, sdofs, pts, bf, wt) -> sol_flat
+            merged_solve(bcd, sdofs, pts, bf, k) -> sol_flat
     """
     coil_dof_offsets: tuple
     support_dof_offset: int
@@ -119,8 +119,8 @@ def solve_uncoupled(
     """Independent per-coil FEM solves; no support DOFs.
 
     Each pipeline is solved separately using its own ``params`` slice.
-    The support is not involved beyond providing the Winkler spring weights
-    already baked into ``params['weights_by_coil']``.
+    The support is not involved beyond providing the Winkler spring
+    stiffness already baked into ``params['stiffness_by_coil']``.
 
     Parameters
     ----------
@@ -131,9 +131,9 @@ def solve_uncoupled(
     params : dict
         Required keys:
 
-        * ``'mesh_points_by_coil'`` : list[jax.Array]
-        * ``'body_force_by_coil'``  : list[jax.Array]
-        * ``'weights_by_coil'``     : list[jax.Array]
+        * ``'mesh_points_by_coil'``  : list[jax.Array]
+        * ``'body_force_by_coil'``   : list[jax.Array]
+        * ``'stiffness_by_coil'``    : list[jax.Array]
 
     Returns
     -------
@@ -143,11 +143,11 @@ def solve_uncoupled(
     """
     pts_by_coil    = params['mesh_points_by_coil']
     bf_by_coil     = params['body_force_by_coil']
-    wt_by_coil     = params['weights_by_coil']
+    k_by_coil      = params['stiffness_by_coil']
     fe_geom_by_coil = params.get('fe_geom_by_coil')
     sol_list_by_coil = [
         pipelines[i].solve(
-            pts_by_coil[i], bf_by_coil[i], wt_by_coil[i],
+            pts_by_coil[i], bf_by_coil[i], k_by_coil[i],
             fe_geom=fe_geom_by_coil[i] if fe_geom_by_coil is not None else None,
         )['sol_list']
         for i in range(len(pipelines))
@@ -196,8 +196,8 @@ def solve_staggered(
           Node positions per coil, shape ``(n_nodes_i, 3)``.
         * ``'body_force_by_coil'``   : list[jax.Array]
           Body force at every quadrature point per coil.
-        * ``'weights_by_coil'``      : list[jax.Array]
-          Per-surface-quad Winkler weights per coil, shape ``(n_sq_i,)``.
+        * ``'stiffness_by_coil'``    : list[jax.Array]
+          Per-surface-quad Winkler stiffness per coil [N/m³], shape ``(n_sq_i,)``.
         * ``'curves_by_coil'``       : list[CurveXYZFourierJAX]
           Traced coil centreline objects (rebuilt from DOFs by the caller).
         * ``'support_dofs'``         : dict
@@ -279,10 +279,10 @@ def make_merged_solve(
     Returns
     -------
     merged_solve : Callable
-        ``merged_solve(bcd, sdofs, pts, bf, wt) -> sol_flat``
+        ``merged_solve(bcd, sdofs, pts, bf, k) -> sol_flat``
         where ``bcd`` is a list of per-coil DOF arrays (traced),
         ``sdofs`` is the support DOF dict (traced), and ``pts``, ``bf``,
-        ``wt`` are per-coil mesh points, body forces, and Winkler weights
+        ``k`` are per-coil mesh points, body forces, and Winkler stiffness
         (all traced).
     """
     from ..solvers.cudss import assemble_csr_values
@@ -320,9 +320,6 @@ def make_merged_solve(
         for i in range(n_pipelines)
     ]
 
-    # Static n_surface_quads per coil for zero-attach placeholder.
-    n_sq_by_coil = tuple(pipelines[i].n_surface_quads for i in range(n_pipelines))
-
     def _make_curves(bcd):
         return [_CurveJAX(curve_qps[i], bcd[i], curve_orders[i])
                 for i in range(n_pipelines)]
@@ -335,18 +332,14 @@ def make_merged_solve(
         return [pipelines[i].problem.surface_jxw(pts[i])
                 for i in range(n_pipelines)]
 
-    def _coil_params(i, pts, bf, wt):
+    def _coil_params(i, pts, bf, k):
         return {
-            'points':          pts[i],
-            'body_force':      bf[i],
-            'support_weights': wt[i],
-            'support_attach':  jnp.zeros(
-                (n_sq_by_coil[i], 3),
-                dtype=pts[i].dtype,
-            ),
+            'points':      pts[i],
+            'body_force':  bf[i],
+            'support_k':   k[i],
         }
 
-    def _assemble_merged_values(bcd, sdofs, pts, bf, wt):
+    def _assemble_merged_values(bcd, sdofs, pts, bf, k):
         """Assemble merged COO value vector V, RHS f, and beam geometry.
 
         Returns the geometry dict in addition to ``(V, f)`` so that the
@@ -360,7 +353,7 @@ def make_merged_solve(
         geom = support.geometry(curves, sdofs)
         V_blocks, f_blocks = [], []
         for i, pipeline in enumerate(pipelines):
-            p_params = _coil_params(i, pts, bf, wt)
+            p_params = _coil_params(i, pts, bf, k)
             _, _, Vi, _, fi = pipeline.assemble_coo(p_params)
             V_blocks.append(Vi)
             f_blocks.append(fi)
@@ -385,8 +378,8 @@ def make_merged_solve(
         return V_merged, f_merged, geom
 
     @jax.custom_vjp
-    def merged_solve(bcd, sdofs, pts, bf, wt):
-        V_merged, f_merged, _ = _assemble_merged_values(bcd, sdofs, pts, bf, wt)
+    def merged_solve(bcd, sdofs, pts, bf, k):
+        V_merged, f_merged, _ = _assemble_merged_values(bcd, sdofs, pts, bf, k)
         csr_values = assemble_csr_values(V_merged, coo_to_csr, nnz_csr)
         # inertia = (n_pos, n_neg, n_zero); verified positive-definite when
         # n_neg == n_zero == 0.  Threading through custom_vjp return would
@@ -394,23 +387,23 @@ def make_merged_solve(
         sol_flat, inertia = solver_K(f_merged, csr_values)
         return sol_flat
 
-    def _fwd(bcd, sdofs, pts, bf, wt):
+    def _fwd(bcd, sdofs, pts, bf, k):
         # Call _assemble_merged_values directly (rather than through merged_solve)
         # to capture V_merged and fwd_geom for the backward pass.  Stashing
         # V_merged avoids a full Jacobian assembly in _bwd (review item 4g).
-        V_merged, f_merged, fwd_geom = _assemble_merged_values(bcd, sdofs, pts, bf, wt)
+        V_merged, f_merged, fwd_geom = _assemble_merged_values(bcd, sdofs, pts, bf, k)
         csr_values = assemble_csr_values(V_merged, coo_to_csr, nnz_csr)
         sol_flat, _inertia = solver_K(f_merged, csr_values)
-        return sol_flat, (bcd, sdofs, pts, bf, wt, sol_flat, fwd_geom, V_merged)
+        return sol_flat, (bcd, sdofs, pts, bf, k, sol_flat, fwd_geom, V_merged)
 
     def _bwd(res, g_flat):
-        bcd, sdofs, pts, bf, wt, sol_flat, fwd_geom, V_merged = res
+        bcd, sdofs, pts, bf, k, sol_flat, fwd_geom, V_merged = res
         # Reuse V_merged from the forward pass — same system matrix, no need to
         # reassemble.  The transpose solve K^T λ = g uses the same K values.
         csr_values_T = assemble_csr_values(V_merged, coo_to_csr_T, nnz_csr_T)
         lambda_flat, inertia_T = solver_KT(g_flat, csr_values_T)
 
-        def _merged_constraint(bcd_in, sdofs_in, pts_in, bf_in, wt_in):
+        def _merged_constraint(bcd_in, sdofs_in, pts_in, bf_in, k_in):
             s_quad_pts = _surf_quad_pts(pts_in)
             jxw_list_in = _surf_jxw(pts_in)
             curves = _make_curves(bcd_in)
@@ -421,7 +414,7 @@ def make_merged_solve(
             geom_kw = {'geom': geom_in} if geom_in is not None else {}
             residuals = []
             for i, pipeline in enumerate(pipelines):
-                p_par = _coil_params(i, pts_in, bf_in, wt_in)
+                p_par = _coil_params(i, pts_in, bf_in, k_in)
                 u_c_i = sol_flat[
                     coil_dof_offsets[i]:coil_dof_offsets[i] + n_dofs_per_coil[i]
                 ].reshape(pipeline.problem.fes[0].num_total_nodes, 3)
@@ -454,7 +447,7 @@ def make_merged_solve(
                 )
             return r_full
 
-        _, vjp_fn = jax.vjp(_merged_constraint, bcd, sdofs, pts, bf, wt)
+        _, vjp_fn = jax.vjp(_merged_constraint, bcd, sdofs, pts, bf, k)
         grads = vjp_fn(-lambda_flat)
         return grads
 
@@ -529,7 +522,7 @@ def solve_monolithic(
 
     mesh_points_by_coil = params['mesh_points_by_coil']
     body_force_by_coil  = params['body_force_by_coil']
-    weights_by_coil     = params['weights_by_coil']
+    stiffness_by_coil   = params['stiffness_by_coil']
     curves_by_coil      = params['curves_by_coil']
     support_dofs        = params['support_dofs']
 
@@ -538,7 +531,7 @@ def solve_monolithic(
         support_dofs,
         mesh_points_by_coil,
         body_force_by_coil,
-        weights_by_coil,
+        stiffness_by_coil,
     )
 
     sol_list_by_coil = []

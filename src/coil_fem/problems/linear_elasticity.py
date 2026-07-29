@@ -4,9 +4,9 @@ Provides :class:`LinearElasticity3D`, a JAX-FEM ``Problem`` subclass that
 supports fully-differentiable solves via ``ad_wrapper`` with respect to mesh
 node positions (``params['points']``), volumetric body forces
 (``params['body_force']``), and per-node Winkler spring weights
-(``params['support_weights']``).  Companion helpers :func:`lame_parameters`,
-:func:`itc_strain`, :func:`dirichlet_bc`, and :func:`recompute_fe_geometry`
-cover common setup tasks.
+(``params['support_k']``).  Companion helpers :func:`lame_parameters`,
+:func:`itc_strain`, and :func:`recompute_fe_geometry` cover common setup
+tasks.
 """
 
 from __future__ import annotations
@@ -169,14 +169,17 @@ class LinearElasticity3D(DeviceProblem):
 
     Implements small-strain Hooke's law ``σ = λ tr(ε) I + 2μ ε``.
     ``set_params`` recomputes all FE geometry arrays from ``params['points']``
-    using pure JAX, exposing gradients through mesh node positions.  Optional
-    Winkler spring-foundation BCs are activated by passing ``winkler_k_scalar``
-    in ``additional_info``; per-node weights are then supplied at run-time as
-    ``params['support_weights']``.
+    using pure JAX, exposing gradients through mesh node positions.  Every
+    exterior mesh face is automatically detected and equipped with a Winkler
+    spring-foundation BC whose per-quad stiffness is supplied at run-time as
+    ``params['support_k']`` (already in N/m³, owned by
+    :class:`~coil_fem.coupling.Support`).  Dirichlet BCs
+    (``dirichlet_bc_info``) may still be applied on top of the Winkler
+    surface.
 
     Parameters
     ----------
-    ``additional_info`` is a tuple ``(E, nu, body_force[, winkler_k_scalar[, itc]])``:
+    ``additional_info`` is a tuple ``(E, nu, body_force[, itc])``:
 
     E : float
         Young's modulus [Pa].
@@ -185,38 +188,23 @@ class LinearElasticity3D(DeviceProblem):
     body_force : tuple[float, float, float] or callable
         Body force [N/m³] for forward-only solves.  For the differentiable
         path supply ``params['body_force']`` instead.
-    winkler_k_scalar : float, optional
-        Base Winkler spring stiffness [N/m³].  Exterior faces are detected
-        automatically; no ``location_fns`` needed.
     itc : float, optional
         Integral thermal contraction ``ΔL/L`` (positive, dimensionless).
         Pre-computes eigenstrain ``ε_th = −itc · I`` at construction.
 
     Examples
     --------
-    Forward-only solve (no Winkler BC)::
-
-        from jax_fem.solver import solver
-
-        rule = lambda pts: pts[:, 2] < pts[:, 2].min() + 1e-5
-        problem = LinearElasticity3D(
-            mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-            dirichlet_bc_info=dirichlet_bc(mesh, rule),
-            additional_info=(200e9, 0.3, (0, 0, -7800 * 9.81)),
-        )
-        sol = solver(problem, solver_options={"umfpack_solver": {}})
-
     Differentiable solve with Winkler BC::
 
         problem = LinearElasticity3D(
             mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-            additional_info=(200e9, 0.3, (0., 0., 0.), 1e9),
+            additional_info=(200e9, 0.3, (0., 0., 0.)),
         )
         fwd_pred = ad_wrapper(problem)
         params = {
-            'points':          jnp.array(mesh.points),
-            'body_force':      lorentz_at_quads,
-            'support_weights': weights,
+            'points':      jnp.array(mesh.points),
+            'body_force':  lorentz_at_quads,
+            'support_k':   support.stiffness(w_g, w_a),
         }
         sol = fwd_pred(params)
     """
@@ -237,7 +225,6 @@ class LinearElasticity3D(DeviceProblem):
         E: float,
         nu: float,
         body_force,
-        winkler_k_scalar: float | None = None,
         itc: float | None = None,
     ):
         """JAX-FEM hook called by ``Problem.__init__`` after mesh setup.
@@ -258,12 +245,6 @@ class LinearElasticity3D(DeviceProblem):
             ``f(x) -> jnp.array(3)`` gives a position-dependent force.  Used
             only for forward-only solves; for the differentiable path supply
             ``params['body_force']`` to :meth:`set_params`.
-        winkler_k_scalar : float, optional
-            Base Winkler spring stiffness [N/m³].  When set, exterior surface
-            faces are detected topologically and all six boundary structures
-            are built here — no ``location_fns`` needed.  Per-node weights in
-            ``[0, 1]`` are given at run-time via ``params['support_weights']``
-            in :meth:`set_params`.
         itc : float, optional
             Integral thermal contraction ``ΔL/L`` on cooldown (positive,
             dimensionless).  Pre-computes the constant eigenstrain
@@ -272,7 +253,6 @@ class LinearElasticity3D(DeviceProblem):
         self.E = float(E)
         self.nu = float(nu)
         self.lam, self.mu = lame_parameters(E, nu)
-        self._winkler_k_scalar = float(winkler_k_scalar) if winkler_k_scalar is not None else None
 
         # Thermal eigenstrain — pre-computed once since the integral thermal
         # contraction is a fixed scalar (not an optimizable DOF).  Uniform
@@ -290,102 +270,91 @@ class LinearElasticity3D(DeviceProblem):
         self._sv     = jnp.asarray(fe.shape_vals)          # (num_quads, num_nodes)
         self._qw     = jnp.asarray(fe.quad_weights)        # (num_quads,)
 
-        if self._winkler_k_scalar is not None:
-            if len(self.boundary_inds_list) != 0:
-                raise ValueError(
-                    "LinearElasticity3D: winkler_k_scalar is set but "
-                    "boundary_inds_list is non-empty (location_fns was also "
-                    "passed). Use either location_fns or winkler_k_scalar, "
-                    "not both."
-                )
-
-            from jax_fem.basis import get_face_shape_vals_and_grads as _gfsv
-            _ele_type = self.ele_type[0] if isinstance(self.ele_type, list) else self.ele_type
-            _, _, _, _, face_corner_inds = _gfsv(_ele_type)
-            cells_np = onp.asarray(fe.cells, dtype=onp.int64)
-            n_ftypes = face_corner_inds.shape[0]
-
-            # Detect exterior faces: sorted corner-node tuple appears exactly once.
-            all_fc = cells_np[:, face_corner_inds].reshape(-1, face_corner_inds.shape[1])
-            all_fc_sorted = onp.sort(all_fc, axis=1)
-            _, inv, counts_fc = onp.unique(
-                all_fc_sorted, axis=0, return_inverse=True, return_counts=True
+        # This class always auto-detects its own exterior Winkler surface, so
+        # location_fns (which would also populate boundary_inds_list) is not
+        # supported.
+        if len(self.boundary_inds_list) != 0:
+            raise ValueError(
+                "LinearElasticity3D: location_fns is not supported; the "
+                "exterior Winkler surface is always auto-detected."
             )
-            is_ext = (counts_fc == 1)[inv]  # (n_cells * n_ftypes,)
-            ext_flat = onp.where(is_ext)[0]
-            correct_bi = onp.stack(
-                [ext_flat // n_ftypes, ext_flat % n_ftypes], axis=1
-            ).astype(onp.int32)
 
-            # For TET10: upgrade face quadrature to gauss_order=4 BEFORE building
-            # the surface arrays, so everything is built once at the right order.
-            # gauss_order=2 gives only 3 face quad points for TRI6 faces, which
-            # under-integrates degree-4 products of quadratic shape functions and
-            # yields a rank-deficient surface stiffness.
-            if _ele_type == 'TET10':
-                face_sv, face_sg, face_qw, face_normals, _ = \
-                    _gfsv('TET10', gauss_order=4)
-                fe.face_shape_vals    = face_sv
-                fe.face_shape_grads_ref = face_sg
-                fe.face_quad_weights  = face_qw
-                fe.num_face_quads     = face_qw.shape[1]
+        from jax_fem.basis import get_face_shape_vals_and_grads as _gfsv
+        _ele_type = self.ele_type[0] if isinstance(self.ele_type, list) else self.ele_type
+        _, _, _, _, face_corner_inds = _gfsv(_ele_type)
+        cells_np = onp.asarray(fe.cells, dtype=onp.int64)
+        n_ftypes = face_corner_inds.shape[0]
 
-            # Build all six boundary structures, mirroring Problem.__init__:132-157.
-            s_shape_grads, n_scale, s_shape_vals = [], [], []
-            for fe_i in self.fes:
-                fsg_phys, ns = fe_i.get_face_shape_grads(correct_bi)
-                s_shape_grads.append(fsg_phys)
-                n_scale.append(ns)
-                s_shape_vals.append(fe_i.face_shape_vals[correct_bi[:, 1]])
-            self.boundary_inds_list         = [correct_bi]
-            self.cells_list_face_list       = [
-                [cells[correct_bi[:, 0]] for cells in self.cells_list]
-            ]
-            self.selected_face_shape_grads  = [onp.concatenate(s_shape_grads, axis=2)]
-            self.nanson_scale               = [onp.transpose(onp.stack(n_scale), (1, 0, 2))]
-            self.selected_face_shape_vals   = [onp.concatenate(s_shape_vals, axis=2)]
-            self.physical_surface_quad_points = [
-                self.fes[0].get_physical_surface_quad_points(correct_bi)
-            ]
-            self.internal_vars_surfaces     = [()]
+        # Detect exterior faces: sorted corner-node tuple appears exactly once.
+        all_fc = cells_np[:, face_corner_inds].reshape(-1, face_corner_inds.shape[1])
+        all_fc_sorted = onp.sort(all_fc, axis=1)
+        _, inv, counts_fc = onp.unique(
+            all_fc_sorted, axis=0, return_inverse=True, return_counts=True
+        )
+        is_ext = (counts_fc == 1)[inv]  # (n_cells * n_ftypes,)
+        ext_flat = onp.where(is_ext)[0]
+        correct_bi = onp.stack(
+            [ext_flat // n_ftypes, ext_flat % n_ftypes], axis=1
+        ).astype(onp.int32)
 
-            # Append face DOF contributions to the bulk-only I/J arrays.
-            _d = sum(_fe.num_nodes * _fe.vec for _fe in self.fes)
-            _c_face = [_cells[correct_bi[:, 0]] for _cells in self.cells_list]
-            _inds_parts = []
-            for _k, (_fe2, _cf) in enumerate(zip(self.fes, _c_face)):
-                _crt = (
-                    _fe2.vec * _cf[:, :, None]
-                    + onp.arange(_fe2.vec)[None, None, :]
-                    + self.offset[_k]
-                )
-                _inds_parts.append(_crt.reshape(len(correct_bi), -1))
-            _inds_f = onp.concatenate(_inds_parts, axis=1)
-            _I_f = onp.repeat(_inds_f[:, :, None], _d, axis=2).reshape(-1)
-            _J_f = onp.repeat(_inds_f[:, None, :], _d, axis=1).reshape(-1)
-            self.I = onp.hstack((self.I, _I_f))
-            self.J = onp.hstack((self.J, _J_f))
+        # For TET10: upgrade face quadrature to gauss_order=4 BEFORE building
+        # the surface arrays, so everything is built once at the right order.
+        # gauss_order=2 gives only 3 face quad points for TRI6 faces, which
+        # under-integrates degree-4 products of quadratic shape functions and
+        # yields a rank-deficient surface stiffness.
+        if _ele_type == 'TET10':
+            face_sv, face_sg, face_qw, face_normals, _ = \
+                _gfsv('TET10', gauss_order=4)
+            fe.face_shape_vals    = face_sv
+            fe.face_shape_grads_ref = face_sg
+            fe.face_quad_weights  = face_qw
+            fe.num_face_quads     = face_qw.shape[1]
+
+        # Build all six boundary structures, mirroring Problem.__init__:132-157.
+        s_shape_grads, n_scale, s_shape_vals = [], [], []
+        for fe_i in self.fes:
+            fsg_phys, ns = fe_i.get_face_shape_grads(correct_bi)
+            s_shape_grads.append(fsg_phys)
+            n_scale.append(ns)
+            s_shape_vals.append(fe_i.face_shape_vals[correct_bi[:, 1]])
+        self.boundary_inds_list         = [correct_bi]
+        self.cells_list_face_list       = [
+            [cells[correct_bi[:, 0]] for cells in self.cells_list]
+        ]
+        self.selected_face_shape_grads  = [onp.concatenate(s_shape_grads, axis=2)]
+        self.nanson_scale               = [onp.transpose(onp.stack(n_scale), (1, 0, 2))]
+        self.selected_face_shape_vals   = [onp.concatenate(s_shape_vals, axis=2)]
+        self.physical_surface_quad_points = [
+            self.fes[0].get_physical_surface_quad_points(correct_bi)
+        ]
+        self.internal_vars_surfaces     = [()]
+
+        # Append face DOF contributions to the bulk-only I/J arrays.
+        _d = sum(_fe.num_nodes * _fe.vec for _fe in self.fes)
+        _c_face = [_cells[correct_bi[:, 0]] for _cells in self.cells_list]
+        _inds_parts = []
+        for _k, (_fe2, _cf) in enumerate(zip(self.fes, _c_face)):
+            _crt = (
+                _fe2.vec * _cf[:, :, None]
+                + onp.arange(_fe2.vec)[None, None, :]
+                + self.offset[_k]
+            )
+            _inds_parts.append(_crt.reshape(len(correct_bi), -1))
+        _inds_f = onp.concatenate(_inds_parts, axis=1)
+        _I_f = onp.repeat(_inds_f[:, :, None], _d, axis=2).reshape(-1)
+        _J_f = onp.repeat(_inds_f[:, None, :], _d, axis=1).reshape(-1)
+        self.I = onp.hstack((self.I, _I_f))
+        self.J = onp.hstack((self.J, _J_f))
 
         # Face reference data — cached for use in set_params on every forward pass.
-        # Only needed when a Winkler surface was registered above.
-        if self._winkler_k_scalar is not None:
-            self._face_sg_ref  = jnp.asarray(fe.face_shape_grads_ref)
-            self._face_sv      = jnp.asarray(fe.face_shape_vals)
-            self._face_qw      = jnp.asarray(fe.face_quad_weights)
-            self._face_normals = jnp.asarray(fe.face_normals)
-        else:
-            self._face_sg_ref  = None
-            self._face_sv      = None
-            self._face_qw      = None
-            self._face_normals = None
+        self._face_sg_ref  = jnp.asarray(fe.face_shape_grads_ref)
+        self._face_sv      = jnp.asarray(fe.face_shape_vals)
+        self._face_qw      = jnp.asarray(fe.face_quad_weights)
+        self._face_normals = jnp.asarray(fe.face_normals)
 
         # Pre-compute static mappings for differentiable Winkler BC.
         # These are built once here and reused in set_params every forward pass.
-        if self._winkler_k_scalar is not None:
-            self._build_winkler_surface_maps()
-        else:
-            self._surf_face_to_surf_node = None
-            self._sel_face_sv = None
+        self._build_winkler_surface_maps()
 
         # Build body-force callable for forward-only evaluation.
         if callable(body_force):
@@ -493,26 +462,24 @@ class LinearElasticity3D(DeviceProblem):
         # (num_sel, n_fq, n_face_nodes)
 
     @property
-    def surface_node_global_indices(self) -> jnp.ndarray | None:
-        """Global node indices of all Winkler surface nodes, or ``None``.
+    def surface_node_global_indices(self) -> jnp.ndarray:
+        """Global node indices of all Winkler surface nodes.
 
         Shape ``(n_surface_nodes,)``.  These are the indices into the full
         ``(n_nodes, 3)`` mesh-node array used by :meth:`interp_surface_nodal_to_quads`
         and by the monolithic coupling pattern.  Not related to the shape of
-        ``params['support_weights']``, which is per-surface-quad.
+        ``params['support_k']``, which is per-surface-quad.
         """
-        return self._surf_unique_global_nodes if self._surf_face_to_surf_node is not None else None
+        return self._surf_unique_global_nodes
 
     @property
-    def n_surface_quads(self) -> int | None:
-        """Total number of surface quadrature points, or ``None`` if no Winkler BC.
+    def n_surface_quads(self) -> int:
+        """Total number of surface quadrature points.
 
         Equal to ``num_selected_faces × num_face_quads``.  This is the leading
-        dimension of ``params['support_weights']`` and ``params['support_attach']``
-        accepted by :meth:`set_params`.
+        dimension of ``params['support_k']`` accepted by
+        :meth:`set_params`.
         """
-        if self._sel_face_sv is None:
-            return None
         s = self._sel_face_sv.shape
         return int(s[0] * s[1])
 
@@ -531,7 +498,7 @@ class LinearElasticity3D(DeviceProblem):
         jnp.ndarray, shape ``(n_surface_quads, 3)``
             Flat array of physical quad-point coordinates, ordered face-major
             then quad-minor (consistent with the layout of
-            ``params['support_weights']``).
+            ``params['support_k']``).
         """
         bi = self.boundary_inds_list[0]
         physical_coos = points[self._cells_jnp]           # (n_cells, n_nodes, 3)
@@ -558,18 +525,7 @@ class LinearElasticity3D(DeviceProblem):
         -------
         jnp.ndarray, shape ``(num_sel, n_fq)``
             JxW values, one per selected face per face quadrature point.
-
-        Raises
-        ------
-        ValueError
-            If no Winkler surface is configured (``winkler_k_scalar`` was not
-            set at construction).
         """
-        if self._winkler_k_scalar is None or self._sel_face_sv is None:
-            raise ValueError(
-                "surface_jxw requires a Winkler surface (winkler_k_scalar must "
-                "be set at construction)."
-            )
         bi = self.boundary_inds_list[0]
         physical_coos = points[self._cells_jnp]            # (n_cells, n_nodes, 3)
         selected_coos = physical_coos[bi[:, 0]]             # (num_sel, n_nodes, 3)
@@ -679,27 +635,17 @@ class LinearElasticity3D(DeviceProblem):
         return mass_map
 
     def get_surface_maps(self):
-        """Winkler spring with optional attachment shift: ``t = u − u_attach``.
+        """Grounded Winkler spring traction: ``t = u``.
 
-        When ``winkler_k_scalar`` is set, :meth:`set_params` absorbs the
-        per-quad stiffness into ``nanson_scale`` so that the surface integral
-        ``∫ k(x) (u − u_attach) · v dS`` is computed correctly.  The surface
-        map returns ``u − u_attach`` where ``u_attach`` is the attachment
-        displacement stored in ``self.internal_vars_surfaces[0]``
-        by :meth:`set_params`.  ``u_attach`` is supplied directly at quad
-        points via ``params['support_attach']``; when absent it defaults to
-        zero and the traction reduces to the grounded identity ``u``.
-
-        If no Winkler BC is configured (``winkler_k_scalar=None``), returns an
-        empty list.
+        :meth:`set_params` absorbs the per-quad stiffness (already the sum of
+        the grounded-clamp and beam-attachment contributions, owned by
+        :class:`~coil_fem.coupling.Support`) into ``nanson_scale`` so that the
+        surface integral ``∫ k(x) u · v dS`` is computed correctly.
         """
-        if self._winkler_k_scalar is None:
-            return []
+        def spring(u, x):
+            return u
 
-        def shifted_spring(u, x, u_attach):
-            return u - u_attach
-
-        return [shifted_spring]
+        return [spring]
 
     def set_params(self, params):
         """Update geometry, body force, and Winkler BC from differentiable params.
@@ -714,22 +660,12 @@ class LinearElasticity3D(DeviceProblem):
                 Mesh node positions — the differentiable quantity.
             ``'body_force'`` : jnp.ndarray (num_cells, num_quads, 3)
                 Body force at every quadrature point.
-            ``'support_weights'`` : jnp.ndarray (n_surface_quads,), optional
-                Per-surface-quad Winkler weights in ``[0, 1]``.  Required when
-                ``winkler_k_scalar`` was set at construction.  The stiffness at
-                each surface quad point is ``winkler_k_scalar * w[q]``, applied
-                directly without any interpolation.  Obtain this array via
-                :meth:`surface_quad_points` → ``support.compute_weights``.
-                Gradients flow through this array via the adjoint.
-            ``'support_attach'`` : jnp.ndarray (n_surface_quads, 3), optional
-                Per-surface-quad attachment displacement ``u_attach``.  When
-                present, the Winkler surface traction becomes
-                ``k(x) (u − u_attach)`` instead of ``k(x) u``, implementing a
-                shifted spring that couples the coil displacement to the
-                displacement of an attached support structure.  Obtain this
-                array via ``support.compute_attach`` called at surface quad
-                points.  Gradients flow through this array via the adjoint.
-                Defaults to zeros when absent (grounded-spring behaviour).
+            ``'support_k'`` : jnp.ndarray (n_surface_quads,)
+                Per-surface-quad Winkler stiffness [N/m³], applied directly
+                without any interpolation.  Obtain this array via
+                :meth:`surface_quad_points` → ``support.compute_weights`` →
+                ``support.stiffness``.  Gradients flow through this array via
+                the adjoint.
         """
         points = params['points']
 
@@ -750,69 +686,48 @@ class LinearElasticity3D(DeviceProblem):
 
         # Recompute surface geometry and fold Winkler stiffness into nanson_scale.
         # (Surface geometry is inlined here; recompute_fe_surface_geometry was
-        # its only caller and has been removed.)
-        for i, bi in enumerate(self.boundary_inds_list):
-            physical_coos = points[self._cells_jnp]           # (num_cells, num_nodes, dim)
-            selected_coos = physical_coos[bi[:, 0]]            # (num_sel, num_nodes, dim)
-            sel_grads_ref = self._face_sg_ref[bi[:, 1]]        # (num_sel, num_fq, num_nodes, dim)
-            sel_normals   = self._face_normals[bi[:, 1]]       # (num_sel, dim)
+        # its only caller and has been removed.)  boundary_inds_list always
+        # holds exactly the one auto-detected exterior surface.
+        bi = self.boundary_inds_list[0]
+        physical_coos = points[self._cells_jnp]           # (num_cells, num_nodes, dim)
+        selected_coos = physical_coos[bi[:, 0]]            # (num_sel, num_nodes, dim)
+        sel_grads_ref = self._face_sg_ref[bi[:, 1]]        # (num_sel, num_fq, num_nodes, dim)
+        sel_normals   = self._face_normals[bi[:, 1]]       # (num_sel, dim)
 
-            jacobian = jnp.sum(
-                selected_coos[:, None, :, :, None] * sel_grads_ref[:, :, :, None, :],
-                axis=2,
-            )  # (num_sel, num_fq, dim, dim)
-            det_J = jnp.linalg.det(jacobian)                  # (num_sel, num_fq)
-            inv_J = jnp.linalg.inv(jacobian)                  # (num_sel, num_fq, dim, dim)
+        jacobian = jnp.sum(
+            selected_coos[:, None, :, :, None] * sel_grads_ref[:, :, :, None, :],
+            axis=2,
+        )  # (num_sel, num_fq, dim, dim)
+        det_J = jnp.linalg.det(jacobian)                  # (num_sel, num_fq)
+        inv_J = jnp.linalg.inv(jacobian)                  # (num_sel, num_fq, dim, dim)
 
-            fsg = (
-                sel_grads_ref[:, :, :, None, :] @ inv_J[:, :, None, :, :]
-            )[:, :, :, 0, :]  # (num_sel, num_fq, num_nodes, dim)
+        fsg = (
+            sel_grads_ref[:, :, :, None, :] @ inv_J[:, :, None, :, :]
+        )[:, :, :, 0, :]  # (num_sel, num_fq, num_nodes, dim)
 
-            ns_geom = jnp.linalg.norm(
-                (sel_normals[:, None, None, :] @ inv_J)[:, :, 0, :], axis=-1
-            )  # (num_sel, num_fq)
-            sel_weights = self._face_qw[bi[:, 1]]
-            ns_geom = ns_geom * det_J * sel_weights
+        ns_geom = jnp.linalg.norm(
+            (sel_normals[:, None, None, :] @ inv_J)[:, :, 0, :], axis=-1
+        )  # (num_sel, num_fq)
+        sel_weights = self._face_qw[bi[:, 1]]
+        ns_geom = ns_geom * det_J * sel_weights
 
-            sel_sv  = self._face_sv[bi[:, 1]]                  # (num_sel, num_fq, num_nodes)
-            spqp = jnp.sum(
-                sel_sv[:, :, :, None] * selected_coos[:, None, :, :], axis=2
-            )  # (num_sel, num_fq, dim)
+        sel_sv  = self._face_sv[bi[:, 1]]                  # (num_sel, num_fq, num_nodes)
+        spqp = jnp.sum(
+            sel_sv[:, :, :, None] * selected_coos[:, None, :, :], axis=2
+        )  # (num_sel, num_fq, dim)
 
-            self.selected_face_shape_grads[i]    = fsg
-            self.physical_surface_quad_points[i] = spqp
+        self.selected_face_shape_grads[0]    = fsg
+        self.physical_surface_quad_points[0] = spqp
 
-            if (i == 0
-                    and self._winkler_k_scalar is not None
-                    and self._sel_face_sv is not None):
-                # ── Winkler stiffness ──────────────────────────────────────────
-                # params['support_weights'] is (n_surface_quads,) — already at
-                # quad points, no interpolation needed.  Reshape to (num_sel,
-                # num_fq) and absorb into nanson_scale so that the shifted
-                # surface map (t = u - u_attach) yields
-                # ∫ k(x) (u − u_attach) · v dS correctly.
-                num_sel = self._sel_face_sv.shape[0]
-                num_fq  = self._sel_face_sv.shape[1]
-                if 'support_weights' in params:
-                    w = params['support_weights']              # (n_sq,) traced
-                    k_at_quad = self._winkler_k_scalar * w.reshape(num_sel, num_fq)
-                    self.nanson_scale[i] = (k_at_quad * ns_geom)[:, None, :]
-                else:
-                    self.nanson_scale[i] = ns_geom[:, None, :]
-
-                # ── Attachment displacement for shifted Winkler spring ─────────
-                # params['support_attach'] is (n_surface_quads, 3) — already at
-                # quad points.  Reshape to (num_sel, num_fq, 3) and store as the
-                # first surface internal var so that shifted_spring returns u − u_attach.
-                if 'support_attach' in params:
-                    ua_at_quad = params['support_attach'].reshape(num_sel, num_fq, 3)
-                else:
-                    ua_at_quad = jnp.zeros(
-                        (num_sel, num_fq, 3), dtype=params['points'].dtype
-                    )
-                self.internal_vars_surfaces[0] = (ua_at_quad,)
-            else:
-                self.nanson_scale[i] = ns_geom[:, None, :]
+        # ── Winkler stiffness ──────────────────────────────────────────
+        # params['support_k'] is (n_surface_quads,) — already at quad points
+        # in N/m³, no interpolation or scalar multiply needed.  Reshape to
+        # (num_sel, num_fq) and absorb into nanson_scale so that the surface
+        # integral ∫ k(x) u · v dS is computed correctly.
+        num_sel = self._sel_face_sv.shape[0]
+        num_fq  = self._sel_face_sv.shape[1]
+        k_at_quad = params['support_k'].reshape(num_sel, num_fq)
+        self.nanson_scale[0] = (k_at_quad * ns_geom)[:, None, :]
 
         # Build per-quad constitutive arrays.  Fall back to uniform scalar
         # values (broadcast) when not supplied in params — this keeps the

@@ -29,6 +29,7 @@ import numpy as onp
 
 from .supports import Support
 from ..geo.curve_jax import CurveXYZFourierJAX
+from ..utils import cubic_hermite_interp
 
 
 # ============================================================================
@@ -162,7 +163,7 @@ class SupportBeams(Support):
         nu : float
             Poisson ratio.
         k_attachment : float
-            Unified translational + torsional spring stiffness [N/m²]
+            Unified translational + torsional spring stiffness [N/m³]
             (applied as ``k_attachment * w`` per surface node, for both the
             force and torque laws — see the *Stiffness matrix symmetry*
             note below).
@@ -176,17 +177,23 @@ class SupportBeams(Support):
         this callable.
     attachment_fn : callable
         ``attachment_fn(surface_pts_beam_frame, dofs, sign_x, beam_options) -> weights``
-        where ``surface_pts_beam_frame`` is ``(n_surface_nodes, 3)`` — surface
-        points expressed in the beam's local frame with origin at the endpoint
-        (computed as ``(pts − x_endpoint) @ Gamma_3``), ``dofs`` is the merged
-        support-dofs dict, ``sign_x`` is ``True`` at the node-1 end (beam
-        extends toward ``+x_local``) and ``False`` at node-2, and ``beam_options``
-        is the options dict.  ``weights`` is ``(n_surface_nodes,)`` in
-        ``[0, 1]``.
+        where ``surface_pts_beam_frame`` is ``(N, 3)`` — query points in the
+        beam's local frame with origin at the endpoint (computed as
+        ``(pts − x_endpoint) @ Gamma_3``).  During solves ``pts`` are surface
+        **quadrature** points; during visualisation they may be surface node
+        positions.  ``dofs`` is the merged support-dofs dict, ``sign_x`` is
+        ``True`` at the node-1 end (beam extends toward ``+x_local``) and
+        ``False`` at node-2, and ``beam_options`` is the options dict.
+        ``weights`` is ``(N,)`` in ``[0, 1]``.
     fixed_clamp_fns : callable or list[callable] or None
         Optional Winkler weight functions forwarded to :class:`Support`.
-        When set, :meth:`compute_weights` behaves identically to
-        :class:`Support` regardless of the beam network.
+        When set, the grounded-clamp half of :meth:`compute_weights`
+        behaves identically to :class:`Support` regardless of the beam
+        network.
+    fixed_clamp_options : dict or None
+        Must contain ``'k_clamp'`` (the grounded Winkler modulus [N/m³])
+        whenever ``fixed_clamp_fns`` is given; forwarded to
+        :class:`Support` as ``k_clamp``.
 
     Notes
     -----
@@ -251,8 +258,15 @@ class SupportBeams(Support):
         attachment_fn: Callable,
         cross_section_dof_keys: tuple = (),
         fixed_clamp_fns=None,
+        fixed_clamp_options=None,
     ):
-        super().__init__(fixed_clamp_fns=fixed_clamp_fns)
+        if fixed_clamp_fns is not None and 'k_clamp' not in (fixed_clamp_options or {}):
+            raise ValueError(
+                "fixed_clamp_options must contain 'k_clamp' when "
+                "fixed_clamp_fns is given."
+            )
+        k_clamp = float((fixed_clamp_options or {}).get('k_clamp', 0.0))
+        super().__init__(k_clamp=k_clamp, fixed_clamp_fns=fixed_clamp_fns)
 
         self._n_base = int(n_base)
         self._beam_options = beam_options
@@ -333,7 +347,6 @@ class SupportBeams(Support):
         self.geometry        = jax.jit(self.geometry)
         self.solve           = jax.jit(self.solve)
         self.compute_weights = jax.jit(self.compute_weights, static_argnums=(0,))
-        self.compute_attach  = jax.jit(self.compute_attach,  static_argnums=(0,))
 
     # ============================================================================
     # Static topology helpers (called once at construction)
@@ -472,7 +485,7 @@ class SupportBeams(Support):
 
     @property
     def k_attachment(self) -> float:
-        """Unified translational + torsional spring stiffness [N/m²]."""
+        """Unified translational + torsional spring stiffness [N/m³]."""
         return self._k_attachment
 
     @property
@@ -519,10 +532,10 @@ class SupportBeams(Support):
 
         Notes
         -----
-        TODO(driver-integration): This is a placeholder that returns zeros.
-        A proper Hermite-shape-function interpolation along beam elements
-        should be added when the staggered/monolithic driver is implemented.
-        See ``docs/developers/support_structure.rst`` for guidance.
+        Placeholder retained for a future staggered driver (returns zeros).
+        Monolithic coupling does not call this method.  A Hermite
+        shape-function interpolation along beam elements should replace this
+        when staggered mode is restored.
         """
         return jnp.zeros((points.shape[0], 3), dtype=points.dtype)
 
@@ -1007,9 +1020,9 @@ class SupportBeams(Support):
 
         Combines :meth:`_beam_geometry` (endpoint positions, lengths,
         tangents) and :meth:`_direction_cosine_matrices` (DCMs) so that
-        callers can pass the result to :meth:`compute_weights`,
-        :meth:`compute_attach`, :meth:`coo`, and :meth:`coupling_values` as
-        the ``geom`` keyword argument, avoiding redundant re-computation.
+        callers can pass the result to :meth:`compute_weights`, :meth:`coo`,
+        and :meth:`coupling_values` as the ``geom`` keyword argument,
+        avoiding redundant re-computation.
 
         Parameters
         ----------
@@ -1041,14 +1054,16 @@ class SupportBeams(Support):
         curves_jax: list,
         dofs,
         geom: dict | None = None,
-    ) -> jax.Array:
-        """Winkler weights for coil ``coil_idx``.
+    ) -> tuple[jax.Array, jax.Array]:
+        """Grounded-clamp and beam-attachment weights for coil ``coil_idx``.
 
         When ``dofs`` is ``None`` (e.g. during weight visualisation before a
         solve), delegates entirely to :class:`Support` (uniform ones when
-        no ``fixed_clamp_fns`` were provided).  Otherwise sums the beam spring
-        weights from all endpoints attached to ``coil_idx`` using the exact
-        beam-frame geometry, then optionally adds the :class:`Support` term.
+        no ``fixed_clamp_fns`` were provided, zero beam-attachment weight).
+        Otherwise sums the beam spring weights from all endpoints attached to
+        ``coil_idx`` using the exact beam-frame geometry for ``w_a``, and
+        optionally computes the :class:`Support` grounded-clamp weight for
+        ``w_g``.
 
         Parameters
         ----------
@@ -1063,7 +1078,9 @@ class SupportBeams(Support):
 
         Returns
         -------
-        jax.Array, shape ``(n_surf,)``
+        w_g, w_a : jax.Array, shape ``(n_surf,)`` each
+            Grounded-clamp weight (multiplies :attr:`~Support.k_clamp`) and
+            beam-attachment weight (multiplies :attr:`k_attachment`).
         """
         if dofs is None:
             return Support.compute_weights(
@@ -1075,10 +1092,10 @@ class SupportBeams(Support):
         gamma3 = geom['gamma3'] if 'gamma3' in geom else self._direction_cosine_matrices(geom, dofs)
         _, specs_by_coil = self._endpoint_specs(geom, gamma3)
 
-        w_total = jnp.zeros(surface_pts.shape[0])
+        w_a = jnp.zeros(surface_pts.shape[0])
         for spec in specs_by_coil.get(coil_idx, []):
             w_k, _ = self._clamp_weights_for_spec(spec, surface_pts, dofs)
-            w_total = w_total + w_k
+            w_a = w_a + w_k
 
         if self._fixed_clamp_fns is not None:
             # Beam dofs have ragged list structure (per-group, not per-coil);
@@ -1087,10 +1104,12 @@ class SupportBeams(Support):
             clamp_dofs = (
                 {'phis': dofs['phis']} if (dofs is not None and 'phis' in dofs) else None
             )
-            w_total = w_total + Support.compute_weights(
+            w_g, _ = Support.compute_weights(
                 self, coil_idx, surface_pts, curves_jax, clamp_dofs
             )
-        return w_total
+        else:
+            w_g = jnp.zeros(surface_pts.shape[0])
+        return w_g, w_a
 
     def beam_segments(self, curves_jax: list, dofs: dict) -> onp.ndarray:
         """Start/end positions of every base-coil beam.
@@ -1115,84 +1134,111 @@ class SupportBeams(Support):
         x_e = onp.asarray(geom['x_end'],   dtype=onp.float64)
         return onp.stack([x_s, x_e], axis=1)
 
-    def compute_attach(
-        self,
-        coil_idx: int,
-        surface_pts: jax.Array,
-        curves_jax: list,
-        dofs,
-        state: dict,
-        geom: dict | None = None,
-    ) -> jax.Array:
-        """Weighted-average beam endpoint displacement at coil surface nodes.
+    def beam_labels(self) -> tuple:
+        """Per-beam static metadata for plotting and VTU export.
 
-        For each beam endpoint spec attached to coil ``coil_idx``, computes
-        the beam displacement at each surface node ``k`` as
-
-        .. math::
-
-            u_{\\text{beam},k}^b = u_{\\text{endpoint}}^b
-                + \\theta_{\\text{endpoint}}^b \\times r_k^b
-
-        where :math:`r_k^b` is the moment arm in the endpoint's frame
-        (surface points shifted by the symmetry transform and projected
-        relative to the endpoint).  The result is mapped back to the coil
-        frame using the inverse symmetry transform.
-
-        Parameters
-        ----------
-        coil_idx : int
-        surface_pts : jax.Array, shape ``(n_surf, 3)``
-        curves_jax : list[CurveXYZFourierJAX]
-        dofs : dict
-        state : dict
-            Must contain ``'u_s'`` : jax.Array, shape ``(n_support_dofs,)``.
-        geom : dict or None
-            Pre-computed geometry dict from :meth:`geometry`.  Computed
-            internally when ``None``.
+        Same beam ordering as :meth:`beam_segments` / :attr:`beam_options`
+        (coil-major, cc-then-cf, stellsym wrap group last).
 
         Returns
         -------
-        jax.Array, shape ``(n_surf, 3)``
+        coil_idx_arr : np.ndarray, shape ``(N_beams,)``, int32
+            Base-coil index each beam originates from (wrap-group beams are
+            labelled ``0``, matching coil 0's ``phi = 0`` image).
+        beam_type : np.ndarray, shape ``(N_beams,)``, int32
+            ``0`` for coil-coil (CC) beams, ``1`` for coil-foundation (CF).
         """
-        u_s    = state['u_s']                            # (12 * N_beams,)
-        u_beams = u_s.reshape(self.n_beams_total, 12)   # (N_beams, 12)
-        n_surf  = surface_pts.shape[0]
+        n_base = self.n_base
+        coil_idx_arr = onp.concatenate([
+            onp.full(self.n_beam_cc[i] + self.n_beam_cf[i], i, dtype=onp.int32)
+            for i in range(n_base)
+        ]) if n_base else onp.zeros(0, dtype=onp.int32)
+        beam_type = onp.concatenate([
+            onp.concatenate([
+                onp.zeros(self.n_beam_cc[i], dtype=onp.int32),
+                onp.ones(self.n_beam_cf[i], dtype=onp.int32),
+            ])
+            for i in range(n_base)
+        ]) if n_base else onp.zeros(0, dtype=onp.int32)
+        if self.stellsym:
+            n_wrap = self.n_beam_cc[n_base]
+            coil_idx_arr = onp.concatenate(
+                [coil_idx_arr, onp.zeros(n_wrap, dtype=onp.int32)])
+            beam_type = onp.concatenate(
+                [beam_type, onp.zeros(n_wrap, dtype=onp.int32)])
+        return coil_idx_arr, beam_type
 
-        if geom is None:
-            geom = self._beam_geometry(curves_jax, dofs)
-        gamma3 = geom['gamma3'] if 'gamma3' in geom else self._direction_cosine_matrices(geom, dofs)
-        _, specs_by_coil = self._endpoint_specs(geom, gamma3)
+    def endpoint_state(self, u_s: jax.Array) -> jax.Array:
+        """Reshape the flat solve vector into per-beam, per-node state.
 
-        w_total      = jnp.zeros(n_surf)
-        u_attach_num = jnp.zeros((n_surf, 3))
+        Parameters
+        ----------
+        u_s : jax.Array, shape ``(n_support_dofs,)``
+            Output of :meth:`solve` (``state['u_s']`` / ``CoilFEM.run()``'s
+            ``'u_s'`` key).
 
-        for spec in specs_by_coil.get(coil_idx, []):
-            b          = spec.b
-            node_side  = spec.node_side
-            t_off      = 6 * node_side
+        Returns
+        -------
+        jax.Array, shape ``(n_beams_total, 2, 6)``
+            Global-frame ``[translation(3), rotation(3)]`` at node 1 (index
+            0) and node 2 (index 1) of every beam.
+        """
+        return u_s.reshape(self.n_beams_total, 2, 6)
 
-            w_k, r_k   = self._clamp_weights_for_spec(spec, surface_pts, dofs)
-            u_ep       = u_beams[b, t_off     : t_off + 3]
-            theta_ep   = u_beams[b, t_off + 3 : t_off + 6]
+    def beam_displacement(self, geom: dict, u_s: jax.Array, xi: jax.Array) -> jax.Array:
+        """Closed-form global-frame centreline displacement along every beam.
 
-            # Rigid-body displacement in the endpoint frame
-            u_beam_k = u_ep[None, :] + jax.vmap(
-                lambda r: jnp.cross(theta_ep, r))(r_k)
+        Evaluates the element's own displacement field — linear for the
+        axial and torsional (twist) components, cubic Hermite for the two
+        bending planes — at normalized position(s) ``xi`` (``0`` at node 1,
+        ``1`` at node 2). This is the exact nodal solution's interior
+        deflection, not an independent interpolation choice: it uses the
+        same shape functions :meth:`_local_stiffness` was assembled from
+        (see ``docs/theory/bisymbeam.rst``).
 
-            # Map back to coil frame
-            u_beam_k = self._apply_end_transform(u_beam_k, spec.tfm, inverse=True)
+        Parameters
+        ----------
+        geom : dict
+            Output of :meth:`geometry` (needs ``'gamma3'`` and ``'L'``).
+        u_s : jax.Array, shape ``(n_support_dofs,)``
+            Output of :meth:`solve`.
+        xi : jax.Array or float
+            Normalized position(s) in ``[0, 1]``, any shape.
 
-            w_total      = w_total + w_k
-            u_attach_num = u_attach_num + w_k[:, None] * u_beam_k
+        Returns
+        -------
+        jax.Array, shape ``(n_beams_total, *xi.shape, 3)``
+            Global-frame displacement of the beam centreline at ``xi``.
+        """
+        xi = jnp.asarray(xi)
+        gamma3 = geom['gamma3']                                  # (N, 3, 3)
+        L      = geom['L']                                       # (N,)
 
-        w_safe   = jnp.where(w_total > 1e-300, w_total, jnp.ones_like(w_total))
-        u_attach = jnp.where(
-            (w_total > 1e-300)[:, None],
-            u_attach_num / w_safe[:, None],
-            jnp.zeros((n_surf, 3), dtype=surface_pts.dtype),
-        )
-        return u_attach
+        u_global = u_s.reshape(self.n_beams_total, 4, 3)          # (N,4,3): [t1,r1,t2,r2]
+        # Global -> local (row-vector convention used throughout this file,
+        # e.g. `pts_beam = r_k @ spec.gamma3`).
+        u_local = jnp.einsum('nkj,nji->nki', u_global, gamma3)    # (N,4,3)
+        t1, r1, t2, r2 = (u_local[:, k, :] for k in range(4))     # each (N,3)
+
+        # Broadcast xi (any shape) against per-beam quantities (N,): trailing
+        # dims of the per-beam column are padded with 1s so it broadcasts
+        # against xi[None, ...], giving a common (N, *xi.shape) result.
+        def _col(a):
+            return a.reshape(a.shape[0], *([1] * xi.ndim))
+
+        xi_b = xi[None, ...]                                      # (1, *xi.shape)
+        L_b  = _col(L)                                             # (N, *1s)
+
+        u_ax = (1 - xi_b) * _col(t1[:, 0]) + xi_b * _col(t2[:, 0])
+        v = cubic_hermite_interp(xi_b, L_b, _col(t1[:, 1]), _col(r1[:, 2]),
+                                  _col(t2[:, 1]), _col(r2[:, 2]))
+        w = cubic_hermite_interp(xi_b, L_b, _col(t1[:, 2]), -_col(r1[:, 1]),
+                                  _col(t2[:, 2]), -_col(r2[:, 1]))
+
+        d_local = jnp.stack([u_ax, v, w], axis=-1)                # (N, *xi.shape, 3)
+        # Local -> global.
+        d_global = jnp.einsum('n...j,nij->n...i', d_local, gamma3)
+        return d_global
 
     def coupling_pattern(
         self,

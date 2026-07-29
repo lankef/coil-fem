@@ -51,8 +51,7 @@ def _make_tiny_pipeline(R: float = 1.0) -> ElasticPipeline:
         mesh,
         E=200e9, nu=0.3, itc=None,
         gravity_bf=(0.0, 0.0, 0.0),
-        winkler_k=1e9,
-        problem_options={'winkler_k': 1e9, 'solver': 'umfpack'},
+        problem_options={'solver': 'umfpack'},
     )
 
 
@@ -71,8 +70,9 @@ def _make_coilfem(
         nfp=1,
         stellsym=False,
         mesh_options=mesh_opts,
-        support=support if support is not None else Support(),
-        problem_options={'winkler_k': 1e9, 'solver': 'umfpack'},
+        support=support if support is not None else Support(k_clamp=1e9),
+        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        problem_options={'solver': 'umfpack'},
         coupling=coupling,
     )
 
@@ -84,44 +84,33 @@ def _make_coilfem(
 class _TrivialCoupledSupport(Support):
     """Mock coupled support: always returns u_s = 0, no coil coupling."""
 
-    is_coupled = True
     n_support_dofs = 1
-    k_attachment = 1e9
     # Static K_ss pattern (1×1 diagonal), required by build_monolithic_static.
     _coo_I = np.zeros(1, dtype=np.int32)
     _coo_J = np.zeros(1, dtype=np.int32)
+
+    def __init__(self, k_clamp: float = 1e9):
+        super().__init__(k_clamp=k_clamp)
+        self._k_attachment = k_clamp
 
     @property
     def is_coupled(self):
         return True
 
+    @property
+    def k_attachment(self):
+        return self._k_attachment
+
     def solve(self, inputs: dict) -> dict:
         return {'u_s': jnp.zeros(self.n_support_dofs)}
 
     def displacement_at(self, state: dict, points: jax.Array) -> jax.Array:
+        """Staggered-mode placeholder (unused while solve_staggered is retired)."""
         return jnp.zeros_like(points)
 
     def compute_weights(self, coil_idx, surface_pts, curves_jax, dofs):
-        return jnp.ones(surface_pts.shape[0])
-
-    def compute_attach(self, coil_idx, surface_pts, curves_jax, dofs, state):
-        return jnp.zeros((surface_pts.shape[0], 3), dtype=surface_pts.dtype)
-
-    def coupling_terms(
-        self,
-        curves_jax,
-        support_dofs,
-        surface_pts_by_coil,
-        coil_dof_offsets,
-        support_dof_offset,
-        surface_node_indices_by_coil,
-    ) -> dict:
-        empty = jnp.zeros(0, dtype=jnp.float64)
-        empty_i = jnp.zeros(0, dtype=jnp.int32)
-        return {
-            'I_cs': empty_i, 'J_cs': empty_i, 'V_cs': empty,
-            'I_sc': empty_i, 'J_sc': empty_i, 'V_sc': empty,
-        }
+        n = surface_pts.shape[0]
+        return jnp.ones(n), jnp.zeros(n)
 
     def coo(self, curves_jax, support_dofs, surface_pts_by_coil):
         n = self.n_support_dofs
@@ -149,8 +138,8 @@ def test_monolithic_raises_on_cpu():
         'body_force_by_coil':  [
             jnp.zeros((pipeline.problem.num_cells, n_quads, 3))
         ],
-        'weights_by_coil':     [
-            jnp.ones(pipeline.n_surface_quads)
+        'stiffness_by_coil':   [
+            jnp.ones(pipeline.n_surface_quads) * 1e9
         ],
         'curves_by_coil':      [_make_circle(N=4)],
         'base_curves_dofs':    [_make_circle(N=4).dofs],
@@ -186,7 +175,9 @@ def test_coilfem_invalid_coupling_raises():
             stellsym=False,
             mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                           'n_grid_1': 1, 'n_grid_2': 1},
-            problem_options={'winkler_k': 1e9, 'solver': 'umfpack'},
+            support=Support(k_clamp=1e9),
+            material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+            problem_options={'solver': 'umfpack'},
             coupling='invalid_option',
         )
 
@@ -267,7 +258,7 @@ def test_coilfem_dispatch_calls_monolithic(monkeypatch):
 
 def test_uncoupled_solve_all_backward_compatible():
     """_solve_all with Support produces the same displacement as old path."""
-    fem  = _make_coilfem(coupling='staggered', support=Support())
+    fem  = _make_coilfem(coupling='staggered', support=Support(k_clamp=1e9))
     dofs = [c.dofs for c in fem.base_curves_jax]
     curr = jnp.array([1.0])
 
@@ -294,26 +285,3 @@ def test_staggered_raises_not_implemented():
     """solve_staggered raises NotImplementedError (retired; use 'monolithic')."""
     with pytest.raises(NotImplementedError, match="solve_staggered"):
         solve_staggered([], None, {})
-
-
-# ============================================================================
-# 6. winkler_k / k_attachment mismatch guard
-# ============================================================================
-
-def test_winkler_k_mismatch_raises():
-    """CoilFEM should raise ValueError when winkler_k != support.k_attachment."""
-    support = _TrivialCoupledSupport()  # k_attachment = 1e9
-
-    curve = _make_circle(N=4)
-    with pytest.raises(ValueError, match="winkler_k"):
-        CoilFEM(
-            base_curves_jax=[curve],
-            base_currents_jax=jnp.array([1.0]),
-            nfp=1,
-            stellsym=False,
-            mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
-                          'n_grid_1': 1, 'n_grid_2': 1},
-            support=support,
-            problem_options={'winkler_k': 5e8, 'solver': 'umfpack'},  # mismatch
-            coupling='staggered',
-        )

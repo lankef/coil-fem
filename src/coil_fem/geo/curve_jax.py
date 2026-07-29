@@ -84,6 +84,12 @@ class CurveXYZFourierJAX:
     # Public interface
     # ============================================================================
 
+    def get_dofs(self):
+        """For compatibility with functions that consume simsopt Curves.
+
+        """
+        return self.dofs
+
     def gamma_eval(self, phi, diff_order: int = 0):
         """Evaluate the curve or its derivative at arbitrary parameter values.
 
