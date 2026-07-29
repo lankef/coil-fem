@@ -24,9 +24,9 @@ class Support:
     spatial distribution of the Winkler spring stiffness is controlled by
     the optional ``fixed_clamp_fns`` argument.
 
-    This is the default support used when no coupling to an external
-    structural model is needed.  It corresponds to the Winkler / Robin BC
-    built into :class:`~coil_fem.problems.LinearElasticity3D`.
+    Pass an instance as ``CoilFEM(support=...)`` when no coupling to an
+    external structural model is needed.  It corresponds to the Winkler /
+    Robin BC built into :class:`~coil_fem.problems.LinearElasticity3D`.
 
     Subclasses
     ----------
@@ -36,6 +36,9 @@ class Support:
 
     Parameters
     ----------
+    k_clamp : float
+        Grounded Winkler spring stiffness [N/m³], applied at every surface
+        quad point weighted by ``fixed_clamp_fns``.
     fixed_clamp_fns : callable or list[callable] or None
         Function(s) returning per-point weights in ``[0, 1]``::
 
@@ -57,10 +60,12 @@ class Support:
 
     def __init__(
         self,
+        k_clamp: float,
         fixed_clamp_fns: Callable | list[Callable] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self._k_clamp = float(k_clamp)
         if callable(fixed_clamp_fns):
             self._fixed_clamp_fns: Callable | list[Callable] | None = fixed_clamp_fns
         elif isinstance(fixed_clamp_fns, (list, tuple)):
@@ -75,32 +80,29 @@ class Support:
 
     @property
     def matrix_symmetry(self) -> str:
-        """``'symmetric'`` — unconditional after ``k_attachment`` unification.
+        """``'symmetric'`` — unconditional by construction.
 
-        All support-block contributions (translational springs, moment-arm
-        cross-terms) are symmetric by construction when a single
-        ``k_attachment`` modulus is used.  :class:`SupportBeams` inherits
-        this without an override.
+        Every spring field (grounded clamp, beam attachment) uses the same
+        modulus on the coil side (:meth:`stiffness`) and the support side
+        (:meth:`coupling_values` / :meth:`coo`), so all support-block
+        contributions (translational springs, moment-arm cross-terms) are
+        symmetric.  :class:`SupportBeams` inherits this without an override.
         """
         return 'symmetric'
 
     @property
+    def k_clamp(self) -> float:
+        """Grounded Winkler spring modulus [N/m³]."""
+        return self._k_clamp
+
+    @property
     def k_attachment(self) -> float:
-        """Distributed attachment (Winkler) modulus [N/m³].
+        """Distributed beam-attachment (Winkler) modulus [N/m³].
 
-        Must be implemented by coupled :class:`Support` subclasses and must
-        equal ``problem_options['winkler_k']`` so the coil-side and beam-side
-        spring sums use the same modulus.
-
-        Raises
-        ------
-        NotImplementedError
-            When the subclass has not declared its attachment modulus.
+        ``0.0`` for the base (beam-less) support; coupled subclasses such as
+        :class:`~coil_fem.coupling.SupportBeams` override this.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} must implement the `k_attachment` property "
-            "and set it equal to problem_options['winkler_k']."
-        )
+        return 0.0
 
     def solve(self, inputs: dict) -> dict:
         """No-op; returns empty state dict."""
@@ -112,9 +114,8 @@ class Support:
         Subclasses that benefit from single-pass geometry computation (e.g.
         :class:`~coil_fem.coupling.SupportBeams`) override this method to
         return a ``dict`` of traced arrays that can be threaded through
-        :meth:`compute_weights`, :meth:`compute_attach`, :meth:`coo`, and
-        :meth:`coupling_values` via their ``geom`` keyword argument, avoiding
-        redundant recomputation.
+        :meth:`compute_weights`, :meth:`coo`, and :meth:`coupling_values` via
+        their ``geom`` keyword argument, avoiding redundant recomputation.
 
         Parameters
         ----------
@@ -135,8 +136,8 @@ class Support:
         surface_pts: jax.Array,
         curves_jax: list,
         dofs,
-    ) -> jax.Array:
-        """Per-surface-node Winkler weights for coil ``coil_idx``.
+    ) -> tuple[jax.Array, jax.Array]:
+        """Per-surface-node grounded-clamp and beam-attachment weights.
 
         Parameters
         ----------
@@ -159,11 +160,14 @@ class Support:
 
         Returns
         -------
-        jax.Array, shape ``(N,)``
-            Winkler weight in ``[0, 1]`` for each query point.
+        w_g, w_a : jax.Array, shape ``(N,)`` each
+            Grounded-clamp weight (in ``[0, 1]``, multiplies :attr:`k_clamp`)
+            and beam-attachment weight (multiplies :attr:`k_attachment`,
+            always zero here since the base support has no beams).
         """
+        w_a = jnp.zeros(surface_pts.shape[0])
         if self._fixed_clamp_fns is None:
-            return jnp.ones(surface_pts.shape[0])
+            return jnp.ones(surface_pts.shape[0]), w_a
         if isinstance(self._fixed_clamp_fns, list):
             fn = self._fixed_clamp_fns[coil_idx]
         else:
@@ -173,7 +177,11 @@ class Support:
             jax.tree_util.tree_map(lambda x: x[coil_idx], dofs)
             if dofs is not None else None
         )
-        return fn(surface_pts, curve_i, dofs_slice)
+        return fn(surface_pts, curve_i, dofs_slice), w_a
+
+    def stiffness(self, w_g: jax.Array, w_a: jax.Array) -> jax.Array:
+        """Per-point Winkler stiffness [N/m³]: ``k_clamp w_g + k_attachment w_a``."""
+        return self._k_clamp * w_g + self.k_attachment * w_a
 
     def coo(self):
         """Return the support stiffness matrix in COO (coordinate) format. For
@@ -231,48 +239,6 @@ class Support:
             f"{type(self).__name__}.coo() is not implemented. "
             "Only supports that participate in monolithic assembly need this."
         )
-
-    def compute_attach(
-        self,
-        coil_idx: int,
-        surface_pts: jax.Array,
-        curves_jax: list,
-        dofs,
-        state: dict,
-    ) -> jax.Array:
-        """Per-query-point target displacement for the shifted Winkler spring.
-
-        In the staggered coupling scheme, the coil-side Winkler spring is shifted
-        so that the spring force at each surface quad point ``q`` is
-
-        .. math::
-
-            f_q = k_{\\text{lin}} \\cdot w_q \\cdot (u_{\\text{attach},q} - u_q)
-
-        where :math:`u_{\\text{attach},q}` is the attachment displacement returned
-        here.  For an uncoupled (grounded) support this is always zero, which
-        recovers the standard Winkler spring.
-
-        Parameters
-        ----------
-        coil_idx : int
-            Index of the base coil (0-based).
-        surface_pts : jax.Array, shape ``(N, 3)``
-            Query points; during solves these are surface quadrature points.
-        curves_jax : list[CurveXYZFourierJAX]
-            Differentiable centreline curves for all base coils.
-        dofs : dict or None
-            Full merged support-dofs dict for the coil set.
-        state : dict
-            Current support state, including ``'u_s'`` (the support
-            displacement vector) when the support is coupled.
-
-        Returns
-        -------
-        jax.Array, shape ``(N, 3)``
-            Attachment displacement at each query point.  Default: zeros.
-        """
-        return jnp.zeros((surface_pts.shape[0], 3), dtype=surface_pts.dtype)
 
     def coupling_pattern(
         self,

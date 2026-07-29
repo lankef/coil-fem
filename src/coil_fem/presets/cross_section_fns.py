@@ -76,7 +76,7 @@ def _map_groups(fn, *ragged_args):
     results = jax.tree_util.tree_map(fn, *ragged_args)
     return tuple(list(x) for x in zip(*results))
 
-wrap_option_keys = ('r_attachment', 'sigmoid_eps',)
+wrap_option_keys = ('r_attachment', 'eps_sigmoid',)
 def wrap_attachment(surface_pts_beam_frame, dofs, sign_x, beam_options):
     """An attachment function that selects nodes within r_clamp from the centerline.
 
@@ -90,14 +90,14 @@ def wrap_attachment(surface_pts_beam_frame, dofs, sign_x, beam_options):
     return clamp_sigmoid(
         d_sq=d_sq,
         r=beam_options['r_attachment'], 
-        sigmoid_eps=beam_options['sigmoid_eps'],
+        eps_sigmoid=beam_options['eps_sigmoid'],
     )
 # ============================================================================
 # Solid circle
 # ============================================================================
 
 solid_circle_dof_keys = ('r_beam',)
-solid_circle_option_keys = ('sigmoid_eps',)
+solid_circle_option_keys = ('eps_sigmoid',)
 
 def solid_circle(support_dofs: dict):
     """Cross-section function for a solid circular section.
@@ -148,7 +148,7 @@ def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, beam_options):
     return in_correct_direction * clamp_sigmoid(
         d_sq=d_sq,
         r=dofs['r_beam'], 
-        sigmoid_eps=beam_options['sigmoid_eps'],
+        eps_sigmoid=beam_options['eps_sigmoid'],
     )
     
 
@@ -158,7 +158,7 @@ def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, beam_options):
 
 
 solid_rectangle_dof_keys = ('w1_beam', 'w2_beam',)
-solid_rectangle_option_keys = ('sigmoid_eps',)
+solid_rectangle_option_keys = ('eps_sigmoid',)
 
 def _rectangle_helper(w1, w2):
     """Elementwise ``(A, Iy, Iz, J)`` formula for a single group's arrays."""
@@ -253,7 +253,7 @@ def solid_square(support_dofs : dict):
 # ============================================================================
 
 hollow_circle_dof_keys = ('r_1_beam', 'r_2_beam',)
-hollow_circle_option_keys = ('sigmoid_eps',)
+hollow_circle_option_keys = ('eps_sigmoid',)
     
 def hollow_circle(support_dofs: dict) -> Callable:
     """Cross-section function for a hollow circular section.

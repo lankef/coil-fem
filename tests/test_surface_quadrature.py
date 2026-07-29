@@ -17,7 +17,6 @@ import math
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 jax.config.update("jax_enable_x64", True)
 
@@ -60,8 +59,7 @@ def _make_pipeline(
         mesh,
         E=200e9, nu=0.3, itc=None,
         gravity_bf=(0.0, 0.0, 0.0),
-        winkler_k=1e9,
-        problem_options={'winkler_k': 1e9, 'solver': 'umfpack'},
+        problem_options={'solver': 'umfpack'},
     )
 
 
@@ -129,37 +127,20 @@ def test_surface_jxw_autodiff():
 
 
 # ============================================================================
-# 4. surface_jxw — raises when no Winkler surface
-# ============================================================================
-
-def test_surface_jxw_raises_without_winkler():
-    """surface_jxw raises ValueError when no Winkler surface is configured."""
-    pipeline = _make_pipeline()
-    pts = jnp.asarray(pipeline.mesh.points)
-    # Temporarily disable the Winkler surface by patching the scalar to None.
-    orig = pipeline.problem._winkler_k_scalar
-    try:
-        pipeline.problem._winkler_k_scalar = None
-        with pytest.raises(ValueError, match="winkler"):
-            pipeline.problem.surface_jxw(pts)
-    finally:
-        pipeline.problem._winkler_k_scalar = orig
-
-
-# ============================================================================
-# 5. Transpose symmetry: K_cs = K_sc^T when Q = I
+# 4. Transpose symmetry: K_cs = K_sc^T when Q = I
 # ============================================================================
 
 def test_coupling_transpose_symmetry():
-    """coupling_values gives K_cs = K_sc^T unconditionally when Q = I.
+    """coupling_values gives K_cs = K_sc^T with split Winkler moduli.
 
     Tests a single CC beam connecting coil 0 to coil 1 with no stellsym
-    transforms (all Q = I).  With a single k_attachment modulus the coupling
-    blocks satisfy the transpose condition at every surface node by construction.
+    transforms (all Q = I).  With ``k_clamp != k_attachment`` the coupling
+    blocks still satisfy the transpose condition at every surface node.
     """
     n_base, nfp = 2, 1
 
-    k = 1e8  # k_attachment
+    k_attachment = 1e8
+    k_clamp = 5e7
 
     def _const_section_fn(support_dofs):
         phi_cc = support_dofs['phis_start_cc']
@@ -174,14 +155,19 @@ def test_coupling_transpose_symmetry():
             J.append(jnp.full((n_per,), 2e-8))
         return A, Iy, Iz, J
 
+    def _ground_clamp_fn(surface_pts, curve_jax, dofs):
+        return jnp.ones(surface_pts.shape[0])
+
     sb = SupportBeams(
         nfp=nfp, stellsym=False,
         beam_options={'n_beam_cc': 1, 'n_beam_cf': 0,
                       'E': 200e9, 'nu': 0.3,
-                      'k_attachment': k},
+                      'k_attachment': k_attachment},
         n_base=n_base,
         cross_section_fn=_const_section_fn,
         attachment_fn=lambda pts, dofs, sign_x, opts: jnp.ones(pts.shape[0]),
+        fixed_clamp_fns=_ground_clamp_fn,
+        fixed_clamp_options={'k_clamp': k_clamp},
     )
 
     curves = [_make_circle(N=8, R=1.0 + 0.1 * i) for i in range(n_base)]
@@ -243,7 +229,7 @@ def test_coupling_transpose_symmetry():
     K_sc = np.zeros((n_s, n_c))
     np.add.at(K_sc, (I_sc - support_dof_offset, J_sc), V_sc)
 
-    # With k_attachment and Q = I: K_cs = K_sc^T unconditionally
+    # With split moduli and Q = I: K_cs = K_sc^T unconditionally
     assert np.allclose(K_cs, K_sc.T, rtol=1e-10, atol=1e-14), (
         f"K_cs != K_sc^T: max deviation = "
         f"{np.abs(K_cs - K_sc.T).max():.3e}"

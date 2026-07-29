@@ -44,8 +44,7 @@ def _make_tiny_pipeline(R: float = 1.0) -> ElasticPipeline:
         mesh,
         E=200e9, nu=0.3, itc=None,
         gravity_bf=(0.0, 0.0, 0.0),
-        winkler_k=1e9,
-        problem_options={'winkler_k': 1e9, 'solver': 'umfpack'},
+        problem_options={'solver': 'umfpack'},
     )
 
 
@@ -91,7 +90,7 @@ def test_linear_elasticity_matrix_symmetry():
 
 def test_support_matrix_symmetry():
     """Base Support declares matrix_symmetry = 'symmetric'."""
-    assert Support().matrix_symmetry == 'symmetric'
+    assert Support(k_clamp=1e9).matrix_symmetry == 'symmetric'
 
 
 def test_support_beams_matrix_symmetry_inherited():
@@ -126,7 +125,7 @@ def test_support_beams_matrix_symmetry_inherited():
     )
     assert sb.matrix_symmetry == 'symmetric'
     # Verify it's the inherited version, not an override
-    assert type(sb).matrix_symmetry is type(Support()).matrix_symmetry or \
+    assert type(sb).matrix_symmetry is type(Support(k_clamp=1e9)).matrix_symmetry or \
         SupportBeams.matrix_symmetry is Support.matrix_symmetry
 
 

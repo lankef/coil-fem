@@ -27,7 +27,7 @@ import jax.numpy as jnp
 import warnings
 from jax.flatten_util import ravel_pytree
 from ..presets import cross_section_fns
-from ..utils import clamp_sigmoid
+from ..utils import clamp_sigmoid, estimate_k, curve_center
 from ..coupling import Support, SupportBeams
 
 
@@ -40,7 +40,7 @@ def _clamp_spheres_weights(
     curve_jax,
     phis_i: jax.Array,
     r_clamp: float,
-    sigmoid_eps: float,
+    eps_sigmoid: float,
 ) -> jax.Array:
     """Smooth-union Winkler weight for a set of sphere clamps on one coil.
 
@@ -52,7 +52,7 @@ def _clamp_spheres_weights(
         Arc-length locations of the clamps (values in [0, 1]).
     r_clamp : float
         Sphere radius [m].
-    sigmoid_eps : float
+    eps_sigmoid : float
         Sharpness of the clamp boundary.
 
     Returns
@@ -64,7 +64,7 @@ def _clamp_spheres_weights(
         (surface_points[:, None, :] - gamma_support[None, :, :]) ** 2,
         axis=-1,
     )                                                        # (n_nodes, n_clamp)
-    w = clamp_sigmoid(d_sq, r_clamp, sigmoid_eps)
+    w = clamp_sigmoid(d_sq, r_clamp, eps_sigmoid)
     return jnp.sum(w, axis=-1)
 
 
@@ -72,7 +72,7 @@ def _topbottom_weights(
     surface_points: jax.Array,
     curve_jax,
     r_clamp: float,
-    sigmoid_eps: float,
+    eps_sigmoid: float,
 ) -> jax.Array:
     """Winkler weight from soft spheres at the coil's topmost and bottommost points.
 
@@ -81,7 +81,7 @@ def _topbottom_weights(
     surface_points : jax.Array, shape (n_nodes, 3)
     curve_jax : CurveXYZFourierJAX
     r_clamp : float
-    sigmoid_eps : float
+    eps_sigmoid : float
 
     Returns
     -------
@@ -93,13 +93,46 @@ def _topbottom_weights(
 
     w_top = clamp_sigmoid(
         jnp.sum((surface_points - top) ** 2, axis=-1),
-        r_clamp, sigmoid_eps,
+        r_clamp, eps_sigmoid,
     )
     w_bottom = clamp_sigmoid(
         jnp.sum((surface_points - bottom) ** 2, axis=-1),
-        r_clamp, sigmoid_eps,
+        r_clamp, eps_sigmoid,
     )
     return w_top + w_bottom
+
+def _generate_k_clamp(base_coils, fixed_clamp_options):
+    """ Defaults for the fixed clamp's Robin/Winkler spring coefficients.
+    
+    A fixed clamp's Robin/Winkler spring coefficients can be auto-generated
+    based on the beam's stiffness. This method generates them from the coil's 
+    stiffness. 
+    """
+    if 'k_clamp' in fixed_clamp_options.keys():
+        return fixed_clamp_options['k_clamp']
+    else:
+        eps_clamp = fixed_clamp_options.get('eps_clamp', 1e-3)
+        try:
+            E_coil = fixed_clamp_options['E_coil']
+        except:
+            raise KeyError(
+                "E_coil not detected in fixed_clamp_options. "
+                "When k_clamp is not provided, the Young's modulus "
+                "of the coils, E_coil, must be provided so that a the value "
+                "of k_clamp can be auto-generated based on the coil's stiffness."
+            )
+        mean_arclengths = np.mean(
+            # This calculates the total length of each coil
+            [jnp.mean(c.incremental_arclength()) for c in base_coils]
+        )
+        L_coil = mean_arclengths / np.pi / 2
+        k_clamp = estimate_k(L=L_coil, E=E_coil, eps=eps_clamp)
+        print(
+            "k_clamp is not provided. Based on the coil's stiffness, "
+            f"the auto-generated value is {k_clamp} N/m3."
+        )
+        return k_clamp
+
 
 try:
     from simsopt._core.optimizable import Optimizable
@@ -241,7 +274,7 @@ class CoilSupportFixed(CoilSupport):
     Each clamp is a sphere of radius ``r_clamp`` centred on the coil at
     curve parameter ``phi``; the per-node weight is the (smooth) union of all
     clamp indicator spheres.  Only the clamp locations ``phis`` are DOFs;
-    ``r_clamp``, ``sigmoid_eps`` and ``n_clamp`` are fixed.
+    ``r_clamp``, ``eps_sigmoid`` and ``n_clamp`` are fixed.
 
     Holds a merged ``phis`` array of shape ``(n_coils, n_clamp)`` covering
     all base coils; a single flat DOF vector of length
@@ -257,11 +290,13 @@ class CoilSupportFixed(CoilSupport):
         Whether to apply stellarator symmetry.
     fixed_clamp_options : dict
         Contains the following entries:
+        k_clamp : float
+            Grounded Winkler spring modulus [N/m³].
         r_clamp : float
             Sphere radius [m] of each clamp (region of non-zero spring weight).
         n_clamp : int
             Number of clamps per coil.
-        sigmoid_eps : float
+        eps_sigmoid : float
             Edge sharpness of the clamp (default 0.1).
     phis : array-like or None
         Initial clamp locations, shape ``(n_coils, n_clamp)`` or
@@ -285,7 +320,7 @@ class CoilSupportFixed(CoilSupport):
         dofs=None,
     ):
         n_coils = len(base_coils)
-
+        k_clamp = _generate_k_clamp(base_coils, fixed_clamp_options)
         try:
             r_clamp = fixed_clamp_options['r_clamp']
             n_clamp = fixed_clamp_options['n_clamp']
@@ -293,18 +328,19 @@ class CoilSupportFixed(CoilSupport):
             raise KeyError(
                 "fixed_clamp_options must contain 'r_clamp' and 'n_clamp'."
             )
-        sigmoid_eps = fixed_clamp_options.get('sigmoid_eps', 0.1)
+        eps_sigmoid = fixed_clamp_options.get('eps_sigmoid', 0.1)
 
         phis_arr = _broadcast_phis(phis, n_coils, n_clamp)
 
         self._r_clamp = float(r_clamp)
-        self._sig_eps  = float(sigmoid_eps)
+        self._sig_eps  = float(eps_sigmoid)
 
         # ── Stored for GSONable serialization ────────────────────────────────────
         # GSONable.as_dict requires every __init__ parameter to be present as
         # self.<param> or self._<param>.
         self._fixed_clamp_options = {
-            'r_clamp': r_clamp, 'n_clamp': n_clamp, 'sigmoid_eps': sigmoid_eps,
+            'k_clamp': k_clamp, 'r_clamp': r_clamp,
+            'n_clamp': n_clamp, 'eps_sigmoid': eps_sigmoid,
         }
         # Serialization seeds only — actual clamp positions are restored from the
         # Optimizable dofs object by simsopt on load.
@@ -314,11 +350,11 @@ class CoilSupportFixed(CoilSupport):
 
         super().__init__(
             base_coils, nfp, stellsym,
-            support=Support(fixed_clamp_fns=self._clamp_fn),
+            support=Support(k_clamp=float(k_clamp), fixed_clamp_fns=self._clamp_fn),
             support_dofs_jax={'phis': phis_arr},
             constants={
                 'r_clamp': float(r_clamp),
-                'sigmoid_eps': float(sigmoid_eps),
+                'eps_sigmoid': float(eps_sigmoid),
             },
             names=names,
             dofs=dofs,
@@ -338,7 +374,7 @@ class CoilSupportTopBottom(CoilSupport):
     """Static soft-sphere support at the top and bottom of the coil centreline.
 
     Has no optimisable DOFs (``support_dofs_jax={}``); ``r_clamp`` and
-    ``sigmoid_eps`` are fixed constants.
+    ``eps_sigmoid`` are fixed constants.
 
     Parameters
     ----------
@@ -350,9 +386,11 @@ class CoilSupportTopBottom(CoilSupport):
         Whether to apply stellarator symmetry.
     fixed_clamp_options : dict
         Contains the following entries:
+        k_clamp : float
+            Grounded Winkler spring modulus [N/m³].
         r_clamp : float
             Sphere radius [m] of each clamp (region of non-zero spring weight).
-        sigmoid_eps : float
+        eps_sigmoid : float
             Edge sharpness of the clamp (default 0.1).
     dofs : DOFs or None
         Simsopt ``DOFs`` object for restoring serialised state.
@@ -366,28 +404,33 @@ class CoilSupportTopBottom(CoilSupport):
         fixed_clamp_options: dict,
         dofs=None,
     ):
+        k_clamp = _generate_k_clamp(base_coils, fixed_clamp_options)
         try:
             r_clamp = fixed_clamp_options['r_clamp']
         except KeyError:
-            raise KeyError("fixed_clamp_options must contain 'r_clamp'.")
-        sigmoid_eps = fixed_clamp_options.get('sigmoid_eps', 0.1)
+            raise KeyError(
+                "fixed_clamp_options must contain 'r_clamp'."
+            )
+        eps_sigmoid = fixed_clamp_options.get('eps_sigmoid', 0.1)
 
         self._r_clamp = float(r_clamp)
-        self._sig_eps  = float(sigmoid_eps)
+        self._sig_eps  = float(eps_sigmoid)
 
         # ── Stored for GSONable serialization ────────────────────────────────────
         # GSONable.as_dict requires every __init__ parameter to be present as
         # self.<param> or self._<param>.
-        self._fixed_clamp_options = {'r_clamp': r_clamp, 'sigmoid_eps': sigmoid_eps}
+        self._fixed_clamp_options = {
+            'k_clamp': k_clamp, 'r_clamp': r_clamp, 'eps_sigmoid': eps_sigmoid,
+        }
         # ─────────────────────────────────────────────────────────────────────────
 
         super().__init__(
             base_coils, nfp, stellsym,
-            support=Support(fixed_clamp_fns=self._clamp_fn),
+            support=Support(k_clamp=float(k_clamp), fixed_clamp_fns=self._clamp_fn),
             support_dofs_jax={},
             constants={
                 'r_clamp': float(r_clamp),
-                'sigmoid_eps': float(sigmoid_eps),
+                'eps_sigmoid': float(eps_sigmoid),
             },
             dofs=dofs,
         )
@@ -518,9 +561,8 @@ class CoilSupportBeams(CoilSupport):
             selects coil surface nodes for beam endpoint coupling.
         k_attachment : float
             Distributed attachment (Winkler) modulus [N/m³].  Governs both
-            translational and rotational spring coupling.  Must equal
-            ``problem_options['winkler_k']``.
-        sigmoid_eps : float
+            translational and rotational spring coupling.
+        eps_sigmoid : float
             Sigmoid function widths of attachment points. Default is 0.1.
         and additional options needed by attachment_fn.
     phis_start_cc : sequence of array-like or None
@@ -544,8 +586,8 @@ class CoilSupportBeams(CoilSupport):
         sequence with entry ``i`` of shape ``(n_beam_cf[i],)``.
     fixed_clamp_options : dict
         Optional additional fixed-sphere Winkler clamps on the coil surface.
-        Set ``{'enabled': True, 'r_clamp': ..., 'n_clamp': ...}`` to enable;
-        ``{'enabled': False}`` (default) disables.
+        Set ``{'enabled': True, 'k_clamp': ..., 'r_clamp': ..., 'n_clamp': ...}``
+        to enable; ``{'enabled': False}`` (default) disables.
     phis : array-like or None
         Initial clamp locations for the optional fixed-sphere clamps.
     fixed_dof_names : iterable of str or None
@@ -567,7 +609,7 @@ class CoilSupportBeams(CoilSupport):
         nfp: int,
         stellsym: bool,
         # Beam info
-        beam_options=None,
+        beam_options=(),
         phis_start_cc=None,
         phis_end_cc=None,
         phis_start_cf=None,
@@ -583,20 +625,15 @@ class CoilSupportBeams(CoilSupport):
         dofs=None,
         **kwargs,
     ):
-        # ── Stored for GSONable serialization (structural params) ─────────────────
-        # GSONable.as_dict requires every __init__ parameter to be present as
-        # self.<param> or self._<param>.
-        self.beam_options         = dict(beam_options or {})           # copy before setdefault mutates
-        self._fixed_clamp_options = dict(fixed_clamp_options or {'enabled': False})
-        self._fixed_dof_names     = fixed_dof_names
-        self._names               = names
-        # ─────────────────────────────────────────────────────────────────────────
-
         # ── Stored for GSONable serialization (initial DOF seeds) ─────────────────
         # These are the construction-time seeds for the Optimizable DOF vector.
         # Their actual values are overwritten by the Optimizable dofs object
         # (self._dofs) restored by simsopt on load — these attributes only serve
         # to satisfy GSONable's introspection.
+        # GSONable.as_dict requires every __init__ parameter to be present as
+        # self.<param> or self._<param>.
+        self._fixed_dof_names       = fixed_dof_names
+        self._names                 = names
         self._phis_start_cc         = phis_start_cc
         self._phis_end_cc           = phis_end_cc
         self._phis_start_cf         = phis_start_cf
@@ -607,8 +644,11 @@ class CoilSupportBeams(CoilSupport):
         self.kwargs                 = kwargs   # GSONable adds **self.kwargs to the dict
         # ─────────────────────────────────────────────────────────────────────────
 
-        beam_options         = self.beam_options
-        fixed_clamp_options  = self._fixed_clamp_options
+        # Resolve options into local copies; caller-owned dicts are never mutated.
+        # Assigned to self.beam_options / self._fixed_clamp_options once resolved
+        # so GSONable serialises the filled-in values.
+        beam_options = {'eps_sigmoid': 0.1, **dict(beam_options or {})}
+        fixed_clamp_options = dict(fixed_clamp_options or {'enabled': False})
 
         n_base = len(base_coils)
 
@@ -635,8 +675,6 @@ class CoilSupportBeams(CoilSupport):
             )
 
         # ── Load the remaining beam options ───────────────────────────────────
-        # Default sigmoid function weight
-        beam_options.setdefault('sigmoid_eps', 0.1)  
         beam_option_keys_req = _REQUIRED_BEAM_OPTIONS + cross_section_option_keys
         missing_beam_options = [k for k in beam_option_keys_req if k not in beam_options]
         unrecognized_beam_options = [k for k in beam_options if k not in beam_option_keys_req]
@@ -649,6 +687,26 @@ class CoilSupportBeams(CoilSupport):
                 f"Unrecognized keys in beam_options: {unrecognized_beam_options}."
             )
 
+        # Calculating beam options
+        if 'k_attachment' not in beam_options:
+            eps_attachment = beam_options.get('eps_attachment', 1e-4)
+            E_beams = fixed_clamp_options['E']
+            # [n_coil, 3]
+            centers = np.array([curve_center(c) for c in self.base_curves])
+            # [n_coil - 1]
+            # The scale-length of coil-coil beams are the inter-coil distance.
+            displacements = np.linalg.norm(centers[1:] - centers[:-1]+1e-8, axis=-1)
+            k_attachment = estimate_k(
+                L=np.mean(displacements),
+                E=E_beams,
+                eps=eps_attachment,
+            )
+            beam_options = {**beam_options, 'k_attachment': float(k_attachment)}
+            print(
+                "k_attachment is not provided. Based on the coil's stiffness, "
+                f"the auto-generated value is {k_attachment} N/m3."
+            )
+
         # ── Optional fixed-sphere Winkler clamps ──────────────────────────────
         # Resolved before SupportBeams construction because fixed_clamp_fns is
         # a constructor argument.  The "must have >=1 CF beam" fallback check
@@ -658,6 +716,9 @@ class CoilSupportBeams(CoilSupport):
         self._r_clamp = None
         self._sig_eps  = None
         if fixed_clamp_options.get('enabled', False):
+            # k_clamp, the Robin/Winkler BC, can be auto-generated using the  
+            # stiffness of the coil body.
+            k_clamp = _generate_k_clamp(base_coils, fixed_clamp_options)
             try:
                 r_clamp = fixed_clamp_options['r_clamp']
                 n_clamp = fixed_clamp_options['n_clamp']
@@ -665,15 +726,23 @@ class CoilSupportBeams(CoilSupport):
                 raise KeyError(
                     "fixed_clamp_options must contain 'r_clamp' and 'n_clamp'."
                 )
-            sigmoid_eps = fixed_clamp_options.get('sigmoid_eps', 0.1)
+            eps_sigmoid = fixed_clamp_options.get('eps_sigmoid', 0.1)
 
             phis_arr = _broadcast_phis(phis, n_base, n_clamp)
 
             self._r_clamp = float(r_clamp)
-            self._sig_eps  = float(sigmoid_eps)
+            self._sig_eps  = float(eps_sigmoid)
             fixed_clamp_fns = self._clamp_fn
+            # Keep k_clamp in the stored options so SupportBeams / GSONable
+            # see the same dict that was validated here.
+            fixed_clamp_options = {
+                **fixed_clamp_options, 'k_clamp': float(k_clamp),
+            }
         else:
             fixed_clamp_fns = None
+
+        self.beam_options = beam_options
+        self._fixed_clamp_options = fixed_clamp_options
 
         # ── Build the functional SupportBeams ─────────────────────────────────
         # SupportBeams.__init__ is the single owner of the beam-count
@@ -688,6 +757,7 @@ class CoilSupportBeams(CoilSupport):
             cross_section_dof_keys=cross_section_dof_keys,
             attachment_fn=attachment_fn,
             fixed_clamp_fns=fixed_clamp_fns,
+            fixed_clamp_options=fixed_clamp_options,
         )
         n_beam_cc = beams.n_beam_cc
         n_beam_cf = beams.n_beam_cf

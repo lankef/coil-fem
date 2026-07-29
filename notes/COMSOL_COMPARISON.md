@@ -1,3 +1,5 @@
+> **Historical note:** This document predates the clamp/attachment moduli split (`k_clamp` / `k_attachment` on `Support`, `params['support_k']`, VTU fields `w_clamp`/`w_attach`/`k_clamp_Npm3`/`k_attach_Npm3`).  API names such as `winkler_k`, `support_weights`, `support_attach`, and `compute_attach` are obsolete.  Prefer `AGENTS.md` and `docs/developers/support_structure.rst` for current behaviour.
+
 # Comparing coil-fem with COMSOL
 
 Step-by-step instructions for reproducing a `CoilFEM` structural analysis in

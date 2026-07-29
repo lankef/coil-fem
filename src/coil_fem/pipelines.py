@@ -43,8 +43,6 @@ class ElasticPipeline:
         ``None`` for isothermal.
     gravity_bf : tuple[float, float, float]
         Constant gravity body-force component ``ρ g_vec`` [N/m³].
-    winkler_k : float
-        Base Winkler spring stiffness [N/m³].
     problem_options : dict
         Options forwarded to :func:`~coil_fem.solvers.build_fwd_pred`.
     """
@@ -56,7 +54,6 @@ class ElasticPipeline:
         nu: float,
         itc: float | None,
         gravity_bf: tuple[float, float, float],
-        winkler_k: float,
         problem_options: dict,
     ):
         self.mesh = mesh
@@ -68,7 +65,7 @@ class ElasticPipeline:
 
         self.problem = LinearElasticity3D(
             mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-            additional_info=(E, nu, tuple(gravity_bf), winkler_k) + thermal_info,
+            additional_info=(E, nu, tuple(gravity_bf)) + thermal_info,
             gpu_assembly=_use_cudss,
         )
         mesh.attach_ref_coords(self.problem)
@@ -87,8 +84,8 @@ class ElasticPipeline:
         return build_fwd_pred(self.problem, self.problem_options)
 
     @property
-    def n_surface_quads(self) -> int | None:
-        """Total number of surface quadrature points, or ``None`` if no Winkler BC."""
+    def n_surface_quads(self) -> int:
+        """Total number of surface quadrature points."""
         return self.problem.n_surface_quads
 
     def surface_quad_points(self, points: jnp.ndarray) -> jnp.ndarray:
@@ -128,8 +125,7 @@ class ElasticPipeline:
         self,
         points: jnp.ndarray,
         body_force: jnp.ndarray,
-        support_weights: jnp.ndarray | None = None,
-        support_attach: jnp.ndarray | None = None,
+        support_k: jnp.ndarray,
         *,
         fe_geom: tuple | None = None,
     ) -> dict:
@@ -144,15 +140,10 @@ class ElasticPipeline:
             Current mesh node positions.
         body_force : jnp.ndarray, shape ``(n_cells, n_quads, 3)``
             Body force at every quadrature point.
-        support_weights : jnp.ndarray or None, shape ``(n_surface_quads,)``
-            Per-surface-quad Winkler weights in ``[0, 1]``.  Obtain via
-            :meth:`surface_quad_points` → ``support.compute_weights``.
-        support_attach : jnp.ndarray or None, shape ``(n_surface_quads, 3)``
-            Per-surface-quad attachment displacement ``u_attach`` for the
-            shifted Winkler spring.  When provided, the spring traction becomes
-            ``k(x) (u − u_attach)`` rather than ``k(x) u``.  Obtain via
-            ``support.compute_attach`` called at surface quad points.
-            Defaults to zeros.
+        support_k : jnp.ndarray, shape ``(n_surface_quads,)``
+            Per-surface-quad Winkler stiffness [N/m³].  Obtain via
+            :meth:`surface_quad_points` → ``support.compute_weights`` →
+            ``support.stiffness``.
         fe_geom : tuple or None
             Pre-computed ``(shape_grads, JxW, v_grads_JxW, pqp)`` from an
             earlier :func:`~coil_fem.problems.recompute_fe_geometry` call for
@@ -169,11 +160,8 @@ class ElasticPipeline:
         params: dict = {
             'points':      points,
             'body_force':  body_force,
+            'support_k':   support_k,
         }
-        if support_weights is not None:
-            params['support_weights'] = support_weights
-        if support_attach is not None:
-            params['support_attach'] = support_attach
         if fe_geom is not None:
             params['_fe_geom'] = fe_geom  # consumed by set_params, not by the solver
 
@@ -240,7 +228,7 @@ class ThermoElasticPipeline(ElasticPipeline):
     coupling is implemented.
     """
 
-    def solve(self, points, body_force, support_weights=None, support_attach=None):
+    def solve(self, points, body_force, support_k):
         """Not implemented — thermoelastic solve not yet available."""
         raise NotImplementedError(
             "ThermoElasticPipeline.solve() is not yet implemented. "

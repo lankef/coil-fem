@@ -29,6 +29,7 @@ from coil_fem.geo import CurveXYZFourierJAX
 from coil_fem.geo import make_rmf_frame
 from coil_fem.meshing import CoilMeshRectangle
 from coil_fem.magnetic import B_self_quadrature
+from coil_fem.pipelines import ElasticPipeline
 
 
 def _make_circle(N=32, R=1.0):
@@ -46,11 +47,11 @@ def _make_circle(N=32, R=1.0):
 def _build_prob_dict(mesh_type, N=32, R=1.0, w1=0.05, w2=0.03):
     """Build a CoilMeshRectangle + LinearElasticity3D problem dict.
 
-    ``mesh.attach_ref_coords(prob)`` populates ``mesh.phi_quad``/``mesh.uv_quad``
-    in place, mirroring what :class:`~coil_fem.CoilFEM` does at construction.
+    Built through :class:`~coil_fem.pipelines.ElasticPipeline`, which already
+    calls ``mesh.attach_ref_coords`` to populate
+    ``mesh.phi_quad``/``mesh.uv_quad`` in place, mirroring what
+    :class:`~coil_fem.CoilFEM` does at construction.
     """
-    from coil_fem.problems import LinearElasticity3D
-
     curve = _make_circle(N=N, R=R)
     fc = make_rmf_frame(curve)
     mesh = CoilMeshRectangle(
@@ -59,11 +60,10 @@ def _build_prob_dict(mesh_type, N=32, R=1.0, w1=0.05, w2=0.03):
         mesh_type=mesh_type,
     )
 
-    prob = LinearElasticity3D(
-        mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-        additional_info=(200e9, 0.3, (0., 0., 0.)),
+    pipeline = ElasticPipeline(
+        mesh, 200e9, 0.3, None, (0., 0., 0.), {'solver': 'umfpack'},
     )
-    mesh.attach_ref_coords(prob)
+    prob = pipeline.problem
 
     return {
         'mesh_type': mesh_type,

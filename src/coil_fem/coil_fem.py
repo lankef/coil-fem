@@ -28,7 +28,6 @@ from .geo import (
     apply_symmetries_to_gammas,
     apply_symmetries_to_gammadashs,
     apply_symmetries_to_currents,
-    n_coils_total,
 )
 from .meshing import CoilMesh
 from .magnetic import biot_savart, B_self_quadrature, lorentz_body_force
@@ -39,7 +38,7 @@ from .problems import (
 )
 from .pipelines import ElasticPipeline, ThermoElasticPipeline
 from .coupling import (
-    Support, SupportBeams,
+    Support, 
     solve_uncoupled, solve_staggered, solve_monolithic,
     MonolithicStatic, make_merged_solve,
 )
@@ -49,7 +48,6 @@ from .metrics import (
     l2_von_mises,
     mean_von_mises_volume_weighted,
     total_strain_energy,
-    cauchy_stress_small_strain,
 )
 
 # ============================================================================
@@ -127,7 +125,7 @@ def _broadcast_problem_options(problem_options: dict | None) -> dict:
 
     Returns
     -------
-    dict with at least keys ``'winkler_k'``, ``'solver'``, ``'adjoint_solver'``.
+    dict with at least keys ``'solver'``, ``'adjoint_solver'``.
 
     Recognised solver names
     -----------------------
@@ -141,10 +139,6 @@ def _broadcast_problem_options(problem_options: dict | None) -> dict:
       ``problem.matrix_symmetry``; override emits ``UserWarning``.
     """
     opts = dict(problem_options) if problem_options else {}
-    if 'winkler_k' not in opts:
-        raise ValueError(
-            "problem_options must contain 'winkler_k' [N/m³]."
-        )
     opts.setdefault('solver', 'umfpack')
     opts.setdefault('adjoint_solver', 'umfpack')
 
@@ -202,11 +196,12 @@ class CoilFEM:
         then fixed for the rest of the optimisation run.
 
         A single dict is broadcast to all base coils.
-    support : Support or None
-        Support model providing per-surface-node Winkler weights via
-        :meth:`~coil_fem.coupling.Support.compute_weights`.  ``None`` (default)
-        installs a :class:`~coil_fem.coupling.Support` with uniform unit
-        weights (fully supported everywhere).
+    support : Support
+        Support model owning the grounded-clamp modulus (``k_clamp``) and,
+        for coupled subclasses, the beam-attachment modulus
+        (``k_attachment``).  Provides per-surface-node Winkler weights via
+        :meth:`~coil_fem.coupling.Support.compute_weights` and combines them
+        into a stiffness via :meth:`~coil_fem.coupling.Support.stiffness`.
     gravity_options : dict or None
         If provided, enables a uniform gravitational body force ``ρ·g``.  May
         contain ``'g_vec'`` (default ``(0, 0, -9.80665)``).  The mass density
@@ -222,9 +217,8 @@ class CoilFEM:
           ``ε_th = −itc · I``.  Not a differentiable DOF.
 
     problem_options : dict or None
-        Numerical solver and Winkler BC parameters.  Keys:
+        Numerical solver parameters.  Keys:
 
-        * ``'winkler_k'`` : float [N/m³] — required.
         * ``'solver'`` : ``'umfpack'`` (default).
         * ``'adjoint_solver'`` : ``'umfpack'`` (default).
 
@@ -248,7 +242,7 @@ class CoilFEM:
         nfp: int,
         stellsym: bool,
         mesh_options: dict | list[dict],
-        support: Support | None = None,
+        support: Support,
         gravity_options: dict | None = None,
         material_options: dict | None = None,
         problem_options: dict | None = None,
@@ -258,7 +252,7 @@ class CoilFEM:
     ):
         self.verbose = verbose
         self._set_jaxfem_log_level()
-        self.support = support if support is not None else Support()
+        self.support = support
 
         if coupling not in _VALID_COUPLING:
             raise ValueError(
@@ -279,15 +273,14 @@ class CoilFEM:
         self.problem_options = _broadcast_problem_options(problem_options)
 
         # ── 2. Material properties ────────────────────────────────────────────
-        mat = material_options or {}
-        self._E   = float(mat.get('E', 200e9))
-        self._nu  = float(mat.get('nu', 0.3))
-        self._rho = float(mat.get('density', 7800.0))
+        self._E   = material_options['E']
+        self._nu  = material_options['nu']
+        self._rho = material_options['density']
         self._lam, self._mu = lame_parameters(self._E, self._nu)
         # Thermal eigenstrain parameter (optional; uniform contraction assumed).
         # ``itc`` is the positive integral thermal contraction ΔL/L applied
         # as ε_th = −itc · I.
-        self._itc = float(mat['itc']) if 'itc' in mat else None
+        self._itc = float(material_options['itc']) if 'itc' in material_options else None
 
         # ── 3+4. Build per-coil pipelines (mesh + problem + fwd_pred) ───────────
         # Pipelines replace the separate self.meshes / self._problems /
@@ -300,21 +293,6 @@ class CoilFEM:
         gravity_bf = (
             self._rho * grav_vec if self.gravity_options else (0.0, 0.0, 0.0)
         )
-        winkler_k = float(self.problem_options['winkler_k'])
-
-        # Both winkler_k and support.k_attachment are N/m³ foundation moduli.
-        # The coil-side Winkler integral ∫ k w (u − u_att) · v dS and the
-        # beam-side spring sums k_attachment Σ w·JxW·(u_att − u_mesh) are the
-        # Galerkin counterparts of the same physical contact law; they must
-        # share the same modulus so that the net coupling force is consistent.
-        if self.support.is_coupled:
-            k_attach_support = float(self.support.k_attachment)
-            if abs(winkler_k - k_attach_support) / (k_attach_support + 1e-300) > 1e-6:
-                raise ValueError(
-                    f"CoilFEM: winkler_k={winkler_k:.6g} does not match "
-                    f"support.k_attachment={k_attach_support:.6g}. Both are N/m³ "
-                    "foundation moduli and must be equal when is_coupled=True."
-                )
 
         _physics_type = (physics_options or {}).get('type', 'elastic')
         _valid_physics = {'elastic', 'thermoelastic'}
@@ -338,7 +316,7 @@ class CoilFEM:
             self.pipelines.append(
                 pipeline_cls(
                     mesh, self._E, self._nu, self._itc,
-                    tuple(gravity_bf), winkler_k, self.problem_options,
+                    tuple(gravity_bf), self.problem_options,
                 )
             )
 
@@ -751,7 +729,7 @@ class CoilFEM:
         * ``'bf_by_coil'``      — list of body-force arrays.
         * ``'B_self_by_coil'``  — list of ``(n_cells, n_quads, 3)`` self-field arrays.
         * ``'B_ext_by_coil'``   — list of ``(n_cells, n_quads, 3)`` mutual-field arrays.
-        * ``'weights_by_coil'`` — list of Winkler-weight arrays.
+        * ``'stiffness_by_coil'`` — list of per-quad Winkler stiffness arrays.
         * ``'u_s'``             — ``(n_support_dofs,)`` support DOF vector, or
           ``None`` for uncoupled solves.
         """
@@ -771,7 +749,7 @@ class CoilFEM:
         bf_by_coil      = []
         bself_by_coil   = []
         bext_by_coil    = []
-        wt_by_coil      = []
+        k_by_coil       = []
         sg_by_coil      = []   # shape_grads for objective metric reuse
         jxw_by_coil_fe  = []   # JxW for objective metric reuse
         fe_geom_by_coil = []   # full (sg, jxw, vgj, pqp) for set_params reuse
@@ -785,15 +763,15 @@ class CoilFEM:
                 all_gammas, all_gammadashs, all_currents,
                 pqp_i,
             )
-            wt_i = self._compute_support_weights(
+            k_i = self.support.stiffness(*self._support_weights(
                 i, pts_i, curves_jax_list, base_support_dofs,
                 geom=support_geom,
-            )
+            ))
             pts_by_coil.append(pts_i)
             bf_by_coil.append(bf_i)
             bself_by_coil.append(bself_i)
             bext_by_coil.append(bext_i)
-            wt_by_coil.append(wt_i)
+            k_by_coil.append(k_i)
             sg_by_coil.append(sg_i)
             jxw_by_coil_fe.append(jxw_i)
             fe_geom_by_coil.append((sg_i, jxw_i, vgj_i, pqp_i))
@@ -801,7 +779,7 @@ class CoilFEM:
         driver_params = {
             'mesh_points_by_coil': pts_by_coil,
             'body_force_by_coil':  bf_by_coil,
-            'weights_by_coil':     wt_by_coil,
+            'stiffness_by_coil':   k_by_coil,
             'curves_by_coil':      curves_jax_list,
             'support_dofs':        base_support_dofs or {},
             # Pre-computed FE geometry (sg, jxw, vgj, pqp) per coil; passed to
@@ -823,16 +801,16 @@ class CoilFEM:
             result = solve_uncoupled(self.pipelines, self.support, driver_params)
 
         return {
-            'sol_list_by_coil': result['sol_list_by_coil'],
-            'pts_by_coil':      pts_by_coil,
-            'bf_by_coil':       bf_by_coil,
-            'B_self_by_coil':   bself_by_coil,
-            'B_ext_by_coil':    bext_by_coil,
-            'weights_by_coil':  wt_by_coil,
-            'sg_by_coil':       sg_by_coil,
-            'jxw_by_coil_fe':   jxw_by_coil_fe,
-            'u_s':              result['u_s'],
-            'diagnostics':      result.get('diagnostics', {}),
+            'sol_list_by_coil':   result['sol_list_by_coil'],
+            'pts_by_coil':        pts_by_coil,
+            'bf_by_coil':         bf_by_coil,
+            'B_self_by_coil':     bself_by_coil,
+            'B_ext_by_coil':      bext_by_coil,
+            'stiffness_by_coil':  k_by_coil,
+            'sg_by_coil':         sg_by_coil,
+            'jxw_by_coil_fe':     jxw_by_coil_fe,
+            'u_s':                result['u_s'],
+            'diagnostics':        result.get('diagnostics', {}),
         }
 
     # ============================================================================
@@ -875,14 +853,21 @@ class CoilFEM:
           shape ``(n_nodes, 3)``.
         * ``'von_mises'``     -- list of ``(n_cells, n_quads)`` von Mises arrays.
         * ``'mesh_points'``   -- list of updated ``(n_nodes, 3)`` node arrays.
-        * ``'support_weights'`` -- list of ``(n_surface_quads,)`` Winkler weight
-          arrays per coil (one entry per surface quadrature point).
+        * ``'support_k'``     -- list of ``(n_surface_quads,)`` Winkler stiffness
+          arrays [N/m³] per coil (one entry per surface quadrature point).
         * ``'f_vol'``         -- list of ``(n_cells, n_quads, 3)`` body force
           density arrays [N/m^3] per coil.
         * ``'B_self'``        -- list of ``(n_cells, n_quads, 3)`` self-field
           arrays [T] per coil.
         * ``'B_ext'``         -- list of ``(n_cells, n_quads, 3)`` mutual field
           arrays [T] per coil.
+        * ``'u_s'``           -- support DOF vector, shape ``(n_support_dofs,)``,
+          or ``None`` for an uncoupled :class:`~coil_fem.coupling.Support`.
+          For :class:`~coil_fem.coupling.SupportBeams`, reshape via
+          ``self.support.endpoint_state(result['u_s'])`` for a per-beam,
+          per-node ``(translation, rotation)`` breakdown, or evaluate
+          ``self.support.beam_displacement(geom, result['u_s'], xi)`` for the
+          closed-form displacement along each beam.
         """
         n_base = len(self.base_curves_jax)
         if base_curves_dofs is None:
@@ -912,10 +897,11 @@ class CoilFEM:
             'displacements':   [sol[0] for sol in sol_list], # list[array(n_nodes, 3)]
             'von_mises':       vm_list,
             'mesh_points':     solved['pts_by_coil'],
-            'support_weights': solved['weights_by_coil'],
+            'support_k':       solved['stiffness_by_coil'],
             'f_vol':           solved['bf_by_coil'],         # list of (n_cells, n_quads, 3) [N/m^3]
             'B_self':          solved['B_self_by_coil'],     # list of (n_cells, n_quads, 3) [T]
             'B_ext':           solved['B_ext_by_coil'],      # list of (n_cells, n_quads, 3) [T]
+            'u_s':             solved['u_s'],                # (n_support_dofs,) or None
         }
 
     def compute_strain_tensors(
@@ -1103,10 +1089,10 @@ class CoilFEM:
         return totals
 
     # ============================================================================
-    # Winkler weight helper (called from run and objective)
+    # Winkler weight helper (called from run, objective, and visualisation)
     # ============================================================================
 
-    def _compute_support_weights(
+    def _support_weights(
         self,
         coil_idx: int,
         pts_i: jax.Array,
@@ -1115,8 +1101,8 @@ class CoilFEM:
         *,
         geom: dict | None = None,
         at: str = 'quads',
-    ) -> jax.Array:
-        """Compute Winkler weights for coil ``coil_idx`` at surface quad or node points.
+    ) -> tuple[jax.Array, jax.Array]:
+        """Grounded-clamp and beam-attachment weights for coil ``coil_idx``.
 
         Parameters
         ----------
@@ -1131,10 +1117,13 @@ class CoilFEM:
             :meth:`~coil_fem.coupling.Support.geometry`.
         at : ``'quads'`` or ``'nodes'``
             Point set at which to evaluate the weight function.  ``'quads'``
-            (default) returns a ``(n_surface_quads,)`` array for use as
-            ``params['support_weights']``.  ``'nodes'`` returns a
-            ``(n_surface_nodes,)`` array, used only for per-node visualisation
-            (plotting and VTU export).
+            (default) returns ``(n_surface_quads,)`` arrays for the solve;
+            ``'nodes'`` returns ``(n_surface_nodes,)`` arrays for visualisation.
+
+        Returns
+        -------
+        w_g, w_a : jax.Array
+            Grounded-clamp and beam-attachment weight fields.
         """
         pipeline = self.pipelines[coil_idx]
         if at == 'nodes':
@@ -1142,7 +1131,9 @@ class CoilFEM:
         else:
             surf_pts = pipeline.surface_quad_points(pts_i)
         kw = {'geom': geom} if geom is not None else {}
-        return self.support.compute_weights(coil_idx, surf_pts, curves_jax, support_dofs, **kw)
+        return self.support.compute_weights(
+            coil_idx, surf_pts, curves_jax, support_dofs, **kw
+        )
 
     # ============================================================================
     # Properties
@@ -1182,13 +1173,10 @@ class CoilFEM:
     ) -> list[str]:
         """Export Winkler support weights and full mesh as VTU files.
 
-        Thin wrapper around :meth:`coil_fem.coupling.Support.save_support_vtu`;
-        the concrete support decides what is written.  The base
-        :class:`~coil_fem.coupling.Support` writes one
-        ``{prefix}{i:02d}_support.vtu`` per coil (``support_weights`` and
-        ``spring_k_Npm3`` point fields); :class:`~coil_fem.coupling.SupportBeams`
-        additionally writes ``{prefix}_beams.vtu`` when ``base_support_dofs`` is
-        provided.
+        Writes one ``{prefix}{i:02d}_support.vtu`` per coil with point fields
+        ``w_clamp``, ``w_attach``, ``k_clamp_Npm3``, and ``k_attach_Npm3``.
+        :class:`~coil_fem.coupling.SupportBeams` additionally writes
+        ``{prefix}_beams.vtu`` when ``base_support_dofs`` is provided.
 
         Parameters
         ----------
@@ -1211,7 +1199,8 @@ class CoilFEM:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
 
         curves_jax = self.curves_from_dofs(base_curves_dofs)
-        winkler_k  = float(self.problem_options['winkler_k'])
+        k_clamp = float(self.support.k_clamp)
+        k_attach = float(self.support.k_attachment)
 
         os.makedirs(out_dir, exist_ok=True)
         written: list[str] = []
@@ -1221,23 +1210,26 @@ class CoilFEM:
             pts_np  = onp.asarray(pts_i, dtype=onp.float64)
             n_nodes = pts_np.shape[0]
 
-            pipeline    = self.pipelines[i]
-            surf_idx    = onp.asarray(pipeline.surface_node_indices, dtype=onp.int32)
-            surf_pts    = pts_i[surf_idx]
-            w_surf      = onp.asarray(
-                self.support.compute_weights(i, surf_pts, curves_jax, base_support_dofs),
-                dtype=onp.float64,
+            surf_idx = onp.asarray(
+                self.pipelines[i].surface_node_indices, dtype=onp.int32
             )
-            weight_full = onp.zeros(n_nodes, dtype=onp.float64)
-            weight_full[surf_idx] = w_surf
+            w_g, w_a = self._support_weights(
+                i, pts_i, curves_jax, base_support_dofs, at='nodes',
+            )
+            w_g_full = onp.zeros(n_nodes, dtype=onp.float64)
+            w_a_full = onp.zeros(n_nodes, dtype=onp.float64)
+            w_g_full[surf_idx] = onp.asarray(w_g, dtype=onp.float64)
+            w_a_full[surf_idx] = onp.asarray(w_a, dtype=onp.float64)
 
             mesh_path = os.path.join(out_dir, f"{prefix}{i:02d}_support.vtu")
             meshio.Mesh(
                 points=pts_np,
                 cells=[(coil_mesh.meshio_cell_type, onp.asarray(coil_mesh.cells, dtype=onp.int32))],
                 point_data={
-                    "support_weights": weight_full,
-                    "spring_k_Npm3":   weight_full * winkler_k,
+                    "w_clamp": w_g_full,
+                    "w_attach": w_a_full,
+                    "k_clamp_Npm3": w_g_full * k_clamp,
+                    "k_attach_Npm3": w_a_full * k_attach,
                 },
             ).write(mesh_path)
             written.append(mesh_path)
@@ -1254,24 +1246,7 @@ class CoilFEM:
             ]).astype(onp.int32)
 
             # Cell labels: beam_type (CC=0, CF=1) and originating coil index.
-            n_base = len(self.base_curves_jax)
-            coil_idx_arr = onp.concatenate([
-                onp.full(self.support.n_beam_cc[i] + self.support.n_beam_cf[i], i, dtype=onp.int32)
-                for i in range(n_base)
-            ]) if n_base else onp.zeros(0, dtype=onp.int32)
-            beam_type = onp.concatenate([
-                onp.concatenate([
-                    onp.zeros(self.support.n_beam_cc[i], dtype=onp.int32),
-                    onp.ones(self.support.n_beam_cf[i], dtype=onp.int32),
-                ])
-                for i in range(n_base)
-            ]) if n_base else onp.zeros(0, dtype=onp.int32)
-            if self.support.stellsym:
-                n_wrap = self.support.n_beam_cc[n_base]
-                coil_idx_arr = onp.concatenate(
-                    [coil_idx_arr, onp.zeros(n_wrap, dtype=onp.int32)])
-                beam_type = onp.concatenate(
-                    [beam_type, onp.zeros(n_wrap, dtype=onp.int32)])
+            coil_idx_arr, beam_type = self.support.beam_labels()
 
             geom = self.support._beam_geometry(curves_jax, base_support_dofs)
             L = onp.asarray(geom['L'], dtype=onp.float64)
@@ -1366,15 +1341,14 @@ class CoilFEM:
             pts_np  = onp.asarray(pts_i, dtype=onp.float64)
             n_nodes = pts_np.shape[0]
 
-            pipeline   = self.pipelines[i]
-            surf_idx   = onp.asarray(pipeline.surface_node_indices, dtype=onp.int32)
-            surf_pts   = pts_i[surf_idx]
-            w_surf     = onp.asarray(
-                self.support.compute_weights(i, surf_pts, curves_jax, base_support_dofs),
-                dtype=onp.float64,
+            surf_idx = onp.asarray(
+                self.pipelines[i].surface_node_indices, dtype=onp.int32
+            )
+            w_g, w_a = self._support_weights(
+                i, pts_i, curves_jax, base_support_dofs, at='nodes',
             )
             weight_full = onp.zeros(n_nodes, dtype=onp.float64)
-            weight_full[surf_idx] = w_surf
+            weight_full[surf_idx] = onp.asarray(w_g + w_a, dtype=onp.float64)
 
             if simple_mode:
                 rgba = onp.empty((n_nodes, 4), dtype=onp.float64)
@@ -1549,6 +1523,7 @@ class CoilFEM:
         base_curves_dofs: list[jax.Array] | None = None,
         base_currents_dofs: jax.Array | None = None,
         base_support_dofs: dict | None = None,
+        n_sub: int = 20,
     ) -> list[str]:
         """Run the forward FEM solve and export results for each coil as a VTU file.
 
@@ -1567,8 +1542,20 @@ class CoilFEM:
             vector and magnitude at FEM quadrature points ``(n_cells, 3)`` / ``(n_cells,)`` [T].
           - cell field ``B_ext_T``  / ``B_ext_mag_T``  — quad-averaged external
             (mutual) field vector and magnitude ``(n_cells, 3)`` / ``(n_cells,)`` [T].
-          - point field ``support_weight`` (``[0, 1]``) and ``spring_k_Npm3``
-            (N/m³) — only written when a ``fixed_clamp_fn`` was supplied.
+          - point fields ``w_clamp``, ``w_attach``, ``k_clamp_Npm3``, and
+            ``k_attach_Npm3`` — grounded-clamp and beam-attachment weights and
+            stiffnesses [N/m³].
+
+        * ``{out_dir}/{prefix}_beams.vtu`` — polyline mesh of every base-coil
+          beam, ``n_sub`` line segments (``n_sub + 1`` points) per beam, only
+          when ``base_support_dofs`` is given and :attr:`support` is a
+          :class:`~coil_fem.coupling.SupportBeams` (i.e. has a
+          ``beam_displacement`` method):
+
+          - point field ``displacement_m`` — closed-form beam-centreline
+            displacement at each sub-point (see
+            :meth:`~coil_fem.coupling.SupportBeams.beam_displacement`).
+          - cell field ``beam_type`` (CC=0, CF=1) and ``coil_index``.
 
         Parameters
         ----------
@@ -1583,6 +1570,9 @@ class CoilFEM:
             Currents per base coil.  ``None`` uses ``self.base_currents_jax``.
         base_support_dofs : dict or None
             Per-coil support parameters for the support functions.
+        n_sub : int
+            Number of sub-segments per beam in ``{prefix}_beams.vtu``
+            (default 20).  Ignored when the support has no beam network.
 
         Returns
         -------
@@ -1593,7 +1583,8 @@ class CoilFEM:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
 
         curves_jax = self.curves_from_dofs(base_curves_dofs)
-        winkler_k  = float(self.problem_options['winkler_k'])
+        k_clamp = float(self.support.k_clamp)
+        k_attach = float(self.support.k_attachment)
 
         result = self.run(
             base_curves_dofs=base_curves_dofs,
@@ -1629,22 +1620,24 @@ class CoilFEM:
             )
 
             # ── Point fields (displacement + support weights) ─────────────────
-            pt_data: dict = {"displacement_m": disp}
-
-            pts_i    = jnp.asarray(pts_np)
+            pts_i = jnp.asarray(pts_np)
             surf_idx = onp.asarray(
                 self.pipelines[i].surface_node_indices, dtype=onp.int32
             )
-            weights_surf = onp.asarray(
-                self._compute_support_weights(
-                    i, pts_i, curves_jax, base_support_dofs, at='nodes'
-                ),
-                dtype=onp.float64,
+            w_g, w_a = self._support_weights(
+                i, pts_i, curves_jax, base_support_dofs, at='nodes',
             )
-            weight_full = onp.zeros(n_nodes, dtype=onp.float64)
-            weight_full[surf_idx] = weights_surf
-            pt_data["support_weights"] = weight_full
-            pt_data["spring_k_Npm3"]  = weight_full * winkler_k
+            w_g_full = onp.zeros(n_nodes, dtype=onp.float64)
+            w_a_full = onp.zeros(n_nodes, dtype=onp.float64)
+            w_g_full[surf_idx] = onp.asarray(w_g, dtype=onp.float64)
+            w_a_full[surf_idx] = onp.asarray(w_a, dtype=onp.float64)
+            pt_data = {
+                "displacement_m": disp,
+                "w_clamp": w_g_full,
+                "w_attach": w_a_full,
+                "k_clamp_Npm3": w_g_full * k_clamp,
+                "k_attach_Npm3": w_a_full * k_attach,
+            }
 
             mesh_path = os.path.join(out_dir, f"{prefix}{i:02d}_run.vtu")
             meshio.Mesh(
@@ -1659,5 +1652,44 @@ class CoilFEM:
                 },
             ).write(mesh_path)
             written.append(mesh_path)
+
+        # ── Beam centreline displacement (SupportBeams only) ───────────────────
+        if (base_support_dofs is not None and result['u_s'] is not None
+                and hasattr(self.support, 'beam_displacement')
+                and self.support.n_beams_total > 0):
+            geom = self.support.geometry(curves_jax, base_support_dofs)
+            xi = jnp.linspace(0.0, 1.0, n_sub + 1)
+            disp = onp.asarray(
+                self.support.beam_displacement(geom, result['u_s'], xi),
+                dtype=onp.float64,
+            )  # (N_beams, n_sub+1, 3)
+
+            x_s = onp.asarray(geom['x_start'], dtype=onp.float64)  # (N_beams, 3)
+            x_e = onp.asarray(geom['x_end'],   dtype=onp.float64)
+            xi_np = onp.asarray(xi, dtype=onp.float64)
+            # Rest-frame interior points (beams are straight at rest).
+            pts = x_s[:, None, :] + xi_np[None, :, None] * (x_e - x_s)[:, None, :]
+
+            n_beams, n_pts_per_beam, _ = pts.shape
+            pts_flat  = pts.reshape(-1, 3)
+            disp_flat = disp.reshape(-1, 3)
+
+            base_idx = (onp.arange(n_beams) * n_pts_per_beam)[:, None]
+            local    = onp.arange(n_sub)[None, :]
+            conn = onp.stack([base_idx + local, base_idx + local + 1], axis=-1)
+            conn = conn.reshape(-1, 2).astype(onp.int32)
+
+            coil_idx_arr, beam_type = self.support.beam_labels()
+            beam_path = os.path.join(out_dir, f"{prefix}_beams.vtu")
+            meshio.Mesh(
+                points=pts_flat,
+                cells=[("line", conn)],
+                point_data={"displacement_m": disp_flat},
+                cell_data={
+                    "beam_type":  [onp.repeat(beam_type, n_sub)],
+                    "coil_index": [onp.repeat(coil_idx_arr, n_sub)],
+                },
+            ).write(beam_path)
+            written.append(beam_path)
 
         return written

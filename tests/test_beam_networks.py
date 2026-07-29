@@ -92,6 +92,7 @@ def _make_support_beams(
     nfp: int = 2,
     stellsym: bool = False,
     fixed_clamp_fns=None,
+    fixed_clamp_options=None,
 ) -> SupportBeams:
     """Build a minimal SupportBeams instance for testing."""
     beam_options = {
@@ -109,6 +110,7 @@ def _make_support_beams(
         cross_section_fn=_constant_section_fn(),
         attachment_fn=_uniform_clamp_fn,
         fixed_clamp_fns=fixed_clamp_fns,
+        fixed_clamp_options=fixed_clamp_options,
     )
 
 
@@ -355,14 +357,62 @@ def test_support_beams_compute_weights_passthrough():
     def half_fn(surface_pts, curve_jax, dofs):
         return jnp.full(surface_pts.shape[0], 0.5)
 
-    sb     = _make_support_beams(n_base=2, fixed_clamp_fns=half_fn)
+    sb     = _make_support_beams(n_base=2, fixed_clamp_fns=half_fn,
+                                  fixed_clamp_options={'k_clamp': 1e9})
     curves = _make_curves(2)
     surf   = jnp.ones((n_surf, 3))
 
-    w = sb.compute_weights(0, surf, curves, None)
+    w_g, w_a = sb.compute_weights(0, surf, curves, None)
 
-    assert w.shape == (n_surf,)
-    assert jnp.allclose(w, 0.5), f"Expected 0.5 everywhere, got {w}"
+    assert w_g.shape == (n_surf,)
+    assert jnp.allclose(w_g, 0.5), f"Expected 0.5 everywhere, got {w_g}"
+    assert jnp.all(w_a == 0.0)
+
+
+def test_support_beams_stiffness_disjoint_regions():
+    """Disjoint clamp/beam regions yield stiffness in {0, k_clamp, k_attachment}."""
+    k_clamp = 1e9
+    k_attachment = 1e8
+    n_surf = 10
+
+    def ground_fn(surface_pts, curve_jax, dofs):
+        idx = jnp.arange(surface_pts.shape[0])
+        return (idx < n_surf // 2).astype(jnp.float64)
+
+    def beam_fn(surface_pts_beam_frame, dofs, sign_x, constants):
+        idx = jnp.arange(surface_pts_beam_frame.shape[0])
+        return (idx >= n_surf // 2).astype(jnp.float64)
+
+    sb = SupportBeams(
+        nfp=1, stellsym=False,
+        beam_options={'n_beam_cc': 0, 'n_beam_cf': 1, 'E': 200e9, 'nu': 0.3,
+                      'k_attachment': k_attachment},
+        n_base=1,
+        cross_section_fn=_constant_section_fn(),
+        attachment_fn=beam_fn,
+        fixed_clamp_fns=ground_fn,
+        fixed_clamp_options={'k_clamp': k_clamp},
+    )
+    quadpoints = jnp.linspace(0.0, 1.0, 8, endpoint=False)
+    dofs = jnp.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    curves = [CurveXYZFourierJAX(quadpoints, dofs, order=1)]
+    sdofs = {
+        'phis_start_cc':         [jnp.zeros(0)],
+        'phis_end_cc':           [jnp.zeros(0)],
+        'phis_start_cf':         [jnp.array([0.0])],
+        'x_foundation':          [jnp.array([[2.0, 0.0, 0.0]])],
+        'thetas_orientation_cc': [jnp.zeros(0)],
+        'thetas_orientation_cf': [jnp.array([0.0])],
+    }
+    surf = jnp.ones((n_surf, 3))
+
+    w_g, w_a = sb.compute_weights(0, surf, curves, sdofs)
+    k = sb.stiffness(w_g, w_a)
+    allowed = {0.0, k_clamp, k_attachment}
+    for val in np.asarray(k):
+        assert any(abs(val - a) < 1e-10 for a in allowed), (
+            f"unexpected stiffness {val}; expected one of {allowed}"
+        )
 
 
 # ============================================================================
@@ -517,8 +567,8 @@ def test_support_beams_end_side_gradient():
             CurveXYZFourierJAX(base_curves[1].quadpoints, dofs_end, base_curves[1].order),
         ]
         # coil_idx=1 receives node-2 of all CC beams from coil 0
-        w = sb.compute_weights(1, surf, curves_jax, sdofs)
-        return jnp.sum(w)
+        w_g, w_a = sb.compute_weights(1, surf, curves_jax, sdofs)
+        return jnp.sum(w_a)
 
     grad = jax.grad(weight_sum_end_coil)(base_curves[1].dofs)
 
@@ -608,8 +658,8 @@ def test_support_beams_ragged_solve_zero_rhs_yields_zero():
     assert jnp.allclose(u_s, 0.0, atol=1e-10)
 
 
-def test_support_beams_ragged_coupling_terms_bounds():
-    """coupling_terms() off-diagonal indices stay within the merged system."""
+def test_support_beams_ragged_coupling_pattern_bounds():
+    """coupling_pattern/values off-diagonal indices stay within the merged system."""
     n_base = 3
     sb     = _make_support_beams(
         n_base=n_base, n_beam_cc=_RAGGED_CC, n_beam_cf=_RAGGED_CF,
@@ -659,11 +709,11 @@ def test_ragged_support_dofs_ravel_roundtrip():
 
 
 # ============================================================================
-# 12. Staggered/monolithic consistency: _assemble_rhs == -K_sc @ u_mesh
+# 12. Monolithic consistency: _assemble_rhs == -K_sc @ u_mesh
 # ============================================================================
 
-def test_support_beams_rhs_matches_coupling_terms():
-    """The standalone-solve RHS equals -K_sc @ u_mesh from coupling_terms.
+def test_support_beams_rhs_matches_coupling_values():
+    """The standalone-solve RHS equals -K_sc @ u_mesh from coupling_values.
 
     Uses a stellsym model so that 'none', 'flip_half' and 'flip' endpoint
     transforms are all present — validating the Q factors and the torque
@@ -854,23 +904,14 @@ def test_support_beams_stellsym_vs_explicit_expansion():
     assert np.allclose(t2x, Q_half @ t2c, rtol=1e-8, atol=1e-15)
     assert np.allclose(r2x, Q_half @ r2c, rtol=1e-8, atol=1e-15)
 
-    # 5. Coil-0 Winkler weights and attach displacements agree.
+    # 5. Coil-0 grounded-clamp and beam-attachment weights agree.
     curves_sym = [CurveXYZFourierJAX(quadpoints, dofs0, 1)]
     curves_exp = [CurveXYZFourierJAX(quadpoints, dofs0, 1),
                   CurveXYZFourierJAX(quadpoints, dofs1, 1)]
-    w_sym = sb_sym.compute_weights(0, surf0, curves_sym, sdofs_sym)
-    w_exp = sb_exp.compute_weights(0, surf0, curves_exp, sdofs_exp)
-    assert np.allclose(np.asarray(w_sym), np.asarray(w_exp), rtol=1e-10)
-
-    ua_sym = sb_sym.compute_attach(0, surf0, curves_sym, sdofs_sym,
-                                   {'u_s': jnp.asarray(u_sym)})
-    ua_exp = sb_exp.compute_attach(0, surf0, curves_exp, sdofs_exp,
-                                   {'u_s': jnp.asarray(u_exp)})
-    assert np.allclose(np.asarray(ua_sym), np.asarray(ua_exp),
-                       rtol=1e-7, atol=1e-15), (
-        "coil-0 attach displacement differs between stellsym and explicit "
-        f"models: max diff = {np.abs(np.asarray(ua_sym) - np.asarray(ua_exp)).max():.3e}"
-    )
+    w_g_sym, w_a_sym = sb_sym.compute_weights(0, surf0, curves_sym, sdofs_sym)
+    w_g_exp, w_a_exp = sb_exp.compute_weights(0, surf0, curves_exp, sdofs_exp)
+    assert np.allclose(np.asarray(w_g_sym), np.asarray(w_g_exp), rtol=1e-10)
+    assert np.allclose(np.asarray(w_a_sym), np.asarray(w_a_exp), rtol=1e-10)
 
 
 # ============================================================================
@@ -1008,3 +1049,84 @@ def test_cf_beam_cantilever_analytic():
         f"analytic {delta_analytic:.4e}, "
         f"rel err = {abs(u[2]-delta_analytic)/delta_analytic:.2e}"
     )
+
+
+# ============================================================================
+# 14. endpoint_state / beam_displacement / beam_labels
+# ============================================================================
+
+def _solved_beam_state(n_base=2, n_cc=1, n_cf=1):
+    """Solve a small network with nonzero mesh displacement, for realism."""
+    sb     = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
+    curves = _make_curves(n_base)
+    sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
+    surf   = _make_surface_pts(n_base)
+    _, jxw = _make_interp_and_jxw(surf)
+    u_mesh = [jnp.ones((s.shape[0], 3)) * 1e-3 for s in surf]
+
+    result = sb.solve({
+        'curves_jax':          curves,
+        'support_dofs':        sdofs,
+        'surface_pts_by_coil': surf,
+        'u_mesh_by_coil':      u_mesh,
+        'jxw_by_coil':         jxw,
+    })
+    geom = sb.geometry(curves, sdofs)
+    return sb, geom, result['u_s']
+
+
+def test_endpoint_state_shape_and_roundtrip():
+    """endpoint_state reshapes u_s into (n_beams, 2, 6) without reordering."""
+    sb, _, u_s = _solved_beam_state()
+    es = sb.endpoint_state(u_s)
+    assert es.shape == (sb.n_beams_total, 2, 6)
+    u_beams = u_s.reshape(sb.n_beams_total, 12)
+    assert jnp.allclose(es[:, 0, :], u_beams[:, 0:6])
+    assert jnp.allclose(es[:, 1, :], u_beams[:, 6:12])
+
+
+def test_beam_displacement_boundary_values_match_nodal_translations():
+    """beam_displacement(geom, u_s, 0/1) reproduces raw nodal translations.
+
+    N1(0)=1 and all other shape functions vanish at xi=0 (symmetrically at
+    xi=1 for N3), so this must hold to machine precision, independent of the
+    solve — it is a property of the Hermite/linear shape functions alone.
+    """
+    sb, geom, u_s = _solved_beam_state()
+    u_beams = u_s.reshape(sb.n_beams_total, 12)
+
+    d0 = sb.beam_displacement(geom, u_s, 0.0)
+    d1 = sb.beam_displacement(geom, u_s, 1.0)
+    assert d0.shape == (sb.n_beams_total, 3)
+    assert d1.shape == (sb.n_beams_total, 3)
+    assert jnp.allclose(d0, u_beams[:, 0:3], atol=1e-10)
+    assert jnp.allclose(d1, u_beams[:, 6:9], atol=1e-10)
+
+
+def test_beam_displacement_array_xi_matches_scalar_at_endpoints():
+    """Vectorized xi input agrees with scalar calls at xi=0 and xi=1."""
+    sb, geom, u_s = _solved_beam_state()
+    xi = jnp.linspace(0.0, 1.0, 7)
+    d_arr = sb.beam_displacement(geom, u_s, xi)
+    assert d_arr.shape == (sb.n_beams_total, 7, 3)
+
+    d0 = sb.beam_displacement(geom, u_s, 0.0)
+    d1 = sb.beam_displacement(geom, u_s, 1.0)
+    assert jnp.allclose(d_arr[:, 0, :],  d0, atol=1e-10)
+    assert jnp.allclose(d_arr[:, -1, :], d1, atol=1e-10)
+
+
+def test_beam_labels_shapes_and_values():
+    """beam_labels() returns per-beam (coil_index, beam_type) arrays.
+
+    CC beams (type 0) precede CF beams (type 1) within each coil's block,
+    matching the ordering used throughout this module (see
+    ``_constant_section_fn`` / ``coo``).
+    """
+    n_base, n_cc, n_cf = 2, 1, 1
+    sb = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
+    coil_idx_arr, beam_type = sb.beam_labels()
+    assert coil_idx_arr.shape == (sb.n_beams_total,)
+    assert beam_type.shape == (sb.n_beams_total,)
+    assert np.array_equal(coil_idx_arr, np.array([0, 0, 1, 1]))
+    assert np.array_equal(beam_type,    np.array([0, 1, 0, 1]))

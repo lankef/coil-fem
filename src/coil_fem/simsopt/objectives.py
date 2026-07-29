@@ -71,14 +71,18 @@ class CoilFEMObjective(Optimizable):
             base_coils,
             nfp=plasma_surface.nfp,
             stellsym=plasma_surface.stellsym,
-            r_clamp=0.05,
+            fixed_clamp_options={
+                'k_clamp': 1e9,
+                'r_clamp': 0.05,
+                'n_clamp': 2,
+            },
         )
         Jstress = CoilFEMObjective(
             coil_support,
             metrics=['max_von_mises_lse'],
             metric_weights=[1.0],
             mesh_options={'shape': 'rect', 'w1': 0.02, 'w2': 0.02},
-            problem_options={'winkler_k': 1e9},
+            problem_options={'solver': 'umfpack'},
         )
         JTotal = JF + STRESS_WEIGHT * Jstress
 
