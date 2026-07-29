@@ -123,13 +123,13 @@ def _generate_k_clamp(base_coils, fixed_clamp_options):
             )
         mean_arclengths = np.mean(
             # This calculates the total length of each coil
-            [jnp.mean(c.incremental_arclength()) for c in base_coils]
+            [jnp.mean(c.curve.incremental_arclength()) for c in base_coils]
         )
         L_coil = mean_arclengths / np.pi / 2
         k_clamp = estimate_k(L=L_coil, E=E_coil, eps=eps_clamp)
         print(
             "k_clamp is not provided. Based on the coil's stiffness, "
-            f"the auto-generated value is {k_clamp} N/m3."
+            f"the auto-generated value is      {k_clamp:.4e} N/m3."
         )
         return k_clamp
 
@@ -445,9 +445,13 @@ _REQUIRED_BEAM_OPTIONS = (
     'n_beam_cf',
     'E',
     'nu',
-    'k_attachment',
     'cross_section_type',
     'attachment_type',
+)
+# Optional; auto-generated from beam stiffness when omitted.
+_OPTIONAL_BEAM_OPTIONS = (
+    'k_attachment',
+    'eps_attachment',
 )
 
 
@@ -676,8 +680,13 @@ class CoilSupportBeams(CoilSupport):
 
         # ── Load the remaining beam options ───────────────────────────────────
         beam_option_keys_req = _REQUIRED_BEAM_OPTIONS + cross_section_option_keys
+        beam_option_keys_allowed = (
+            beam_option_keys_req + _OPTIONAL_BEAM_OPTIONS
+        )
         missing_beam_options = [k for k in beam_option_keys_req if k not in beam_options]
-        unrecognized_beam_options = [k for k in beam_options if k not in beam_option_keys_req]
+        unrecognized_beam_options = [
+            k for k in beam_options if k not in beam_option_keys_allowed
+        ]
         if missing_beam_options:
             raise ValueError(
                 f"Missing keys in beam_options: {missing_beam_options}."
@@ -689,10 +698,10 @@ class CoilSupportBeams(CoilSupport):
 
         # Calculating beam options
         if 'k_attachment' not in beam_options:
-            eps_attachment = beam_options.get('eps_attachment', 1e-4)
-            E_beams = fixed_clamp_options['E']
+            eps_attachment = beam_options.get('eps_attachment', 1e-3)
+            E_beams = beam_options['E']
             # [n_coil, 3]
-            centers = np.array([curve_center(c) for c in self.base_curves])
+            centers = np.array([curve_center(c.curve) for c in base_coils])
             # [n_coil - 1]
             # The scale-length of coil-coil beams are the inter-coil distance.
             displacements = np.linalg.norm(centers[1:] - centers[:-1]+1e-8, axis=-1)
@@ -704,7 +713,7 @@ class CoilSupportBeams(CoilSupport):
             beam_options = {**beam_options, 'k_attachment': float(k_attachment)}
             print(
                 "k_attachment is not provided. Based on the coil's stiffness, "
-                f"the auto-generated value is {k_attachment} N/m3."
+                f"the auto-generated value is {k_attachment:.4e} N/m3."
             )
 
         # ── Optional fixed-sphere Winkler clamps ──────────────────────────────
