@@ -108,8 +108,8 @@ class Support:
         """No-op; returns empty state dict."""
         return {}
 
-    def geometry(self, curves_jax: list, support_dofs: dict) -> dict | None:
-        """Precomputed geometry bundle for this support; ``None`` for uncoupled supports.
+    def beam_geometry(self, curves_jax: list, support_dofs: dict) -> dict | None:
+        """Precomputed beam geometry bundle; ``None`` for uncoupled supports.
 
         Subclasses that benefit from single-pass geometry computation (e.g.
         :class:`~coil_fem.coupling.SupportBeams`) override this method to
@@ -221,7 +221,7 @@ class Support:
         surface_pts_by_coil : list or None
             Per-coil surface query points.
         geom : dict or None
-            Pre-computed geometry bundle from :meth:`geometry`.
+            Pre-computed geometry bundle from :meth:`beam_geometry`.
         jxw_by_coil : list or None
             Per-coil surface JxW area measures.
         beam_endpoints : list or None

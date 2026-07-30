@@ -357,7 +357,7 @@ def make_merged_solve(
         jxw_list = _surf_jxw(pts)
         curves   = _make_curves(bcd)
         # Compute beam geometry once; reuse for support_values and coupling_values.
-        geom = support.geometry(curves, sdofs)
+        geom = support.beam_geometry(curves, sdofs)
         V_blocks, f_blocks = [], []
         for i, pipeline in enumerate(pipelines):
             p_params = _coil_params(i, pts, bf, k)

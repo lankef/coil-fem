@@ -744,7 +744,7 @@ class CoilFEM:
         # When coupled, compute beam geometry once and reuse for weights.
         support_geom = None
         if self.support.is_coupled:
-            support_geom = self.support.geometry(
+            support_geom = self.support.beam_geometry(
                 curves_jax_list, base_support_dofs or {}
             )
 
@@ -1117,7 +1117,7 @@ class CoilFEM:
             :meth:`~coil_fem.coupling.Support.compute_weights`.
         geom : dict or None
             Pre-computed beam geometry from
-            :meth:`~coil_fem.coupling.Support.geometry`.
+            :meth:`~coil_fem.coupling.Support.beam_geometry`.
         at : ``'quads'`` or ``'nodes'``
             Point set at which to evaluate the weight function.  ``'quads'``
             (default) returns ``(n_surface_quads,)`` arrays for the solve;
@@ -1251,7 +1251,7 @@ class CoilFEM:
             # Cell labels: beam_type (CC=0, CF=1) and originating coil index.
             coil_idx_arr, beam_type = self.support.beam_labels()
 
-            geom = self.support._beam_geometry(curves_jax, base_support_dofs)
+            geom = self.support.beam_geometry(curves_jax, base_support_dofs)
             L = onp.asarray(geom['L'], dtype=onp.float64)
 
             beam_path = os.path.join(out_dir, f"{prefix}_beams.vtu")
@@ -1660,7 +1660,7 @@ class CoilFEM:
         if (base_support_dofs is not None and result['u_s'] is not None
                 and hasattr(self.support, 'beam_displacement')
                 and self.support.n_beams_total > 0):
-            geom = self.support.geometry(curves_jax, base_support_dofs)
+            geom = self.support.beam_geometry(curves_jax, base_support_dofs)
             xi = jnp.linspace(0.0, 1.0, n_sub + 1)
             disp = onp.asarray(
                 self.support.beam_displacement(geom, result['u_s'], xi),

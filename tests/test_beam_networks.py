@@ -488,7 +488,7 @@ def test_support_beams_transform_matrices_and_reflection_planes():
     # group n_base-1 -> flip_half(coil n-1), group n_base -> flip(coil 0).
     sdofs  = _make_support_dofs(n_base, 1, 1, stellsym=True)
     curves = _make_curves(n_base)
-    geom   = sb._beam_geometry(curves, sdofs)
+    geom   = sb.beam_geometry(curves, sdofs)
 
     phi_e = sdofs['phis_end_cc'][n_base - 1][0]
     x_e_expected = Q_half @ np.asarray(curves[n_base - 1].gamma_eval(phi_e))
@@ -765,10 +765,9 @@ def test_support_beams_rhs_matches_coupling_values():
     f_expected = -K_sc @ u_c
 
     # RHS from the standalone-solve path (uses same JxW=1 fixture).
-    geom   = sb._beam_geometry(curves, sdofs)
-    gamma3 = sb._direction_cosine_matrices(geom, sdofs)
+    geom   = sb.beam_geometry(curves, sdofs)
     beps   = sb._endpoint_weights_and_r(
-        curves, geom, gamma3, sdofs, surf, jxw_by_coil=jxw,
+        curves, geom, geom['gamma3'], sdofs, surf, jxw_by_coil=jxw,
     )
     f_rhs  = np.asarray(sb._assemble_rhs(geom, beps, u_mesh))
 
@@ -1083,7 +1082,7 @@ def _solved_beam_state(n_base=2, n_cc=1, n_cf=1):
         'u_mesh_by_coil':      u_mesh,
         'jxw_by_coil':         jxw,
     })
-    geom = sb.geometry(curves, sdofs)
+    geom = sb.beam_geometry(curves, sdofs)
     return sb, geom, result['u_s']
 
 

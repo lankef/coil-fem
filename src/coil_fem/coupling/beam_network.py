@@ -211,7 +211,7 @@ class SupportBeams(Support):
     * Local DOF ordering per beam follows Figure 4.6 of
       ``docs/theory/bisymbeam.rst``:
       ``[u1, v1, w1, θx1, θy1, θz1, u2, v2, w2, θx2, θy2, θz2]``.
-    * Beam local frame (see :meth:`_direction_cosine_matrices`):
+    * Beam local frame (built in :meth:`beam_geometry`):
       ``x_local`` is the beam axis (unit vector node1 → node2);
       ``z_local`` is ``cross(x_local, t_coil_start)`` — the direction normal
       to both the beam axis and the coil's tangent at the node-1 attachment
@@ -345,7 +345,7 @@ class SupportBeams(Support):
         # already covered by the outer JIT of the monolithic driver / solve,
         # and jitting them independently trips up on the ragged EndpointSpec
         # list built inside `_endpoint_specs`.
-        self.geometry        = jax.jit(self.geometry)
+        self.beam_geometry   = jax.jit(self.beam_geometry)
         self.solve           = jax.jit(self.solve)
         self.compute_weights = jax.jit(self.compute_weights, static_argnums=(0,))
 
@@ -570,195 +570,6 @@ class SupportBeams(Support):
             return pts @ Q          # row-vector form of Q^T @ p
         return pts @ Q.T            # row-vector form of Q @ p
 
-    def _beam_geometry(
-        self,
-        curves: list[CurveXYZFourierJAX],
-        support_dofs: dict,
-    ) -> dict:
-        """Compute per-beam rest-state geometry arrays.
-
-        All outputs are traced through ``curves`` and ``support_dofs`` and
-        are therefore differentiable w.r.t. coil DOFs,
-        ``phis_start_cc``, ``phis_end_cc``, ``phis_start_cf``,
-        ``x_foundation``, etc.
-
-        Parameters
-        ----------
-        curves : list[CurveXYZFourierJAX]
-            Traced base-coil curve objects.
-        support_dofs : dict
-            Must contain ``phis_start_cc``, ``phis_end_cc``, ``phis_start_cf``,
-            ``x_foundation`` (as specified in the class docstring).
-
-        Returns
-        -------
-        dict with keys:
-
-        * ``'x_start'``     : (N_beams, 3) — endpoint at node 1 (coil side, always).
-        * ``'x_end'``       : (N_beams, 3) — endpoint at node 2.
-        * ``'t_beam'``      : (N_beams, 3) — unit beam tangent (node1→node2).
-        * ``'L'``           : (N_beams,)   — beam length.
-        * ``'t_coil_start'``: (N_beams, 3) — coil tangent at node-1 attachment phi.
-        * ``'t_coil_end'``  : (N_beams, 3) — coil tangent at node-2 for CC beams;
-          zero vector for CF beams (foundation side has no coil tangent).
-        """
-        phis_start_cc = support_dofs['phis_start_cc']       # list[g] -> (n_beam_cc[g],)
-        phis_end_cc   = support_dofs['phis_end_cc']         # list[g] -> (n_beam_cc[g],)
-        phis_start_cf = support_dofs['phis_start_cf']       # list[i] -> (n_beam_cf[i],)
-        x_foundation = support_dofs['x_foundation']       # list[i] -> (n_beam_cf[i], 3)
-
-        # Each element appended here is a (n_beams_in_block, 3) array; lists
-        # are assembled with jnp.concatenate at the end.  This issues one
-        # gamma_eval per (curve, group) pair instead of one per beam.
-        x_start_list, x_end_list = [], []
-        t_coil_start_list, t_coil_end_list = [], []
-
-        def append_cc_group(g):
-            """Batch-append the CC beams of group ``g``."""
-            n_g = self.n_beam_cc[g]
-            if n_g == 0:
-                return
-            start_idx, end_idx, end_tfm = self._cc_groups[g]
-            curve_s = curves[start_idx]
-            curve_e = curves[end_idx]
-            phi_s_g = phis_start_cc[g]                            # (n_g,)
-            phi_e_g = phis_end_cc[g]                              # (n_g,)
-
-            x_s_g   = curve_s.gamma_eval(phi_s_g)                # (n_g, 3)
-            x_e_raw = curve_e.gamma_eval(phi_e_g)                # (n_g, 3)
-            x_e_g   = self._apply_end_transform(x_e_raw, end_tfm)
-
-            t_cs_raw = curve_s.gamma_eval(phi_s_g, diff_order=1) # (n_g, 3)
-            t_cs_g   = t_cs_raw / (
-                jnp.linalg.norm(t_cs_raw, axis=1, keepdims=True) + 1e-300
-            )
-
-            t_ce_raw = curve_e.gamma_eval(phi_e_g, diff_order=1) # (n_g, 3)
-            t_ce_raw = self._apply_end_transform(t_ce_raw, end_tfm)
-            t_ce_g   = t_ce_raw / (
-                jnp.linalg.norm(t_ce_raw, axis=1, keepdims=True) + 1e-300
-            )
-
-            x_start_list.append(x_s_g)
-            x_end_list.append(x_e_g)
-            t_coil_start_list.append(t_cs_g)
-            t_coil_end_list.append(t_ce_g)
-
-        for i, curve_i in enumerate(curves):
-            # ── CC beams of group i (start coil = i) ─────────────────────────
-            append_cc_group(i)
-
-            # ── CF beams for coil i ──────────────────────────────────────────
-            n_cf_i = self.n_beam_cf[i]
-            if n_cf_i > 0:
-                phi_s_cf = phis_start_cf[i]                           # (n_cf_i,)
-                x_s_cf   = curve_i.gamma_eval(phi_s_cf)              # (n_cf_i, 3)
-                t_cs_raw = curve_i.gamma_eval(phi_s_cf, diff_order=1) # (n_cf_i, 3)
-                t_cs_cf  = t_cs_raw / (
-                    jnp.linalg.norm(t_cs_raw, axis=1, keepdims=True) + 1e-300
-                )
-
-                x_start_list.append(x_s_cf)
-                x_end_list.append(x_foundation[i])                   # (n_cf_i, 3)
-                t_coil_start_list.append(t_cs_cf)
-                # CF: no coil tangent at foundation side → zero placeholder
-                t_coil_end_list.append(jnp.zeros((n_cf_i, 3)))
-
-        # ── Stellsym wrap group: coil 0 -> its phi = 0 image ─────────────────
-        if self.stellsym:
-            append_cc_group(self.n_base)
-
-        x_start      = jnp.concatenate(x_start_list,      axis=0)  # (N, 3)
-        x_end        = jnp.concatenate(x_end_list,        axis=0)  # (N, 3)
-        t_coil_start = jnp.concatenate(t_coil_start_list, axis=0)  # (N, 3)
-        t_coil_end   = jnp.concatenate(t_coil_end_list,   axis=0)  # (N, 3)
-
-        diff = x_end - x_start                             # (N, 3)
-        L    = jnp.linalg.norm(diff, axis=1)              # (N,)
-        t_beam = diff / (L[:, None] + 1e-300)             # (N, 3)
-
-        return {
-            'x_start':      x_start,
-            'x_end':        x_end,
-            't_beam':       t_beam,
-            'L':            L,
-            't_coil_start': t_coil_start,
-            't_coil_end':   t_coil_end,
-        }
-
-    def _direction_cosine_matrices(
-        self,
-        geom: dict,
-        support_dofs: dict,
-    ) -> jax.Array:
-        """Compute per-beam 3×3 direction-cosine matrices.
-
-        The beam local frame is defined as:
-
-        * ``x_local = t_beam``  (unit vector node1→node2).
-        * reference direction ``ref = cross(t_beam, t_coil_start)``
-          (normal to the beam in the plane of beam + coil-start tangent).
-        * ``z_local = normalize(Rodrigues(t_beam, thetas_orientation) @ ref)``
-          — ``thetas_orientation`` rolls the cross-section about the beam axis.
-        * ``y_local = cross(z_local, x_local)``
-
-        Parameters
-        ----------
-        geom : dict
-            Output of :meth:`_beam_geometry`.
-        support_dofs : dict
-            Must contain ``thetas_orientation_cc`` and ``thetas_orientation_cf``.
-
-        Returns
-        -------
-        jax.Array, shape ``(N_beams, 3, 3)``
-            Column-major: ``Gamma[b] = [x_local | y_local | z_local]``.
-        """
-        theta_cc = support_dofs['thetas_orientation_cc']  # list[g] -> (n_beam_cc[g],)
-        theta_cf = support_dofs['thetas_orientation_cf']  # list[i] -> (n_beam_cf[i],)
-
-        t_beam = geom['t_beam']           # (N, 3)
-        t_coil = geom['t_coil_start']     # (N, 3)
-
-        # Flatten theta angles into (N,) matching the beam ordering (per coil:
-        # cc group i then cf coil i; stellsym wrap group appended last).
-        # One concatenate per group/coil instead of one append per beam.
-        theta_parts = []
-        for i in range(self.n_base):
-            if self.n_beam_cc[i] > 0:
-                theta_parts.append(theta_cc[i])
-            if self.n_beam_cf[i] > 0:
-                theta_parts.append(theta_cf[i])
-        if self.stellsym and self.n_beam_cc[self.n_base] > 0:
-            theta_parts.append(theta_cc[self.n_base])
-        thetas = jnp.concatenate(theta_parts, axis=0)  # (N,)
-
-        def single_dcm(t_b, t_c, theta):
-            # Reference direction: cross(beam-tangent, coil-tangent-at-start)
-            ref = jnp.cross(t_b, t_c)
-            ref_norm = jnp.linalg.norm(ref)
-            # Guard against parallel tangents: fall back to a global-z reference
-            ref = jnp.where(
-                ref_norm > 1e-9,
-                ref / ref_norm,
-                jnp.array([0., 0., 1.]) - t_b * t_b[2],  # projection of z onto plane ⊥ t_b
-            )
-            ref = ref / (jnp.linalg.norm(ref) + 1e-300)
-
-            # Roll the reference direction about the beam axis by theta
-            R = _rodrigues(t_b, theta)
-            z_local = R @ ref
-            z_local = z_local / (jnp.linalg.norm(z_local) + 1e-300)
-
-            x_local = t_b
-            y_local = jnp.cross(z_local, x_local)
-            y_local = y_local / (jnp.linalg.norm(y_local) + 1e-300)
-
-            # Columns: x_local, y_local, z_local
-            return jnp.stack([x_local, y_local, z_local], axis=1)  # (3, 3)
-
-        return jax.vmap(single_dcm)(t_beam, t_coil, thetas)  # (N, 3, 3)
-
     def _endpoint_specs(
         self,
         geom: dict,
@@ -774,9 +585,9 @@ class SupportBeams(Support):
         Parameters
         ----------
         geom : dict
-            Output of :meth:`_beam_geometry`.
+            Output of :meth:`beam_geometry`.
         gamma3 : jax.Array, shape ``(N_beams, 3, 3)``
-            Output of :meth:`_direction_cosine_matrices`.
+            ``geom['gamma3']``.
 
         Returns
         -------
@@ -1012,38 +823,149 @@ class SupportBeams(Support):
     # Public geometry helper
     # ============================================================================
 
-    def geometry(
+    def beam_geometry(
         self,
         curves_jax: list,
         support_dofs: dict,
     ) -> dict:
         """Compute all per-beam geometry arrays in one traced call.
 
-        Combines :meth:`_beam_geometry` (endpoint positions, lengths,
-        tangents) and :meth:`_direction_cosine_matrices` (DCMs) so that
-        callers can pass the result to :meth:`compute_weights`,
-        :meth:`support_values`, and :meth:`coupling_values` as the ``geom``
-        keyword argument,
-        avoiding redundant re-computation.
+        Builds rest chords (endpoints, lengths, tangents) and per-beam
+        direction-cosine matrices ``gamma3``.  Callers should compute this
+        once and pass the result to :meth:`compute_weights`,
+        :meth:`support_values`, and :meth:`coupling_values` as ``geom``.
 
         Parameters
         ----------
         curves_jax : list[CurveXYZFourierJAX]
             Traced base-coil centreline objects.
         support_dofs : dict
-            Traced support DOF pytree.
+            Traced support DOF pytree (attachment phis, ``x_foundation``,
+            ``thetas_orientation_*``, …).
 
         Returns
         -------
-        dict
-            All keys from :meth:`_beam_geometry` plus:
+        dict with keys:
 
-            * ``'gamma3'`` : jax.Array, shape ``(N_beams, 3, 3)`` — per-beam
-              direction-cosine matrices (columns: local x/y/z axes).
+        * ``'x_start'``     : (N_beams, 3) — endpoint at node 1 (coil side).
+        * ``'x_end'``       : (N_beams, 3) — endpoint at node 2.
+        * ``'t_beam'``      : (N_beams, 3) — unit beam tangent (node1→node2).
+        * ``'L'``           : (N_beams,)   — centerline chord length.
+        * ``'t_coil_start'``: (N_beams, 3) — coil tangent at node-1 attach phi.
+        * ``'t_coil_end'``  : (N_beams, 3) — coil tangent at node-2 for CC;
+          zeros for CF.
+        * ``'gamma3'``      : (N_beams, 3, 3) — DCMs (columns: local x/y/z).
         """
-        geom = self._beam_geometry(curves_jax, support_dofs)
-        geom['gamma3'] = self._direction_cosine_matrices(geom, support_dofs)
-        return geom
+        phis_start_cc = support_dofs['phis_start_cc']
+        phis_end_cc   = support_dofs['phis_end_cc']
+        phis_start_cf = support_dofs['phis_start_cf']
+        x_foundation  = support_dofs['x_foundation']
+
+        # Each element appended here is a (n_beams_in_block, 3) array; lists
+        # are assembled with jnp.concatenate at the end.  This issues one
+        # gamma_eval per (curve, group) pair instead of one per beam.
+        x_start_list, x_end_list = [], []
+        t_coil_start_list, t_coil_end_list = [], []
+
+        def append_cc_group(g):
+            """Batch-append the CC beams of group ``g``."""
+            n_g = self.n_beam_cc[g]
+            if n_g == 0:
+                return
+            start_idx, end_idx, end_tfm = self._cc_groups[g]
+            curve_s = curves_jax[start_idx]
+            curve_e = curves_jax[end_idx]
+            phi_s_g = phis_start_cc[g]
+            phi_e_g = phis_end_cc[g]
+
+            x_s_g   = curve_s.gamma_eval(phi_s_g)
+            x_e_raw = curve_e.gamma_eval(phi_e_g)
+            x_e_g   = self._apply_end_transform(x_e_raw, end_tfm)
+
+            t_cs_raw = curve_s.gamma_eval(phi_s_g, diff_order=1)
+            t_cs_g   = t_cs_raw / (
+                jnp.linalg.norm(t_cs_raw, axis=1, keepdims=True) + 1e-300
+            )
+
+            t_ce_raw = curve_e.gamma_eval(phi_e_g, diff_order=1)
+            t_ce_raw = self._apply_end_transform(t_ce_raw, end_tfm)
+            t_ce_g   = t_ce_raw / (
+                jnp.linalg.norm(t_ce_raw, axis=1, keepdims=True) + 1e-300
+            )
+
+            x_start_list.append(x_s_g)
+            x_end_list.append(x_e_g)
+            t_coil_start_list.append(t_cs_g)
+            t_coil_end_list.append(t_ce_g)
+
+        for i, curve_i in enumerate(curves_jax):
+            append_cc_group(i)
+
+            n_cf_i = self.n_beam_cf[i]
+            if n_cf_i > 0:
+                phi_s_cf = phis_start_cf[i]
+                x_s_cf   = curve_i.gamma_eval(phi_s_cf)
+                t_cs_raw = curve_i.gamma_eval(phi_s_cf, diff_order=1)
+                t_cs_cf  = t_cs_raw / (
+                    jnp.linalg.norm(t_cs_raw, axis=1, keepdims=True) + 1e-300
+                )
+
+                x_start_list.append(x_s_cf)
+                x_end_list.append(x_foundation[i])
+                t_coil_start_list.append(t_cs_cf)
+                t_coil_end_list.append(jnp.zeros((n_cf_i, 3)))
+
+        if self.stellsym:
+            append_cc_group(self.n_base)
+
+        x_start      = jnp.concatenate(x_start_list,      axis=0)
+        x_end        = jnp.concatenate(x_end_list,        axis=0)
+        t_coil_start = jnp.concatenate(t_coil_start_list, axis=0)
+        t_coil_end   = jnp.concatenate(t_coil_end_list,   axis=0)
+
+        diff   = x_end - x_start
+        L      = jnp.linalg.norm(diff, axis=1)
+        t_beam = diff / (L[:, None] + 1e-300)
+
+        # Direction-cosine matrices (local x/y/z as columns).
+        theta_cc = support_dofs['thetas_orientation_cc']
+        theta_cf = support_dofs['thetas_orientation_cf']
+        theta_parts = []
+        for i in range(self.n_base):
+            if self.n_beam_cc[i] > 0:
+                theta_parts.append(theta_cc[i])
+            if self.n_beam_cf[i] > 0:
+                theta_parts.append(theta_cf[i])
+        if self.stellsym and self.n_beam_cc[self.n_base] > 0:
+            theta_parts.append(theta_cc[self.n_base])
+        thetas = jnp.concatenate(theta_parts, axis=0)
+
+        def single_dcm(t_b, t_c, theta):
+            ref = jnp.cross(t_b, t_c)
+            ref_norm = jnp.linalg.norm(ref)
+            # Guard against parallel tangents: fall back to a global-z reference
+            ref = jnp.where(
+                ref_norm > 1e-9,
+                ref / ref_norm,
+                jnp.array([0., 0., 1.]) - t_b * t_b[2],
+            )
+            ref = ref / (jnp.linalg.norm(ref) + 1e-300)
+            z_local = _rodrigues(t_b, theta) @ ref
+            z_local = z_local / (jnp.linalg.norm(z_local) + 1e-300)
+            x_local = t_b
+            y_local = jnp.cross(z_local, x_local)
+            y_local = y_local / (jnp.linalg.norm(y_local) + 1e-300)
+            return jnp.stack([x_local, y_local, z_local], axis=1)
+
+        return {
+            'x_start':      x_start,
+            'x_end':        x_end,
+            't_beam':       t_beam,
+            'L':            L,
+            't_coil_start': t_coil_start,
+            't_coil_end':   t_coil_end,
+            'gamma3':       jax.vmap(single_dcm)(t_beam, t_coil_start, thetas),
+        }
 
     # ============================================================================
     # Support-ABC hook implementations
@@ -1075,7 +997,7 @@ class SupportBeams(Support):
             All base-coil centreline curves (traced).
         dofs : dict or None
         geom : dict or None
-            Pre-computed geometry dict from :meth:`geometry`.  Computed
+            Pre-computed geometry dict from :meth:`beam_geometry`.  Computed
             internally when ``None``.
 
         Returns
@@ -1090,9 +1012,8 @@ class SupportBeams(Support):
             )
 
         if geom is None:
-            geom = self._beam_geometry(curves_jax, dofs)
-        gamma3 = geom['gamma3'] if 'gamma3' in geom else self._direction_cosine_matrices(geom, dofs)
-        _, specs_by_coil = self._endpoint_specs(geom, gamma3)
+            geom = self.beam_geometry(curves_jax, dofs)
+        _, specs_by_coil = self._endpoint_specs(geom, geom['gamma3'])
 
         w_a = jnp.zeros(surface_pts.shape[0])
         for spec in specs_by_coil.get(coil_idx, []):
@@ -1131,7 +1052,7 @@ class SupportBeams(Support):
         -------
         np.ndarray, shape ``(N_beams, 2, 3)``
         """
-        geom = self._beam_geometry(curves_jax, dofs)
+        geom = self.beam_geometry(curves_jax, dofs)
         x_s = onp.asarray(geom['x_start'], dtype=onp.float64)
         x_e = onp.asarray(geom['x_end'],   dtype=onp.float64)
         return onp.stack([x_s, x_e], axis=1)
@@ -1201,7 +1122,7 @@ class SupportBeams(Support):
         Parameters
         ----------
         geom : dict
-            Output of :meth:`geometry` (needs ``'gamma3'`` and ``'L'``).
+            Output of :meth:`beam_geometry` (needs ``'gamma3'`` and ``'L'``).
         u_s : jax.Array, shape ``(n_support_dofs,)``
             Output of :meth:`solve`.
         xi : jax.Array or float
@@ -1373,9 +1294,8 @@ class SupportBeams(Support):
             n_fq)`` from
             :meth:`~coil_fem.problems.LinearElasticity3D.surface_jxw`.
         geom : dict or None
-            Pre-computed beam geometry dict (output of :meth:`_beam_geometry`
-            and optionally including ``'gamma3'``).  If ``None``, geometry is
-            computed internally.
+            Pre-computed beam geometry from :meth:`beam_geometry`.  If
+            ``None``, computed internally.
 
         Returns
         -------
@@ -1383,8 +1303,8 @@ class SupportBeams(Support):
         V_sc : jax.Array, shape ``(nnz_sc,)``
         """
         if geom is None:
-            geom = self._beam_geometry(curves_jax, support_dofs)
-        gamma3 = geom['gamma3'] if 'gamma3' in geom else self._direction_cosine_matrices(geom, support_dofs)
+            geom = self.beam_geometry(curves_jax, support_dofs)
+        gamma3 = geom['gamma3']
         specs, _ = self._endpoint_specs(geom, gamma3)
 
         V_cs_parts: list = []
@@ -1454,10 +1374,10 @@ class SupportBeams(Support):
         Parameters
         ----------
         curves : list[CurveXYZFourierJAX]
-        geom : dict  — output of :meth:`_beam_geometry`.
+        geom : dict  — output of :meth:`beam_geometry`.
         gamma3 : jax.Array, shape ``(N_beams, 3, 3)``
-            Output of :meth:`_direction_cosine_matrices`, passed in from
-            :meth:`support_values` so it is computed only once.
+            ``geom['gamma3']``, passed in from :meth:`support_values` so it
+            is not re-fetched inside the loop.
         support_dofs : dict
         surface_pts_by_coil : list[jax.Array] or None
             One ``(n_surf_i, 3)`` array per base coil.  During solves these
@@ -1656,7 +1576,7 @@ class SupportBeams(Support):
             hard-clamp contribution regardless (see
             :meth:`_endpoint_weights_and_r`).
         geom : dict or None
-            Pre-computed geometry dict from :meth:`geometry`.  Computed
+            Pre-computed geometry dict from :meth:`beam_geometry`.  Computed
             internally when ``None``.
         jxw_by_coil : list[jax.Array] or None
             Per-coil Jacobian-weighted quadrature area measure, forwarded to
@@ -1674,8 +1594,8 @@ class SupportBeams(Support):
             Stiffness values ``K_ss[I[k], J[k]]`` (traced).
         """
         if geom is None:
-            geom = self._beam_geometry(curves_jax, support_dofs)
-        Gamma_3 = geom['gamma3'] if 'gamma3' in geom else self._direction_cosine_matrices(geom, support_dofs)
+            geom = self.beam_geometry(curves_jax, support_dofs)
+        Gamma_3 = geom['gamma3']
 
         A_all, Iy_all, Iz_all, J_all = self.cross_section_fn(support_dofs)
         A  = jnp.concatenate([jnp.atleast_1d(a) for a in A_all])
@@ -1711,7 +1631,7 @@ class SupportBeams(Support):
         Parameters
         ----------
         geom : dict
-            Output of :meth:`_beam_geometry`.
+            Output of :meth:`beam_geometry`.
         beam_endpoints : list
             Output of :meth:`_endpoint_weights_and_r`.
         u_mesh_by_coil : list[jax.Array] or None
@@ -1804,7 +1724,7 @@ class SupportBeams(Support):
         jxw_by_coil         = inputs.get('jxw_by_coil', None)
 
         # Use pre-computed geometry from driver when available, else compute.
-        geom = inputs.get('geom') or self.geometry(curves_jax, support_dofs)
+        geom = inputs.get('geom') or self.beam_geometry(curves_jax, support_dofs)
         gamma3 = geom['gamma3']
 
         # Compute endpoint weights/moment-arms once; reuse for both the K_ss

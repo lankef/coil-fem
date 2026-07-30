@@ -186,7 +186,7 @@ Two kinds of data bundles appear in this codebase; use the correct container for
 
 **Traced bundles** (vary per optimisation step, flow through JAX autodiff):
 - Use plain `dict` or `NamedTuple`.  Both are JAX pytrees.
-- Example: `geom` dict returned by `SupportBeams.geometry(curves_jax, support_dofs)` contains endpoint positions, lengths, and DCMs — all traced arrays.
+- Example: `geom` dict returned by `SupportBeams.beam_geometry(curves_jax, support_dofs)` contains endpoint positions, lengths, and DCMs — all traced arrays.
 - Example: `support_dofs` passed to solvers and metrics.
 
 **Static bundles** (fixed at construction, never traced):
