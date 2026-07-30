@@ -111,7 +111,14 @@ def _generate_k_clamp(base_coils, fixed_clamp_options):
     if 'k_clamp' in fixed_clamp_options.keys():
         return fixed_clamp_options['k_clamp']
     else:
-        eps_clamp = fixed_clamp_options.get('eps_clamp', 1e-3)
+        # The beams can bend and therefore can numerically
+        # tolerate a much higher regularization factor than
+        # the fixed clamps. A higher factor by at least 2^4 is 
+        # needed because beams can be 2x more narrow than coils.
+        # TODO: it may be possible to change this factor 
+        # dynamically in an optimization based on the 
+        # support beam thickness.
+        eps_clamp = fixed_clamp_options.get('eps_clamp', 1e-5)
         try:
             E_coil = fixed_clamp_options['E_coil']
         except:
