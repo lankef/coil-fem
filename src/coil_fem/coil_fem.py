@@ -363,7 +363,7 @@ class CoilFEM:
 
         Reads ``problem.I`` / ``problem.J`` directly from each pipeline (no
         probe Jacobian assembly), merges with the support K_ss pattern from
-        ``support._coo_I`` / ``support._coo_J``, and the coupling pattern from
+        ``support.support_pattern``, and the coupling pattern from
         ``support.coupling_pattern``.  Builds the forward and (when
         ``solver == 'cudss'``) adjoint CSR patterns and cuDSS solver handles,
         then creates the ``custom_vjp``-wrapped ``merged_solve`` via
@@ -408,11 +408,12 @@ class CoilFEM:
             I_blocks.append(I_cc)
             J_blocks.append(J_cc)
 
-        # Support K_ss block: static indices pre-built at SupportBeams construction.
-        I_ss = np.asarray(self.support._coo_I, dtype=np.int32) + support_dof_offset
-        J_ss = np.asarray(self.support._coo_J, dtype=np.int32) + support_dof_offset
-        I_blocks.append(I_ss)
-        J_blocks.append(J_ss)
+        # Support K_ss block: local pattern from support, shifted to global DOFs.
+        I_ss_local, J_ss_local = self.support.support_pattern()
+        I_ss_pat = np.asarray(I_ss_local, dtype=np.int32) + support_dof_offset
+        J_ss_pat = np.asarray(J_ss_local, dtype=np.int32) + support_dof_offset
+        I_blocks.append(I_ss_pat)
+        J_blocks.append(J_ss_pat)
 
         # Coupling K_cs / K_sc: pure numpy, no tracing.
         I_cs_pat, J_cs_pat, I_sc_pat, J_sc_pat = self.support.coupling_pattern(
@@ -492,6 +493,8 @@ class CoilFEM:
             surface_node_indices_by_coil=tuple(surface_node_indices_by_coil),
             curve_qps=curve_qps,
             curve_orders=curve_orders,
+            I_ss_pat=I_ss_pat,
+            J_ss_pat=J_ss_pat,
             I_cs_pat=I_cs_pat if has_cs else None,
             J_cs_pat=J_cs_pat if has_cs else None,
             I_sc_pat=I_sc_pat if has_sc else None,

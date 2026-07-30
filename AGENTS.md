@@ -227,7 +227,8 @@ The coupling between coil FEM and support structures is split across three layer
 | `stiffness(w_g, w_a)` | concrete | Per-point Winkler stiffness `k_clamp*w_g + k_attachment*w_a` [N/m³] |
 | `coupling_pattern(coil_dof_offsets, support_dof_offset, surface_node_indices_by_coil)` | default=empty | Static numpy I/J index arrays for K_cs / K_sc coupling blocks |
 | `coupling_values(curves_jax, sdofs, surf_pts_by_coil, *, jxw_by_coil, geom)` | default=empty | Traced V arrays for K_cs / K_sc coupling blocks |
-| `coo(curves_jax, sdofs, surf_pts, *, geom, jxw_by_coil)` | default stub | Support stiffness K_ss in COO format |
+| `support_pattern()` | default=empty | Static local COO I/J for K_ss (cached globally as `I_ss_pat`/`J_ss_pat` on `MonolithicStatic`) |
+| `support_values(curves_jax, sdofs, surf_pts, *, geom, jxw_by_coil)` | default stub | Traced COO V for K_ss |
 | `n_support_dofs` | attribute | Required when `is_coupled=True` |
 | `k_clamp` | property | Grounded Winkler modulus [N/m³] (constructor arg) |
 | `k_attachment` | property | Beam-attachment modulus [N/m³]; base returns `0.0` |
@@ -236,7 +237,7 @@ The coupling between coil FEM and support structures is split across three layer
 
 ### `SupportBeams` (`coupling/beam_network.py`)
 
-`SupportBeams` extends `Support` with a bisymmetric beam-network model.  It overrides `compute_weights`, `coupling_pattern`, `coupling_values`, `coo`, and `solve`.
+`SupportBeams` extends `Support` with a bisymmetric beam-network model.  It overrides `compute_weights`, `coupling_pattern`, `coupling_values`, `support_pattern`, `support_values`, and `solve`.
 
 Key constructor arguments (all static; set once at construction):
 
@@ -286,5 +287,5 @@ Two module-level driver functions replace the uncoupled per-coil loop in `CoilFE
 3. Implement `solve(inputs) -> {'u_s': ...}` using any JAX-compatible solver.
 4. Override `compute_weights` to return `(w_g, w_a)` per-surface-quad weight fields.
 5. Implement `coupling_pattern` and `coupling_values` to return the static COO indices and traced V values for the off-diagonal K_cs / K_sc coupling blocks (used by the monolithic driver).
-6. Implement `coo` to return the support-local K_ss block in COO format (used by the monolithic driver).
+6. Implement `support_pattern` and `support_values` to return the static local COO indices and traced V values for the support-local K_ss block (used by the monolithic driver).
 7. Add tests in `tests/test_<subclass>.py`.

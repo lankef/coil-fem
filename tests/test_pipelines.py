@@ -95,10 +95,17 @@ def test_support_solve_returns_empty_dict():
     assert state == {}
 
 
-def test_support_coo_raises():
-    """Support.coo() raises NotImplementedError."""
+def test_support_pattern_empty():
+    """Support.support_pattern() returns empty local I/J arrays."""
+    I, J = Support(k_clamp=1e9).support_pattern()
+    assert I.shape == (0,)
+    assert J.shape == (0,)
+
+
+def test_support_values_raises():
+    """Support.support_values() raises NotImplementedError."""
     with pytest.raises(NotImplementedError):
-        Support(k_clamp=1e9).coo()
+        Support(k_clamp=1e9).support_values([], {}, None)
 
 
 def test_support_compute_weights_uniform():

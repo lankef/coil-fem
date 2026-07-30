@@ -63,6 +63,11 @@ class MonolithicStatic:
     has_sc : bool
         Whether the K_sc coupling block is non-empty.
     surface_node_indices_by_coil : tuple[np.ndarray, ...]
+    I_ss_pat, J_ss_pat : np.ndarray
+        Global COO indices for the support ``K_ss`` block (from
+        ``support.support_pattern`` shifted by ``support_dof_offset``).
+    I_cs_pat, J_cs_pat, I_sc_pat, J_sc_pat : np.ndarray or None
+        Global COO indices for the off-diagonal coupling blocks.
     indptr : jax.Array
         CSR row pointer for the forward solve (on device).
     indices : jax.Array
@@ -92,6 +97,8 @@ class MonolithicStatic:
     surface_node_indices_by_coil: tuple
     curve_qps: tuple
     curve_orders: tuple
+    I_ss_pat: object     # np.ndarray — global COO row indices for K_ss
+    J_ss_pat: object     # np.ndarray — global COO column indices for K_ss
     I_cs_pat: object     # np.ndarray or None when has_cs=False
     J_cs_pat: object
     I_sc_pat: object     # np.ndarray or None when has_sc=False
@@ -349,7 +356,7 @@ def make_merged_solve(
         surf_pts = _surf_quad_pts(pts)
         jxw_list = _surf_jxw(pts)
         curves   = _make_curves(bcd)
-        # Compute beam geometry once; reuse for coo and coupling_values.
+        # Compute beam geometry once; reuse for support_values and coupling_values.
         geom = support.geometry(curves, sdofs)
         V_blocks, f_blocks = [], []
         for i, pipeline in enumerate(pipelines):
@@ -358,7 +365,7 @@ def make_merged_solve(
             V_blocks.append(Vi)
             f_blocks.append(fi)
         geom_kw = {'geom': geom} if geom is not None else {}
-        _, _, V_ss, _ = support.coo(
+        V_ss = support.support_values(
             curves, sdofs, surf_pts, **geom_kw, jxw_by_coil=jxw_list,
         )
         V_blocks.append(V_ss)
@@ -425,10 +432,12 @@ def make_merged_solve(
                     pipeline.problem.internal_vars_surfaces,
                 )
                 residuals.append(jax.flatten_util.ravel_pytree(res_i)[0])
-            Iss, Jss, Vss, ns = support.coo(
+            Iss, Jss = support.support_pattern()
+            Vss = support.support_values(
                 curves, sdofs_in, s_quad_pts, **geom_kw, jxw_by_coil=jxw_list_in,
             )
             u_s = sol_flat[support_dof_offset:]
+            ns = n_s
             r_s = jnp.zeros(ns, dtype=Vss.dtype).at[Iss].add(Vss * u_s[Jss])
             r_full = jnp.concatenate(residuals + [r_s])
             V_cs_in, V_sc_in = support.coupling_values(

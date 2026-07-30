@@ -85,9 +85,6 @@ class _TrivialCoupledSupport(Support):
     """Mock coupled support: always returns u_s = 0, no coil coupling."""
 
     n_support_dofs = 1
-    # Static K_ss pattern (1×1 diagonal), required by build_monolithic_static.
-    _coo_I = np.zeros(1, dtype=np.int32)
-    _coo_J = np.zeros(1, dtype=np.int32)
 
     def __init__(self, k_clamp: float = 1e9):
         super().__init__(k_clamp=k_clamp)
@@ -112,12 +109,13 @@ class _TrivialCoupledSupport(Support):
         n = surface_pts.shape[0]
         return jnp.ones(n), jnp.zeros(n)
 
-    def coo(self, curves_jax, support_dofs, surface_pts_by_coil):
-        n = self.n_support_dofs
-        I = jnp.zeros(n, dtype=jnp.int32)
-        J = jnp.zeros(n, dtype=jnp.int32)
-        V = jnp.ones(n, dtype=jnp.float64) * 1e9
-        return I, J, V, n
+    def support_pattern(self):
+        # Static K_ss pattern (1×1 diagonal), required by build_monolithic_static.
+        return np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32)
+
+    def support_values(self, curves_jax, support_dofs, surface_pts_by_coil=None,
+                       geom=None, *, jxw_by_coil=None, beam_endpoints=None):
+        return jnp.ones(self.n_support_dofs, dtype=jnp.float64) * 1e9
 
 
 # ============================================================================
@@ -151,6 +149,8 @@ def test_monolithic_raises_on_cpu():
         surface_node_indices_by_coil=(pipeline.surface_node_indices,),
         curve_qps=(_make_circle(N=4).quadpoints,),
         curve_orders=(1,),
+        I_ss_pat=np.zeros(0, dtype=np.int32),
+        J_ss_pat=np.zeros(0, dtype=np.int32),
         I_cs_pat=None, J_cs_pat=None, I_sc_pat=None, J_sc_pat=None,
         indptr=None, indices=None, coo_to_csr=None, nnz_csr=0,
         coo_to_csr_T=None, nnz_csr_T=None,
