@@ -320,6 +320,10 @@ class CoilFEM:
                 )
             )
 
+        # Coil section metadata for SupportBeams surface-exit / L_eff.
+        if hasattr(self.support, 'bind_coil_meshes'):
+            self.support.bind_coil_meshes(self.meshes)
+
         # Build the monolithic static bundle once (cuDSS path only; no-op otherwise).
         self.monolithic_static: MonolithicStatic | None = None
         if self.support.is_coupled and coupling == 'monolithic':
@@ -1179,7 +1183,9 @@ class CoilFEM:
         Writes one ``{prefix}{i:02d}_support.vtu`` per coil with point fields
         ``w_clamp``, ``w_attach``, ``k_clamp_Npm3``, and ``k_attach_Npm3``.
         :class:`~coil_fem.coupling.SupportBeams` additionally writes
-        ``{prefix}_beams.vtu`` when ``base_support_dofs`` is provided.
+        ``{prefix}_beams.vtu`` when ``base_support_dofs`` is provided — one
+        line per beam on the free span ``[ξ_start, ξ_end]`` with cell field
+        ``beam_length`` equal to ``L_eff``.
 
         Parameters
         ----------
@@ -1238,21 +1244,24 @@ class CoilFEM:
             written.append(mesh_path)
 
         if base_support_dofs is not None and hasattr(self.support, 'beam_segments'):
-            segs = self.support.beam_segments(curves_jax, base_support_dofs)  # (N, 2, 3)
-            n_beams = segs.shape[0]
-            x_s, x_e  = segs[:, 0], segs[:, 1]
+            # Free-segment endpoints (surface-to-surface / surface-to-foundation).
+            geom = self.support.beam_geometry(curves_jax, base_support_dofs)
+            x_s = onp.asarray(geom['x_start'], dtype=onp.float64)
+            x_e = onp.asarray(geom['x_end'], dtype=onp.float64)
+            xi_s = onp.asarray(geom['xi_start'], dtype=onp.float64)[:, None]
+            xi_e = onp.asarray(geom['xi_end'], dtype=onp.float64)[:, None]
+            x_att_s = x_s + xi_s * (x_e - x_s)
+            x_att_e = x_s + xi_e * (x_e - x_s)
+            n_beams = x_s.shape[0]
 
-            pts_beams = onp.concatenate([x_s, x_e], axis=0)      # (2N, 3)
-            conn = onp.column_stack([                              # (N, 2)
+            pts_beams = onp.concatenate([x_att_s, x_att_e], axis=0)  # (2N, 3)
+            conn = onp.column_stack([
                 onp.arange(n_beams),
                 onp.arange(n_beams, 2 * n_beams),
             ]).astype(onp.int32)
 
-            # Cell labels: beam_type (CC=0, CF=1) and originating coil index.
             coil_idx_arr, beam_type = self.support.beam_labels()
-
-            geom = self.support.beam_geometry(curves_jax, base_support_dofs)
-            L = onp.asarray(geom['L'], dtype=onp.float64)
+            L_eff = onp.asarray(geom['L_eff'], dtype=onp.float64)
 
             beam_path = os.path.join(out_dir, f"{prefix}_beams.vtu")
             meshio.Mesh(
@@ -1260,7 +1269,7 @@ class CoilFEM:
                 cells=[("line", conn)],
                 cell_data={
                     "beam_type":   [beam_type],
-                    "beam_length": [L],
+                    "beam_length": [L_eff],
                     "coil_index":  [coil_idx_arr],
                 },
             ).write(beam_path)
@@ -1550,15 +1559,18 @@ class CoilFEM:
             stiffnesses [N/m³].
 
         * ``{out_dir}/{prefix}_beams.vtu`` — polyline mesh of every base-coil
-          beam, ``n_sub`` line segments (``n_sub + 1`` points) per beam, only
-          when ``base_support_dofs`` is given and :attr:`support` is a
+          beam on its free span ``[ξ_start, ξ_end]`` (surface-to-surface for
+          CC, surface-to-foundation for CF), ``n_sub`` line segments
+          (``n_sub + 1`` points) per beam, only when ``base_support_dofs`` is
+          given and :attr:`support` is a
           :class:`~coil_fem.coupling.SupportBeams` (i.e. has a
           ``beam_displacement`` method):
 
           - point field ``displacement_m`` — closed-form beam-centreline
             displacement at each sub-point (see
             :meth:`~coil_fem.coupling.SupportBeams.beam_displacement`).
-          - cell field ``beam_type`` (CC=0, CF=1) and ``coil_index``.
+          - cell field ``beam_type`` (CC=0, CF=1), ``coil_index``, and
+            ``beam_length`` (effective free length ``L_eff``).
 
         Parameters
         ----------
@@ -1656,12 +1668,16 @@ class CoilFEM:
             ).write(mesh_path)
             written.append(mesh_path)
 
-        # ── Beam centreline displacement (SupportBeams only) ───────────────────
+        # ── Beam free-span displacement (SupportBeams only) ───────────────────
         if (base_support_dofs is not None and result['u_s'] is not None
                 and hasattr(self.support, 'beam_displacement')
                 and self.support.n_beams_total > 0):
             geom = self.support.beam_geometry(curves_jax, base_support_dofs)
-            xi = jnp.linspace(0.0, 1.0, n_sub + 1)
+            xi_start = geom['xi_start']
+            xi_end = geom['xi_end']
+            # Per-beam uniform samples on the free chord [ξ_start, ξ_end].
+            t = jnp.linspace(0.0, 1.0, n_sub + 1)
+            xi = xi_start[:, None] + t[None, :] * (xi_end[:, None] - xi_start[:, None])
             disp = onp.asarray(
                 self.support.beam_displacement(geom, result['u_s'], xi),
                 dtype=onp.float64,
@@ -1670,8 +1686,7 @@ class CoilFEM:
             x_s = onp.asarray(geom['x_start'], dtype=onp.float64)  # (N_beams, 3)
             x_e = onp.asarray(geom['x_end'],   dtype=onp.float64)
             xi_np = onp.asarray(xi, dtype=onp.float64)
-            # Rest-frame interior points (beams are straight at rest).
-            pts = x_s[:, None, :] + xi_np[None, :, None] * (x_e - x_s)[:, None, :]
+            pts = x_s[:, None, :] + xi_np[..., None] * (x_e - x_s)[:, None, :]
 
             n_beams, n_pts_per_beam, _ = pts.shape
             pts_flat  = pts.reshape(-1, 3)
@@ -1683,14 +1698,16 @@ class CoilFEM:
             conn = conn.reshape(-1, 2).astype(onp.int32)
 
             coil_idx_arr, beam_type = self.support.beam_labels()
+            L_eff = onp.asarray(geom['L_eff'], dtype=onp.float64)
             beam_path = os.path.join(out_dir, f"{prefix}_beams.vtu")
             meshio.Mesh(
                 points=pts_flat,
                 cells=[("line", conn)],
                 point_data={"displacement_m": disp_flat},
                 cell_data={
-                    "beam_type":  [onp.repeat(beam_type, n_sub)],
-                    "coil_index": [onp.repeat(coil_idx_arr, n_sub)],
+                    "beam_type":   [onp.repeat(beam_type, n_sub)],
+                    "coil_index":  [onp.repeat(coil_idx_arr, n_sub)],
+                    "beam_length": [onp.repeat(L_eff, n_sub)],
                 },
             ).write(beam_path)
             written.append(beam_path)
