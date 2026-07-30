@@ -340,6 +340,12 @@ class SupportBeams(Support):
         # Pre-build the static COO index arrays (I and J are loop-invariant).
         self._support_I, self._support_J = self._build_static_ij()
 
+        # Coil section metadata for surface-exit / L_eff (set by bind_coil_meshes).
+        self._coil_framed_templates = None
+        self._coil_is_disk = None
+        self._coil_a = None  # w1 (rect) or radius (disk)
+        self._coil_b = None  # w2 (rect) or radius (disk)
+
         # JIT-compile hot paths once topology is fixed.  `support_values` and
         # `coupling_values` are intentionally left un-jitted here: they are
         # already covered by the outer JIT of the monolithic driver / solve,
@@ -569,6 +575,166 @@ class SupportBeams(Support):
         if inverse:
             return pts @ Q          # row-vector form of Q^T @ p
         return pts @ Q.T            # row-vector form of Q @ p
+
+    def bind_coil_meshes(self, meshes: list) -> None:
+        """Bind coil cross-section metadata for effective beam length.
+
+        Stores per-coil framed-curve templates and section extents used by
+        :meth:`beam_geometry` to compute surface-exit parameters
+        ``xi_start`` / ``xi_end`` and ``L_eff``.  Called from
+        :class:`~coil_fem.coil_fem.CoilFEM` after meshes are built.  Without
+        this call, ``L_eff`` falls back to the centerline chord ``L``.
+
+        Parameters
+        ----------
+        meshes : list[CoilMesh]
+            One mesh per base coil (same order as ``curves_jax``).
+        """
+        if len(meshes) != self.n_base:
+            raise ValueError(
+                f"bind_coil_meshes: expected {self.n_base} meshes, "
+                f"got {len(meshes)}."
+            )
+        is_disk, a, b = [], [], []
+        templates = []
+        for m in meshes:
+            templates.append(m.framed_curve)
+            if m.shape == 'disk':
+                is_disk.append(True)
+                a.append(float(m.radius))
+                b.append(float(m.radius))
+            elif m.shape == 'rect':
+                is_disk.append(False)
+                a.append(float(m.w1))
+                b.append(float(m.w2))
+            else:
+                raise ValueError(
+                    f"bind_coil_meshes: unsupported mesh shape {m.shape!r}."
+                )
+        self._coil_framed_templates = tuple(templates)
+        self._coil_is_disk = np.asarray(is_disk, dtype=bool)
+        self._coil_a = np.asarray(a, dtype=np.float64)
+        self._coil_b = np.asarray(b, dtype=np.float64)
+        # Re-JIT so the bound section metadata is picked up at trace time.
+        self.beam_geometry = jax.jit(self.beam_geometry)
+
+    @staticmethod
+    def _frame_at_phi(fc, phi: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Interpolate coil frame ``(p, q)`` at ``phi`` from native quadpoints.
+
+        Uses periodic linear interpolation of :meth:`rotated_frame` on the
+        mesh quadpoint grid (RMF-safe; avoids sparse ``rotated_frame_eval``).
+        """
+        N = fc.curve.quadpoints.shape[0]
+        _, p_qp, q_qp = fc.rotated_frame()
+        phi = jnp.asarray(phi, dtype=float) % 1.0
+        x = phi * N
+        i0 = jnp.floor(x).astype(jnp.int32) % N
+        i1 = (i0 + 1) % N
+        frac = (x - jnp.floor(x))[..., None]
+        p = (1.0 - frac) * p_qp[i0] + frac * p_qp[i1]
+        q = (1.0 - frac) * q_qp[i0] + frac * q_qp[i1]
+        p = p / (jnp.linalg.norm(p, axis=-1, keepdims=True) + 1e-300)
+        q = q - jnp.sum(q * p, axis=-1, keepdims=True) * p
+        q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-300)
+        return p, q
+
+    @staticmethod
+    def _xi_surface_exit(
+        d: jax.Array,
+        p: jax.Array,
+        q: jax.Array,
+        a: jax.Array,
+        b: jax.Array,
+        is_disk: jax.Array,
+    ) -> jax.Array:
+        """Normalized chord station where the ray exits the coil surface.
+
+        For a rectangular section, surface is ``max(|u|, |v|) = 1`` with
+        ``u = 2 (d·p)/a``, ``v = 2 (d·q)/b``.  For a disk of radius ``a``,
+        surface is ``sqrt(u² + v²) = 1`` with ``u = (d·p)/a``, ``v = (d·q)/a``.
+        """
+        dp = jnp.sum(d * p, axis=-1)
+        dq = jnp.sum(d * q, axis=-1)
+        xi_rect = 1.0 / (
+            jnp.maximum(jnp.abs(2.0 * dp / a), jnp.abs(2.0 * dq / b)) + 1e-300
+        )
+        xi_disk = a / (jnp.sqrt(dp * dp + dq * dq) + 1e-300)
+        return jnp.where(is_disk, xi_disk, xi_rect)
+
+    def _surface_exit_params(
+        self,
+        curves_jax: list,
+        support_dofs: dict,
+        x_start: jax.Array,
+        x_end: jax.Array,
+        L: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Closed-form ``xi_start``, ``xi_end``, ``L_eff`` for every beam.
+
+        When coil meshes have not been bound, returns ``(0, 1, L)``.
+        """
+        n = L.shape[0]
+        if self._coil_framed_templates is None:
+            return jnp.zeros(n), jnp.ones(n), L
+
+        fcs = [
+            tmpl.with_dofs(c.dofs)
+            for tmpl, c in zip(self._coil_framed_templates, curves_jax)
+        ]
+        is_disk = jnp.asarray(self._coil_is_disk)
+        a_all = jnp.asarray(self._coil_a)
+        b_all = jnp.asarray(self._coil_b)
+
+        phis_start_cc = support_dofs['phis_start_cc']
+        phis_end_cc = support_dofs['phis_end_cc']
+        phis_start_cf = support_dofs['phis_start_cf']
+
+        xi_s_list, xi_e_list = [], []
+        b0 = 0
+
+        def append_cc_group(g):
+            nonlocal b0
+            n_g = self.n_beam_cc[g]
+            if n_g == 0:
+                return
+            start_idx, end_idx, end_tfm = self._cc_groups[g]
+            sl = slice(b0, b0 + n_g)
+            d = x_end[sl] - x_start[sl]
+            p_s, q_s = self._frame_at_phi(fcs[start_idx], phis_start_cc[g])
+            p_e, q_e = self._frame_at_phi(fcs[end_idx], phis_end_cc[g])
+            p_e = self._apply_end_transform(p_e, end_tfm)
+            q_e = self._apply_end_transform(q_e, end_tfm)
+            xi_s_list.append(self._xi_surface_exit(
+                d, p_s, q_s, a_all[start_idx], b_all[start_idx], is_disk[start_idx],
+            ))
+            xi_e_list.append(
+                1.0 - self._xi_surface_exit(
+                    d, p_e, q_e, a_all[end_idx], b_all[end_idx], is_disk[end_idx],
+                )
+            )
+            b0 += n_g
+
+        for i in range(self.n_base):
+            append_cc_group(i)
+            n_cf = self.n_beam_cf[i]
+            if n_cf > 0:
+                sl = slice(b0, b0 + n_cf)
+                d = x_end[sl] - x_start[sl]
+                p_s, q_s = self._frame_at_phi(fcs[i], phis_start_cf[i])
+                xi_s_list.append(self._xi_surface_exit(
+                    d, p_s, q_s, a_all[i], b_all[i], is_disk[i],
+                ))
+                xi_e_list.append(jnp.ones(n_cf))
+                b0 += n_cf
+
+        if self.stellsym:
+            append_cc_group(self.n_base)
+
+        xi_start = jnp.concatenate(xi_s_list, axis=0)
+        xi_end = jnp.concatenate(xi_e_list, axis=0)
+        L_eff = jnp.maximum(L * (xi_end - xi_start), 1e-3 * L)
+        return xi_start, xi_end, L_eff
 
     def _endpoint_specs(
         self,
@@ -830,10 +996,13 @@ class SupportBeams(Support):
     ) -> dict:
         """Compute all per-beam geometry arrays in one traced call.
 
-        Builds rest chords (endpoints, lengths, tangents) and per-beam
-        direction-cosine matrices ``gamma3``.  Callers should compute this
-        once and pass the result to :meth:`compute_weights`,
-        :meth:`support_values`, and :meth:`coupling_values` as ``geom``.
+        Builds rest chords (endpoints, lengths, tangents), per-beam
+        direction-cosine matrices ``gamma3``, and — when coil meshes have
+        been bound via :meth:`bind_coil_meshes` — surface-exit parameters
+        ``xi_start`` / ``xi_end`` and the effective stiffness length
+        ``L_eff``.  Callers should compute this once and pass the result to
+        :meth:`compute_weights`, :meth:`support_values`, and
+        :meth:`coupling_values` as ``geom``.
 
         Parameters
         ----------
@@ -855,6 +1024,11 @@ class SupportBeams(Support):
         * ``'t_coil_end'``  : (N_beams, 3) — coil tangent at node-2 for CC;
           zeros for CF.
         * ``'gamma3'``      : (N_beams, 3, 3) — DCMs (columns: local x/y/z).
+        * ``'xi_start'``    : (N_beams,) — chord station at start-coil surface.
+        * ``'xi_end'``      : (N_beams,) — chord station at end-coil surface
+          (or ``1`` for CF foundation).
+        * ``'L_eff'``       : (N_beams,) — free length for beam stiffness
+          (``L`` when meshes are unbound).
         """
         phis_start_cc = support_dofs['phis_start_cc']
         phis_end_cc   = support_dofs['phis_end_cc']
@@ -957,6 +1131,9 @@ class SupportBeams(Support):
             y_local = y_local / (jnp.linalg.norm(y_local) + 1e-300)
             return jnp.stack([x_local, y_local, z_local], axis=1)
 
+        xi_start, xi_end, L_eff = self._surface_exit_params(
+            curves_jax, support_dofs, x_start, x_end, L,
+        )
         return {
             'x_start':      x_start,
             'x_end':        x_end,
@@ -965,6 +1142,9 @@ class SupportBeams(Support):
             't_coil_start': t_coil_start,
             't_coil_end':   t_coil_end,
             'gamma3':       jax.vmap(single_dcm)(t_beam, t_coil_start, thetas),
+            'xi_start':     xi_start,
+            'xi_end':       xi_end,
+            'L_eff':        L_eff,
         }
 
     # ============================================================================
@@ -1126,31 +1306,42 @@ class SupportBeams(Support):
         u_s : jax.Array, shape ``(n_support_dofs,)``
             Output of :meth:`solve`.
         xi : jax.Array or float
-            Normalized position(s) in ``[0, 1]``, any shape.
+            Normalized chord position(s) in ``[0, 1]``.  A shared sample
+            grid has any shape (broadcast to every beam).  A per-beam grid
+            has leading axis ``n_beams_total`` (e.g. shape
+            ``(n_beams_total, n_pts)``).
 
         Returns
         -------
-        jax.Array, shape ``(n_beams_total, *xi.shape, 3)``
+        jax.Array
             Global-frame displacement of the beam centreline at ``xi``.
+            Shape ``(n_beams_total, *xi.shape, 3)`` for a shared grid, or
+            ``(n_beams_total, *xi.shape[1:], 3)`` for a per-beam grid.
         """
         xi = jnp.asarray(xi)
         gamma3 = geom['gamma3']                                  # (N, 3, 3)
         L      = geom['L']                                       # (N,)
+        N = self.n_beams_total
 
-        u_global = u_s.reshape(self.n_beams_total, 4, 3)          # (N,4,3): [t1,r1,t2,r2]
+        u_global = u_s.reshape(N, 4, 3)                           # (N,4,3): [t1,r1,t2,r2]
         # Global -> local (row-vector convention used throughout this file,
         # e.g. `pts_beam = r_k @ spec.gamma3`).
         u_local = jnp.einsum('nkj,nji->nki', u_global, gamma3)    # (N,4,3)
         t1, r1, t2, r2 = (u_local[:, k, :] for k in range(4))     # each (N,3)
 
-        # Broadcast xi (any shape) against per-beam quantities (N,): trailing
-        # dims of the per-beam column are padded with 1s so it broadcasts
-        # against xi[None, ...], giving a common (N, *xi.shape) result.
-        def _col(a):
-            return a.reshape(a.shape[0], *([1] * xi.ndim))
+        # Per-beam xi: leading axis matches N.  Shared xi: prepend a beam axis.
+        per_beam = (xi.ndim >= 1 and xi.shape[0] == N)
+        if per_beam:
+            xi_b = xi                                              # (N, *rest)
+            n_trail = xi.ndim - 1
+        else:
+            xi_b = xi[None, ...]                                   # (1, *xi.shape)
+            n_trail = xi.ndim
 
-        xi_b = xi[None, ...]                                      # (1, *xi.shape)
-        L_b  = _col(L)                                             # (N, *1s)
+        def _col(a):
+            return a.reshape(a.shape[0], *([1] * n_trail))
+
+        L_b = _col(L)
 
         u_ax = (1 - xi_b) * _col(t1[:, 0]) + xi_b * _col(t2[:, 0])
         v = cubic_hermite_interp(xi_b, L_b, _col(t1[:, 1]), _col(r1[:, 2]),
@@ -1158,7 +1349,7 @@ class SupportBeams(Support):
         w = cubic_hermite_interp(xi_b, L_b, _col(t1[:, 2]), -_col(r1[:, 1]),
                                   _col(t2[:, 2]), -_col(r2[:, 1]))
 
-        d_local = jnp.stack([u_ax, v, w], axis=-1)                # (N, *xi.shape, 3)
+        d_local = jnp.stack([u_ax, v, w], axis=-1)                # (N, *rest, 3)
         # Local -> global.
         d_global = jnp.einsum('n...j,nij->n...i', d_local, gamma3)
         return d_global
@@ -1603,7 +1794,7 @@ class SupportBeams(Support):
         Iz = jnp.concatenate([jnp.atleast_1d(a) for a in Iz_all])
         Jj = jnp.concatenate([jnp.atleast_1d(a) for a in J_all])
 
-        K_local  = self._local_stiffness(A, Iy, Iz, Jj, geom['L'])
+        K_local  = self._local_stiffness(A, Iy, Iz, Jj, geom['L_eff'])
         K_global = self._global_stiffness(K_local, Gamma_3)
 
         if beam_endpoints is None:

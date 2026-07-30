@@ -16,7 +16,8 @@ import pytest
 
 jax.config.update("jax_enable_x64", True)
 
-from coil_fem.geo import CurveXYZFourierJAX
+from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
+from coil_fem.meshing import CoilMeshRectangle
 from coil_fem.coupling import SupportBeams
 
 
@@ -1141,3 +1142,105 @@ def test_beam_labels_shapes_and_values():
     assert beam_type.shape == (sb.n_beams_total,)
     assert np.array_equal(coil_idx_arr, np.array([0, 0, 1, 1]))
     assert np.array_equal(beam_type,    np.array([0, 1, 0, 1]))
+
+
+# ============================================================================
+# Effective length L_eff (surface-exit correction)
+# ============================================================================
+
+def test_L_eff_unbound_equals_L():
+    """Without bind_coil_meshes, L_eff falls back to the centerline chord."""
+    sb = _make_support_beams(n_base=2, n_beam_cc=1, n_beam_cf=0)
+    curves = _make_curves(2)
+    sdofs = _make_support_dofs(2, 1, 0)
+    geom = sb.beam_geometry(curves, sdofs)
+    np.testing.assert_allclose(np.asarray(geom['L_eff']), np.asarray(geom['L']))
+    np.testing.assert_allclose(np.asarray(geom['xi_start']), 0.0)
+    np.testing.assert_allclose(np.asarray(geom['xi_end']), 1.0)
+
+
+def test_L_eff_rect_radial_beam():
+    """Radial CC beam on coaxial circles: ξ_start = w/(2L), L_eff = L - w."""
+    N = 32
+    curves = [_make_circle(N=N, R=1.0), _make_circle(N=N, R=2.0)]
+    w = 0.2
+    meshes = [
+        CoilMeshRectangle(make_framed_curve(c, 'centroid'), w, w, n_grid_1=2, n_grid_2=2)
+        for c in curves
+    ]
+    # Only the coil-0 → coil-1 group; leave the wrap group empty.
+    n_cc = [1, 0]
+    sb = _make_support_beams(n_base=2, n_beam_cc=n_cc, n_beam_cf=0)
+    sb.bind_coil_meshes(meshes)
+
+    sdofs = _make_support_dofs(2, n_cc, 0)
+    # φ = 0 → γ = (R, 0, 0); centroid-frame p is radial → beam along p.
+    sdofs['phis_start_cc'] = [jnp.array([0.0]), jnp.zeros(0)]
+    sdofs['phis_end_cc'] = [jnp.array([0.0]), jnp.zeros(0)]
+
+    geom = sb.beam_geometry(curves, sdofs)
+    L = float(geom['L'][0])
+    assert np.isclose(L, 1.0, rtol=1e-6)
+    np.testing.assert_allclose(float(geom['xi_start'][0]), w / (2.0 * L), rtol=1e-3)
+    np.testing.assert_allclose(float(geom['xi_end'][0]), 1.0 - w / (2.0 * L), rtol=1e-3)
+    np.testing.assert_allclose(float(geom['L_eff'][0]), L - w, rtol=1e-3)
+
+
+def test_free_segment_xi_grid_endpoints():
+    """Uniform free-span ξ grid starts/ends at geom xi_start / xi_end."""
+    N = 32
+    curves = [_make_circle(N=N, R=1.0), _make_circle(N=N, R=2.0)]
+    w = 0.2
+    meshes = [
+        CoilMeshRectangle(make_framed_curve(c, 'centroid'), w, w, n_grid_1=2, n_grid_2=2)
+        for c in curves
+    ]
+    n_cc = [1, 0]
+    sb = _make_support_beams(n_base=2, n_beam_cc=n_cc, n_beam_cf=0)
+    sb.bind_coil_meshes(meshes)
+    sdofs = _make_support_dofs(2, n_cc, 0)
+    sdofs['phis_start_cc'] = [jnp.array([0.0]), jnp.zeros(0)]
+    sdofs['phis_end_cc'] = [jnp.array([0.0]), jnp.zeros(0)]
+
+    geom = sb.beam_geometry(curves, sdofs)
+    n_sub = 8
+    t = jnp.linspace(0.0, 1.0, n_sub + 1)
+    xi = geom['xi_start'][:, None] + t[None, :] * (
+        geom['xi_end'][:, None] - geom['xi_start'][:, None]
+    )
+    np.testing.assert_allclose(xi[:, 0], geom['xi_start'], atol=1e-12)
+    np.testing.assert_allclose(xi[:, -1], geom['xi_end'], atol=1e-12)
+    # Rest samples lie strictly inside the centerline chord for this fixture.
+    assert float(geom['xi_start'][0]) > 0.0
+    assert float(geom['xi_end'][0]) < 1.0
+
+
+def test_L_eff_grad_phis_finite():
+    """sum(L_eff) is differentiable w.r.t. attachment phis (FD match)."""
+    N = 16
+    curves = [_make_circle(N=N, R=1.0), _make_circle(N=N, R=2.0)]
+    w = 0.15
+    meshes = [
+        CoilMeshRectangle(make_framed_curve(c, 'centroid'), w, w, n_grid_1=2, n_grid_2=2)
+        for c in curves
+    ]
+    n_cc = [1, 0]
+    sb = _make_support_beams(n_base=2, n_beam_cc=n_cc, n_beam_cf=0)
+    sb.bind_coil_meshes(meshes)
+    sdofs0 = _make_support_dofs(2, n_cc, 0)
+    sdofs0['phis_start_cc'] = [jnp.array([0.05]), jnp.zeros(0)]
+    sdofs0['phis_end_cc'] = [jnp.array([0.05]), jnp.zeros(0)]
+
+    def loss(phi0):
+        sdofs = {
+            **sdofs0,
+            'phis_start_cc': [jnp.atleast_1d(phi0), jnp.zeros(0)],
+            'phis_end_cc': [jnp.atleast_1d(phi0), jnp.zeros(0)],
+        }
+        return jnp.sum(sb.beam_geometry(curves, sdofs)['L_eff'])
+
+    g = jax.grad(loss)(jnp.array(0.05))
+    assert np.isfinite(float(g))
+    eps = 1e-6
+    fd = (loss(0.05 + eps) - loss(0.05 - eps)) / (2 * eps)
+    np.testing.assert_allclose(float(g), float(fd), rtol=1e-3, atol=1e-5)

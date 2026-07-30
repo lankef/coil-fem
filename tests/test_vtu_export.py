@@ -156,13 +156,28 @@ def test_save_run_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
     disp = mesh.point_data['displacement_m']
     assert disp.shape == (n_beams * (n_sub + 1), 3)
 
-    # First/last point of the (single) beam are its node-1/node-2 translations.
-    u_beam = np.asarray(u_s).reshape(n_beams, 12)
-    assert np.allclose(disp[0],  u_beam[0, 0:3], atol=1e-10)
-    assert np.allclose(disp[-1], u_beam[0, 6:9], atol=1e-10)
+    # Polyline spans the free chord [ξ_start, ξ_end], not necessarily ξ=0/1.
+    curves = fem.curves_from_dofs([curve.dofs])
+    geom = support.beam_geometry(curves, sdofs)
+    xi_s = float(geom['xi_start'][0])
+    xi_e = float(geom['xi_end'][0])
+    x_s = np.asarray(geom['x_start'][0])
+    x_e = np.asarray(geom['x_end'][0])
+    assert np.allclose(mesh.points[0],  x_s + xi_s * (x_e - x_s), atol=1e-10)
+    assert np.allclose(mesh.points[-1], x_s + xi_e * (x_e - x_s), atol=1e-10)
+
+    d_s = np.asarray(support.beam_displacement(geom, u_s, xi_s)[0])
+    d_e = np.asarray(support.beam_displacement(geom, u_s, xi_e)[0])
+    assert np.allclose(disp[0],  d_s, atol=1e-10)
+    assert np.allclose(disp[-1], d_e, atol=1e-10)
 
     assert mesh.cell_data['beam_type'][0].shape  == (n_beams * n_sub,)
     assert mesh.cell_data['coil_index'][0].shape == (n_beams * n_sub,)
+    assert mesh.cell_data['beam_length'][0].shape == (n_beams * n_sub,)
+    assert np.allclose(
+        mesh.cell_data['beam_length'][0],
+        np.repeat(np.asarray(geom['L_eff']), n_sub),
+    )
 
 
 if __name__ == "__main__":
