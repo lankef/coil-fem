@@ -11,8 +11,9 @@ see ``docs/theory/bisymbeam.rst``).  Each beam endpoint couples to coil
 exterior mesh points via translational and torsional springs whose spatial
 distribution is governed by a user-supplied ``attachment_fn``.
 
-:meth:`SupportBeams.coo` returns the support-local stiffness block
-``K_ss`` in COO format (differentiable w.r.t. all traced inputs).
+:meth:`SupportBeams.support_pattern` / :meth:`SupportBeams.support_values`
+expose the support-local stiffness block ``K_ss`` in COO format
+(differentiable w.r.t. all traced inputs).
 :meth:`SupportBeams.solve` runs a standalone forward solve (batched
 ``jnp.linalg.solve``) for the beam DOFs given coil-side mesh displacements.
 """
@@ -337,9 +338,9 @@ class SupportBeams(Support):
         self._cc_groups = self._build_cc_groups()
 
         # Pre-build the static COO index arrays (I and J are loop-invariant).
-        self._coo_I, self._coo_J = self._build_static_ij()
+        self._support_I, self._support_J = self._build_static_ij()
 
-        # JIT-compile hot paths once topology is fixed.  `coo` and
+        # JIT-compile hot paths once topology is fixed.  `support_values` and
         # `coupling_values` are intentionally left un-jitted here: they are
         # already covered by the outer JIT of the monolithic driver / solve,
         # and jitting them independently trips up on the ragged EndpointSpec
@@ -1020,8 +1021,9 @@ class SupportBeams(Support):
 
         Combines :meth:`_beam_geometry` (endpoint positions, lengths,
         tangents) and :meth:`_direction_cosine_matrices` (DCMs) so that
-        callers can pass the result to :meth:`compute_weights`, :meth:`coo`,
-        and :meth:`coupling_values` as the ``geom`` keyword argument,
+        callers can pass the result to :meth:`compute_weights`,
+        :meth:`support_values`, and :meth:`coupling_values` as the ``geom``
+        keyword argument,
         avoiding redundant re-computation.
 
         Parameters
@@ -1455,7 +1457,7 @@ class SupportBeams(Support):
         geom : dict  — output of :meth:`_beam_geometry`.
         gamma3 : jax.Array, shape ``(N_beams, 3, 3)``
             Output of :meth:`_direction_cosine_matrices`, passed in from
-            :meth:`coo` so it is computed only once.
+            :meth:`support_values` so it is computed only once.
         support_dofs : dict
         surface_pts_by_coil : list[jax.Array] or None
             One ``(n_surf_i, 3)`` array per base coil.  During solves these
@@ -1606,33 +1608,23 @@ class SupportBeams(Support):
         return jnp.stack(K_spring_list, axis=0)  # (N, 12, 12)
 
     # ============================================================================
-    # Scatter helper
+    # support_pattern / support_values — K_ss COO assembly
     # ============================================================================
 
-    def _scatter_block_diagonal(self, K_beam: jax.Array) -> tuple:
-        """Flatten ``(N, 12, 12)`` block-diagonal stiffness into COO triplets.
+    def support_pattern(self):
+        """Static local COO I/J index arrays for ``K_ss``.
 
-        Row/column indices ``I``, ``J`` are pre-built at construction (static);
-        only the value array ``V`` is traced.
-
-        Parameters
-        ----------
-        K_beam : jax.Array, shape ``(N_beams, 12, 12)``
+        Pre-built at construction (block-diagonal 12×12 per beam).  Paired
+        element-wise with :meth:`support_values`.
 
         Returns
         -------
-        I : np.ndarray, shape ``(N*144,)``   — static int32 row indices
-        J : np.ndarray, shape ``(N*144,)``   — static int32 column indices
-        V : jax.Array, shape ``(N*144,)``    — traced float values
+        I, J : np.ndarray, shape ``(N_beams * 144,)``
+            Row and column indices in support-local DOF numbering.
         """
-        V = K_beam.reshape(-1)
-        return self._coo_I, self._coo_J, V
+        return self._support_I, self._support_J
 
-    # ============================================================================
-    # coo — the primary assembly entry point
-    # ============================================================================
-
-    def coo(
+    def support_values(
         self,
         curves_jax: list,
         support_dofs: dict,
@@ -1641,11 +1633,11 @@ class SupportBeams(Support):
         *,
         jxw_by_coil: list | None = None,
         beam_endpoints: list[list[EndpointResult]] | None = None,
-    ) -> tuple:
-        """Return the support-local stiffness block ``K_ss`` in COO format.
+    ) -> jax.Array:
+        """Traced COO values for the support-local stiffness block ``K_ss``.
 
-        All outputs except ``I`` and ``J`` are differentiable w.r.t.
-        ``curves_jax`` and ``support_dofs``.
+        Differentiable w.r.t. ``curves_jax`` and ``support_dofs``.  Paired
+        element-wise with :meth:`support_pattern`.
 
         Parameters
         ----------
@@ -1678,10 +1670,8 @@ class SupportBeams(Support):
 
         Returns
         -------
-        I : np.ndarray, shape ``(N*144,)``  — static row indices
-        J : np.ndarray, shape ``(N*144,)``  — static column indices
-        V : jax.Array,  shape ``(N*144,)``  — stiffness values (traced)
-        n_dofs : int                         — total support DOFs
+        jax.Array, shape ``(N_beams * 144,)``
+            Stiffness values ``K_ss[I[k], J[k]]`` (traced).
         """
         if geom is None:
             geom = self._beam_geometry(curves_jax, support_dofs)
@@ -1704,9 +1694,7 @@ class SupportBeams(Support):
 
         K_spring = self._spring_stiffness_contributions(beam_endpoints)
         K_beam = K_global + K_spring
-
-        I, J, V = self._scatter_block_diagonal(K_beam)
-        return I, J, V, self.n_support_dofs
+        return K_beam.reshape(-1)
 
     # ============================================================================
     # solve — standalone forward solve
@@ -1826,11 +1814,13 @@ class SupportBeams(Support):
             jxw_by_coil,
         )
 
-        I, J, V, n_dofs = self.coo(
+        I, J = self.support_pattern()
+        V = self.support_values(
             curves_jax, support_dofs, geom=geom, beam_endpoints=beam_endpoints,
         )
 
         # Build dense K_ss from COO.
+        n_dofs = self.n_support_dofs
         K_ss = jnp.zeros((n_dofs, n_dofs))
         K_ss = K_ss.at[I, J].add(V)
 

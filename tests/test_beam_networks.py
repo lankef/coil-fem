@@ -58,7 +58,7 @@ def _constant_section_fn(A_val=1e-4, Iy_val=1e-8, Iz_val=1e-8, J_val=2e-8):
 
     Consumes the ragged (per-group list) support_dofs and returns one array
     of beam properties per group (cc-then-cf order; the stellsym wrap group
-    has no cf part), matching the shape contract of ``SupportBeams.coo``.
+    has no cf part), matching the shape contract of ``SupportBeams.support_values``.
     """
     def fn(support_dofs):
         phi_cc = support_dofs['phis_start_cc']   # list[g] -> (n_beam_cc[g],)
@@ -216,11 +216,11 @@ def test_support_beams_dof_count():
 
 
 # ============================================================================
-# 3. coo shapes
+# 3. support_pattern / support_values shapes
 # ============================================================================
 
 def test_support_beams_coo_shapes():
-    """coo() returns (I, J, V, n) with consistent shapes."""
+    """support_pattern/values return consistent COO shapes."""
     n_base, n_cc, n_cf = 2, 1, 1
     sb     = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)
     curves = _make_curves(n_base)
@@ -228,7 +228,9 @@ def test_support_beams_coo_shapes():
     surf   = _make_surface_pts(n_base)
     _, jxw = _make_interp_and_jxw(surf)
 
-    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw)
+    I, J = sb.support_pattern()
+    V = sb.support_values(curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw)
+    n_dofs = sb.n_support_dofs
 
     n_beams = n_base * (n_cc + n_cf)
     expected_nnz = n_beams * 144   # 12 * 12 per beam
@@ -263,7 +265,9 @@ def test_support_beams_coo_diagonal_dominance():
     surf   = _make_surface_pts(n_base)
     _, jxw = _make_interp_and_jxw(surf)
 
-    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw)
+    I, J = sb.support_pattern()
+    V = sb.support_values(curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw)
+    n_dofs = sb.n_support_dofs
 
     # Reconstruct the dense block-diagonal matrix
     K = np.zeros((n_dofs, n_dofs))
@@ -498,7 +502,7 @@ def test_support_beams_transform_matrices_and_reflection_planes():
 
 
 # ============================================================================
-# 9. coo without surface_pts_by_coil — bare-beam blocks are rank-6
+# 9. support_values without surface_pts_by_coil — bare-beam blocks are rank-6
 # ============================================================================
 
 def test_support_beams_bare_beam_rank():
@@ -510,7 +514,9 @@ def test_support_beams_bare_beam_rank():
     sdofs  = _make_support_dofs(n_base, n_cc, n_cf)
 
     # Pass surface_pts_by_coil=None → bare beam, no spring regularisation
-    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=None, jxw_by_coil=[])
+    I, J = sb.support_pattern()
+    V = sb.support_values(curves, sdofs, surface_pts_by_coil=None, jxw_by_coil=[])
+    n_dofs = sb.n_support_dofs
 
     K = np.zeros((n_dofs, n_dofs))
     np.add.at(K, (np.asarray(I), np.asarray(J)), np.asarray(V))
@@ -606,7 +612,7 @@ def test_support_beams_ragged_counts_and_offsets():
 
 
 def test_support_beams_ragged_coo_shapes():
-    """coo() sizing and index bounds hold for ragged per-coil counts."""
+    """support_pattern/values sizing and index bounds hold for ragged counts."""
     n_base = 3
     sb     = _make_support_beams(
         n_base=n_base, n_beam_cc=_RAGGED_CC, n_beam_cf=_RAGGED_CF,
@@ -617,7 +623,9 @@ def test_support_beams_ragged_coo_shapes():
     surf   = _make_surface_pts(n_base)
     _, jxw = _make_interp_and_jxw(surf)
 
-    I, J, V, n_dofs = sb.coo(curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw)
+    I, J = sb.support_pattern()
+    V = sb.support_values(curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw)
+    n_dofs = sb.n_support_dofs
 
     n_beams = sum(_RAGGED_CC[i] + _RAGGED_CF[i] for i in range(n_base))
     expected_nnz = n_beams * 144
@@ -933,9 +941,11 @@ def test_k_ss_symmetry():
     surf   = _make_surface_pts(n_base, n_surf=12)
     jxw    = [jnp.ones((12,), dtype=jnp.float64) for _ in range(n_base)]
 
-    I, J, V, n_dofs = sb.coo(
+    I, J = sb.support_pattern()
+    V = sb.support_values(
         curves, sdofs, surface_pts_by_coil=surf, jxw_by_coil=jxw
     )
+    n_dofs = sb.n_support_dofs
 
     K = np.zeros((n_dofs, n_dofs))
     np.add.at(K, (np.asarray(I), np.asarray(J)), np.asarray(V))
@@ -1020,9 +1030,11 @@ def test_cf_beam_cantilever_analytic():
 
     # No Winkler spring (surface_pts_by_coil=None): only the beam stiffness
     # plus the CF hard-clamp on node-2 DOFs.  This gives the pure cantilever.
-    I, J, V, n_dofs = sb.coo(
+    I, J = sb.support_pattern()
+    V = sb.support_values(
         [curve], sdofs, surface_pts_by_coil=None, jxw_by_coil=None
     )
+    n_dofs = sb.n_support_dofs
 
     K = np.zeros((n_dofs, n_dofs))
     np.add.at(K, (np.asarray(I), np.asarray(J)), np.asarray(V))
@@ -1121,7 +1133,7 @@ def test_beam_labels_shapes_and_values():
 
     CC beams (type 0) precede CF beams (type 1) within each coil's block,
     matching the ordering used throughout this module (see
-    ``_constant_section_fn`` / ``coo``).
+    ``_constant_section_fn`` / ``support_values``).
     """
     n_base, n_cc, n_cf = 2, 1, 1
     sb = _make_support_beams(n_base=n_base, n_beam_cc=n_cc, n_beam_cf=n_cf)

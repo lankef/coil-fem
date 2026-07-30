@@ -84,7 +84,7 @@ class Support:
 
         Every spring field (grounded clamp, beam attachment) uses the same
         modulus on the coil side (:meth:`stiffness`) and the support side
-        (:meth:`coupling_values` / :meth:`coo`), so all support-block
+        (:meth:`coupling_values` / :meth:`support_values`), so all support-block
         contributions (translational springs, moment-arm cross-terms) are
         symmetric.  :class:`SupportBeams` inherits this without an override.
         """
@@ -114,7 +114,7 @@ class Support:
         Subclasses that benefit from single-pass geometry computation (e.g.
         :class:`~coil_fem.coupling.SupportBeams`) override this method to
         return a ``dict`` of traced arrays that can be threaded through
-        :meth:`compute_weights`, :meth:`coo`, and :meth:`coupling_values` via
+        :meth:`compute_weights`, :meth:`support_values`, and :meth:`coupling_values` via
         their ``geom`` keyword argument, avoiding redundant recomputation.
 
         Parameters
@@ -183,60 +183,62 @@ class Support:
         """Per-point Winkler stiffness [N/m³]: ``k_clamp w_g + k_attachment w_a``."""
         return self._k_clamp * w_g + self.k_attachment * w_a
 
-    def coo(self):
-        """Return the support stiffness matrix in COO (coordinate) format. For
-        monolithic mode.
-
-        In the monolithic coupling strategy, the global FEM system is
-        assembled as a single block-structured matrix
-
-        .. math::
-
-            \\begin{bmatrix} K_{cc} & K_{cs} \\\\ K_{sc} & K_{ss} \\end{bmatrix}
-            \\begin{bmatrix} u_c \\\\ u_s \\end{bmatrix}
-            =
-            \\begin{bmatrix} f_c \\\\ f_s \\end{bmatrix}
-
-        where subscript *c* denotes coil DOFs and *s* denotes support DOFs.
-        The interface coupling blocks :math:`K_{cs}` / :math:`K_{sc}` arise from
-        the shared Winkler / contact constraint at the attachment surface.
-        ``coo()`` exposes the support's own diagonal block :math:`K_{ss}` (and
-        optionally the off-diagonal coupling blocks) so that
-        ``solve_monolithic`` can assemble the full system without re-entering
-        each sub-problem's internals.
-
-        COO format stores a sparse matrix as three parallel arrays:
-
-        ``I`` : array of int, shape ``(nnz,)``
-            Row indices of each non-zero entry, in the *local* DOF numbering
-            of the support (0 to ``n_dofs - 1``).
-        ``J`` : array of int, shape ``(nnz,)``
-            Column indices of each non-zero entry (same numbering as ``I``).
-        ``V`` : array of float, shape ``(nnz,)``
-            Stiffness values ``K[I[k], J[k]]`` for each entry *k*.  Units are
-            N/m (force per displacement).
-        ``n_dofs`` : int
-            Total number of support DOFs; sets the block size in the global
-            matrix.
-
-        The assembled sparse matrix is ``scipy.sparse.coo_matrix((V, (I, J)),
-        shape=(n_dofs, n_dofs))`` or its JAX / cuSPARSE equivalent.
+    def support_pattern(self):
+        """Static local COO I/J index arrays for the support stiffness block ``K_ss``.
 
         Returns
         -------
-        tuple
-            ``(I, J, V, n_dofs)`` as described above.
+        I, J : np.ndarray, shape ``(nnz,)``
+            Row and column indices in support-local DOF numbering.  Empty
+            int32 arrays for the uncoupled base support (no support DOFs).
+        """
+        import numpy as onp
+        empty = onp.zeros(0, dtype=onp.int32)
+        return empty, empty
+
+    def support_values(
+        self,
+        curves_jax: list,
+        support_dofs: dict,
+        surface_pts_by_coil: list | None = None,
+        geom: dict | None = None,
+        *,
+        jxw_by_coil: list | None = None,
+        beam_endpoints=None,
+    ):
+        """Traced COO values for the support stiffness block ``K_ss``.
+
+        Paired element-wise with :meth:`support_pattern`.  Override in
+        subclasses that participate in monolithic assembly (e.g.
+        :class:`~coil_fem.coupling.SupportBeams`).
+
+        Parameters
+        ----------
+        curves_jax : list
+            Differentiable centreline curves for all base coils.
+        support_dofs : dict
+            Optimisable support parameters.
+        surface_pts_by_coil : list or None
+            Per-coil surface query points.
+        geom : dict or None
+            Pre-computed geometry bundle from :meth:`geometry`.
+        jxw_by_coil : list or None
+            Per-coil surface JxW area measures.
+        beam_endpoints : list or None
+            Pre-computed endpoint spring data (subclass-specific).
+
+        Returns
+        -------
+        jax.Array, shape ``(nnz,)``
+            Stiffness values ``K_ss[I[k], J[k]]`` [N/m].
 
         Raises
         ------
         NotImplementedError
-            Raised by default; override in subclasses that support monolithic
-            assembly (e.g. ``SupportBeams``, ``DensityFieldSupport``).
-            The grounded :class:`Support` has no DOFs and never contributes a
-            stiffness block, so it intentionally keeps the default behaviour.
+            Default for the grounded :class:`Support`, which has no DOFs.
         """
         raise NotImplementedError(
-            f"{type(self).__name__}.coo() is not implemented. "
+            f"{type(self).__name__}.support_values() is not implemented. "
             "Only supports that participate in monolithic assembly need this."
         )
 
