@@ -36,10 +36,6 @@ def rotate_points_z(pts: jax.Array, phi: float) -> jax.Array:
     return jnp.stack([x, y, z], axis=-1)
 
 
-# Keep private aliases for backward compatibility with any internal callers.
-_rotate_points_z = rotate_points_z
-
-
 def flip_points(pts: jax.Array) -> jax.Array:
     """Apply stellarator reflection: negate y and z components.
 
@@ -47,9 +43,6 @@ def flip_points(pts: jax.Array) -> jax.Array:
     """
     signs = jnp.array([1.0, -1.0, -1.0])
     return pts * signs
-
-
-_flip_points = flip_points
 
 
 def rodrigues(axis: jax.Array, angle: jax.Array) -> jax.Array:
@@ -118,9 +111,9 @@ def apply_symmetries_to_gammas(
                     # Identity: keep original (avoids unnecessary computation)
                     images.append(g)
                 else:
-                    g = _rotate_points_z(g, phi)
+                    g = rotate_points_z(g, phi)
                     if flip:
-                        g = _flip_points(g)
+                        g = flip_points(g)
                     images.append(g)
     return jnp.stack(images, axis=0)  # (n_total, n_quad, 3)
 

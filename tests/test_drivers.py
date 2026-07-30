@@ -253,32 +253,7 @@ def test_coilfem_dispatch_calls_monolithic(monkeypatch):
 
 
 # ============================================================================
-# 4. Uncoupled path: _solve_all with Support is backward-compatible
-# ============================================================================
-
-def test_uncoupled_solve_all_backward_compatible():
-    """_solve_all with Support produces the same displacement as old path."""
-    fem  = _make_coilfem(coupling='staggered', support=Support(k_clamp=1e9))
-    dofs = [c.dofs for c in fem.base_curves_jax]
-    curr = jnp.array([1.0])
-
-    # Run via new _solve_all path
-    all_g, all_gd, all_c = fem._expand_geometry(dofs, curr)
-    solved = fem._solve_all(dofs, all_g, all_gd, all_c, base_support_dofs=None)
-
-    # Run via old objective (which also calls _solve_all internally now)
-    result = fem.run(dofs, curr, None)
-
-    u_new = solved['sol_list_by_coil'][0][0]
-    u_old = result['displacements'][0]
-    np.testing.assert_allclose(
-        np.array(u_new), np.array(u_old), atol=1e-12,
-        err_msg="_solve_all and run should return identical displacements.",
-    )
-
-
-# ============================================================================
-# 5. solve_staggered is retired
+# 4. solve_staggered is retired
 # ============================================================================
 
 def test_staggered_raises_not_implemented():
