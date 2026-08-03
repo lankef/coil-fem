@@ -19,7 +19,12 @@ from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
 from coil_fem.meshing import CoilMesh
 from coil_fem.pipelines import ElasticPipeline
 from coil_fem.coupling import Support, SupportBeams
-from coil_fem.solvers.cudss import weakest_symmetry, _MTYPE_ID, _STRENGTH
+from coil_fem.solvers.cudss import (
+    weakest_symmetry,
+    adjoint_reuses_forward_K,
+    _MTYPE_ID,
+    _STRENGTH,
+)
 
 
 # ============================================================================
@@ -76,6 +81,30 @@ def test_mtype_id_values():
 
 def test_strength_ordering():
     assert _STRENGTH['general'] < _STRENGTH['symmetric'] < _STRENGTH['spd']
+
+
+# ============================================================================
+# adjoint_reuses_forward_K
+# ============================================================================
+
+def test_adjoint_reuses_forward_K_symmetric_and_spd():
+    """Symmetric / SPD mtype_id → reuse forward K (no solver_KT workspace)."""
+    assert adjoint_reuses_forward_K('symmetric', _MTYPE_ID['symmetric']) is True
+    assert adjoint_reuses_forward_K('spd', _MTYPE_ID['spd']) is True
+
+
+def test_adjoint_reuses_forward_K_general():
+    """General mtype_id → keep a separate transpose solver."""
+    assert adjoint_reuses_forward_K('general', _MTYPE_ID['general']) is False
+
+
+def test_adjoint_reuses_forward_K_honours_mtype_override():
+    """Final mtype_id wins over the string claim (cudss_mtype_id override)."""
+    # Claim says symmetric but override forces general → do not reuse.
+    assert adjoint_reuses_forward_K('symmetric', 0) is False
+    # Claim says general but override forces symmetric → reuse.
+    assert adjoint_reuses_forward_K('general', 1) is True
+    assert adjoint_reuses_forward_K('general', 3) is True
 
 
 # ============================================================================
@@ -156,6 +185,21 @@ def test_build_fwd_pred_rejects_nonlinear_problem_on_cudss():
             build_fwd_pred(problem, {'solver': 'cudss'})
     finally:
         problem.is_linear = True
+
+
+def test_require_cuda_for_cudss_rejects_host_backend():
+    """require_cuda_for_cudss raises when no CUDA JAX device is available."""
+    import unittest.mock as mock
+    from coil_fem.solvers.cudss import require_cuda_for_cudss
+
+    host = mock.Mock()
+    host.platform = 'cpu'
+    with mock.patch('coil_fem.solvers.cudss.jax.devices', return_value=[host]):
+        with mock.patch(
+            'coil_fem.solvers.cudss.jax.default_backend', return_value='cpu'
+        ):
+            with pytest.raises(RuntimeError, match="JAX_PLATFORMS"):
+                require_cuda_for_cudss()
 
 
 # ============================================================================

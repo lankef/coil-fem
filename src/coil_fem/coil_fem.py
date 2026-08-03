@@ -441,7 +441,13 @@ class CoilFEM:
 
         # ── cuDSS-specific layer ──────────────────────────────────────────────
         if solver == 'cudss':
-            from .solvers.cudss import _import_cudss_solver, build_csr_pattern, weakest_symmetry, _MTYPE_ID
+            from .solvers.cudss import (
+                _import_cudss_solver,
+                build_csr_pattern,
+                weakest_symmetry,
+                adjoint_reuses_forward_K,
+                _MTYPE_ID,
+            )
 
             # Derive merged matrix type from each block's declared symmetry.
             _sym_claims = [p.problem.matrix_symmetry for p in self.pipelines]
@@ -460,6 +466,7 @@ class CoilFEM:
                 mtype_id = override
             device_id = int(self.problem_options.get('cudss_device_id', 0))
             mview_id  = 0
+            adjoint_reuses_K = adjoint_reuses_forward_K(merged_sym, mtype_id)
 
             CuDSSSolver = _import_cudss_solver()
 
@@ -477,13 +484,18 @@ class CoilFEM:
             )
             solver_K = _make_solver(indptr, indices)
 
-            iT, jT, coo_to_csr_T, _, _, nnz_csr_T = build_csr_pattern(
-                J_merged, I_merged, n_total_dofs
-            )
-            solver_KT = _make_solver(iT, jT)
+            # Symmetric / SPD: Kᵀ = K — skip a second cuDSS workspace.
+            if adjoint_reuses_K:
+                coo_to_csr_T = nnz_csr_T = solver_KT = None
+            else:
+                iT, jT, coo_to_csr_T, _, _, nnz_csr_T = build_csr_pattern(
+                    J_merged, I_merged, n_total_dofs
+                )
+                solver_KT = _make_solver(iT, jT)
         else:
             indptr = indices = coo_to_csr = None
             nnz_csr = 0
+            adjoint_reuses_K = True  # unused when merged_solve is None
             coo_to_csr_T = nnz_csr_T = solver_K = solver_KT = None
 
         static = MonolithicStatic(
@@ -507,6 +519,7 @@ class CoilFEM:
             indices=indices,
             coo_to_csr=coo_to_csr,
             nnz_csr=nnz_csr,
+            adjoint_reuses_K=adjoint_reuses_K,
             coo_to_csr_T=coo_to_csr_T,
             nnz_csr_T=nnz_csr_T,
             solver_K=solver_K,
@@ -790,8 +803,12 @@ class CoilFEM:
             'curves_by_coil':      curves_jax_list,
             'support_dofs':        base_support_dofs or {},
             # Pre-computed FE geometry (sg, jxw, vgj, pqp) per coil; passed to
-            # pipeline.solve → set_params to skip recompute_fe_geometry there.
+            # pipeline.solve / monolithic assemble → set_params to skip
+            # recompute_fe_geometry there.
             'fe_geom_by_coil':     fe_geom_by_coil,
+            # Pre-computed beam geometry; reused by monolithic assemble so
+            # SupportBeams.beam_geometry is not evaluated a second time.
+            'support_geom':        support_geom,
         }
 
         if self.support.is_coupled:
