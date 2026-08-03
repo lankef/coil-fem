@@ -367,9 +367,11 @@ def make_merged_solve(
         """Assemble merged COO value vector V, RHS f, and beam geometry.
 
         ``fe_geom`` / ``geom`` are precomputed by the caller (``_solve_all``)
-        so volume FE geometry and ``beam_geometry`` are not recomputed here.
-        Returns ``geom`` (possibly computed as a fallback) for the
-        ``custom_vjp`` residual.
+        so volume FE geometry and ``beam_geometry`` are not recomputed on the
+        *forward* path.  The custom_vjp backward constraint must still
+        recompute ``beam_geometry`` from ``sdofs`` (see ``_bwd``) — do not
+        treat this forward cache as an adjoint freeze.
+        Returns ``geom`` (possibly computed as a fallback).
         """
         surf_pts = _surf_quad_pts(pts)
         jxw_list = _surf_jxw(pts)
@@ -416,19 +418,22 @@ def make_merged_solve(
 
     def _fwd(bcd, sdofs, pts, bf, k, fe_geom, geom):
         # Call _assemble_merged_values directly (rather than through merged_solve)
-        # to capture V_merged and fwd_geom for the backward pass.  Stashing
-        # V_merged avoids a full Jacobian assembly in _bwd (review item 4g).
-        V_merged, f_merged, fwd_geom = _assemble_merged_values(
+        # to capture V_merged for the backward pass.  Stashing V_merged avoids a
+        # full Jacobian assembly in _bwd (review item 4g).
+        # ``geom`` is kept in the residual only to build a zero cotangent for the
+        # outer forward-cache argument — it must NOT be reused inside the
+        # constraint VJP (see _bwd).
+        V_merged, f_merged, _ = _assemble_merged_values(
             bcd, sdofs, pts, bf, k, fe_geom, geom,
         )
         csr_values = assemble_csr_values(V_merged, coo_to_csr, nnz_csr)
         sol_flat, _inertia = solver_K(f_merged, csr_values)
         return sol_flat, (
-            bcd, sdofs, pts, bf, k, fe_geom, sol_flat, fwd_geom, V_merged,
+            bcd, sdofs, pts, bf, k, fe_geom, sol_flat, geom, V_merged,
         )
 
     def _bwd(res, g_flat):
-        bcd, sdofs, pts, bf, k, fe_geom, sol_flat, fwd_geom, V_merged = res
+        bcd, sdofs, pts, bf, k, fe_geom, sol_flat, geom_arg, V_merged = res
         # Reuse V_merged from the forward pass — same system matrix, no need to
         # reassemble.  Symmetric / SPD: Kᵀ = K → reuse solver_K + forward CSR.
         if adjoint_reuses_K:
@@ -442,10 +447,20 @@ def make_merged_solve(
             s_quad_pts = _surf_quad_pts(pts_in)
             jxw_list_in = _surf_jxw(pts_in)
             curves = _make_curves(bcd_in)
-            # Freeze beam geometry from the forward pass (same as before):
-            # differentiate through the constraint at the forward-pass point
-            # without re-tracing beam_geometry.
-            geom_in = fwd_geom
+            # ------------------------------------------------------------------
+            # REQUIRED FOR CORRECT GRADIENTS — do not "optimize" this away.
+            #
+            # SupportBeams attachment DOFs (phis_*, x_foundation, thetas_*)
+            # enter K_ss / K_cs / K_sc almost entirely through beam_geometry
+            # (endpoints, gamma3, L_eff).  Reusing the forward-cached geom_arg
+            # here freezes that path, so jax.grad / CoilFEMObjective.dJ miss
+            # ∂K/∂φ and Taylor tests / L-BFGS on beam networks fail badly
+            # (analytic |dJh| ≫ FD).  Forward-only sharing of support_geom in
+            # _solve_all / _assemble_merged_values is fine; the constraint VJP
+            # must recompute.  For memory, use jax.checkpoint/remat — never
+            # freeze geom.
+            # ------------------------------------------------------------------
+            geom_in = support.beam_geometry(curves, sdofs_in)
             geom_kw = {'geom': geom_in} if geom_in is not None else {}
             residuals = []
             for i, pipeline in enumerate(pipelines):
@@ -488,11 +503,14 @@ def make_merged_solve(
             _merged_constraint, bcd, sdofs, pts, bf, k, fe_geom,
         )
         g_bcd, g_sdofs, g_pts, g_bf, g_k, g_fe_geom = vjp_fn(-lambda_flat)
-        # geom was frozen in the constraint — zero cotangent (preserves the
-        # pre-existing cut of ∂K/∂beam-frame through beam_geometry).
+        # Outer ``geom`` is a forward-only cache from _solve_all.  Support-DOF
+        # derivatives flow through sdofs → beam_geometry inside the constraint
+        # above — not through this cotangent.  Always zero; do not route grads
+        # via geom_arg (that would double-count if the constraint also
+        # recomputes, and freezing-without-recompute is incorrect).
         g_geom = jax.tree_util.tree_map(
-            jnp.zeros_like, fwd_geom,
-        ) if fwd_geom is not None else None
+            jnp.zeros_like, geom_arg,
+        ) if geom_arg is not None else None
         return g_bcd, g_sdofs, g_pts, g_bf, g_k, g_fe_geom, g_geom
 
     merged_solve.defvjp(_fwd, _bwd)
