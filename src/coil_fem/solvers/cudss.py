@@ -38,6 +38,15 @@ _SPINEAX_INSTALL_HINT = (
     '  pip install --no-build-isolation -e ".[cudss]"'
 )
 
+_CUDA_BACKEND_HINT = (
+    "problem_options['solver']='cudss' requires a CUDA JAX backend, but "
+    "jax.default_backend()={backend!r} and jax.devices()={devices}. "
+    "simsopt sets jax_platform_name='cpu' on import, which pins JAX to Host "
+    "if it initialises before a GPU backend is selected. Fix: restart the "
+    "process/kernel and set os.environ['JAX_PLATFORMS']='cuda' before "
+    "importing simsopt (or import coil_fem before simsopt)."
+)
+
 # ============================================================================
 # Matrix symmetry helpers
 # ============================================================================
@@ -65,8 +74,53 @@ def weakest_symmetry(*claims: str) -> str:
     return min(claims, key=_STRENGTH.__getitem__)
 
 
+def adjoint_reuses_forward_K(merged_sym: str, mtype_id: int) -> bool:
+    """True when ``Kᵀ = K`` so the adjoint may reuse ``solver_K`` + forward CSR.
+
+    Honours the *final* ``mtype_id`` (after any ``cudss_mtype_id`` override):
+    ``0`` (general) → ``False``; ``1`` (symmetric) and ``3`` (SPD) → ``True``.
+    ``merged_sym`` is accepted for call-site clarity / future checks but the
+    decision is driven by ``mtype_id``.
+
+    Parameters
+    ----------
+    merged_sym : str
+        Weakest merged claim from :func:`weakest_symmetry`.
+    mtype_id : int
+        Final cuDSS matrix type id (0=general, 1=symmetric, 3=SPD).
+
+    Returns
+    -------
+    bool
+    """
+    if merged_sym not in _MTYPE_ID:
+        raise ValueError(
+            f"merged_sym must be one of {sorted(_MTYPE_ID)}, got {merged_sym!r}"
+        )
+    return mtype_id != 0
+
+
+def require_cuda_for_cudss() -> None:
+    """Raise if the cuDSS path is used without a CUDA JAX device.
+
+    spineax registers ``solve_single_f64`` only for ``platform='CUDA'``.  When
+    JAX is pinned to Host (commonly by simsopt's
+    ``jax_platform_name='cpu'``), the FFI call fails with an opaque
+    ``NOT_FOUND`` error; this check fails earlier with a clear fix.
+    """
+    devices = jax.devices()
+    if not any(d.platform == 'gpu' for d in devices):
+        raise RuntimeError(
+            _CUDA_BACKEND_HINT.format(
+                backend=jax.default_backend(),
+                devices=devices,
+            )
+        )
+
+
 def _import_cudss_solver():
     """Import spineax's ``CuDSSSolver``, raising a helpful error if missing."""
+    require_cuda_for_cudss()
     try:
         from spineax.cudss.solver import CuDSSSolver
     except ImportError as e:

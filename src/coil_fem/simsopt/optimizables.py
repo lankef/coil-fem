@@ -707,11 +707,11 @@ class CoilSupportBeams(CoilSupport):
         if 'k_attachment' not in beam_options:
             eps_attachment = beam_options.get('eps_attachment', 1e-3)
             E_beams = beam_options['E']
-            # [n_coil, 3]
-            centers = np.array([curve_center(c.curve) for c in base_coils])
-            # [n_coil - 1]
-            # The scale-length of coil-coil beams are the inter-coil distance.
-            displacements = np.linalg.norm(centers[1:] - centers[:-1]+1e-8, axis=-1)
+            centers_zero = curve_center(base_coils[0].curve)
+            estimated_R = jnp.sqrt(centers_zero[0]**2 + centers_zero[1]**2)
+            displacements = estimated_R * jnp.pi * 2 / nfp / len(base_coils)
+            if stellsym:
+                displacements = displacements / 2
             k_attachment = estimate_k(
                 L=np.mean(displacements),
                 E=E_beams,
