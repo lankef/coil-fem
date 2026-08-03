@@ -153,6 +153,7 @@ def test_monolithic_raises_on_cpu():
         J_ss_pat=np.zeros(0, dtype=np.int32),
         I_cs_pat=None, J_cs_pat=None, I_sc_pat=None, J_sc_pat=None,
         indptr=None, indices=None, coo_to_csr=None, nnz_csr=0,
+        adjoint_reuses_K=True,
         coo_to_csr_T=None, nnz_csr_T=None,
         solver_K=None, solver_KT=None, merged_solve=None,
     )

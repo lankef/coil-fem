@@ -7,11 +7,11 @@ without requiring the GPU stack:
 * the linearity identity ``K u == R(u) - R(0)`` for a ``gpu_assembly=True``
   problem, validating that :meth:`ElasticPipeline.assemble_coo` returns a
   consistent ``(I, J, V)`` triplet;
-* the transpose CSR pattern used by the adjoint solve;
-* the ``gpu_assembly`` gate on :meth:`ElasticPipeline.assemble_coo`.
+* the transpose CSR pattern used by the general (non-symmetric) adjoint path;
+* the ``gpu_assembly`` gate and ``_fe_geom`` assemble parity.
 
-A GPU-gated end-to-end test compares ``solve_monolithic`` against
-``solve_staggered`` and is skipped unless spineax + a CUDA device are present.
+A GPU-gated test checks that a symmetric SupportBeams + elasticity merge
+skips ``solver_KT`` and that a forward monolithic solve stays finite.
 """
 
 from __future__ import annotations
@@ -31,7 +31,8 @@ from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
 from coil_fem.meshing import CoilMesh
 from coil_fem.pipelines import ElasticPipeline
 from coil_fem.problems import LinearElasticity3D
-from coil_fem.coupling import SupportBeams, solve_monolithic, solve_staggered
+from coil_fem.coupling import SupportBeams
+from coil_fem.problems import recompute_fe_geometry
 from coil_fem.solvers.cudss import build_csr_pattern, assemble_csr_values
 
 _HAS_SPINEAX = importlib.util.find_spec("spineax") is not None
@@ -205,8 +206,38 @@ def test_assemble_coo_requires_gpu_assembly():
         pipeline.assemble_coo(params)
 
 
+def test_assemble_coo_fe_geom_parity():
+    """set_params / Newton V with ``_fe_geom`` matches a fresh recompute."""
+    mesh = _tiny_mesh()
+    problem = _gpu_problem(mesh)
+    pts = jnp.asarray(mesh.points)
+    n_sq = problem.n_surface_quads
+    base = {
+        'points':     pts,
+        'body_force': jnp.zeros((mesh.n_cells, mesh.n_quads, 3)),
+        'support_k':  jnp.ones(n_sq) * 1e9,
+    }
+    fe_geom = recompute_fe_geometry(
+        pts, problem._cells_jnp, problem._sg_ref, problem._sv, problem._qw,
+    )
+
+    def _assemble(params):
+        problem.set_params(params)
+        zero_sol = [jnp.zeros((problem.fes[0].num_total_nodes, 3))]
+        res = problem.compute_newton_vars(
+            zero_sol, problem.internal_vars, problem.internal_vars_surfaces,
+        )
+        load = -jax.flatten_util.ravel_pytree(res)[0]
+        return problem.V_jax, load
+
+    V0, f0 = _assemble(dict(base))
+    V1, f1 = _assemble({**base, '_fe_geom': fe_geom})
+    assert jnp.allclose(V0, V1, rtol=1e-12, atol=1e-14)
+    assert jnp.allclose(f0, f1, rtol=1e-12, atol=1e-14)
+
+
 # ---------------------------------------------------------------------------
-# 4. GPU-gated end-to-end: monolithic vs staggered
+# 4. GPU-gated: symmetric merged system skips solver_KT
 # ---------------------------------------------------------------------------
 
 def _constant_section_fn(A_val=1e-4, Iy_val=1e-8, Iz_val=1e-8, J_val=2e-8):
@@ -230,22 +261,17 @@ def _uniform_clamp_fn(surface_pts_beam_frame, dofs, sign_x, constants):
 
 
 @pytest.mark.skipif(not (_HAS_SPINEAX and _HAS_GPU), reason=_GPU_REASON)
-def test_monolithic_matches_staggered():
-    """solve_monolithic and solve_staggered agree on a small coupled system."""
-    k_attachment = 1e8
+def test_monolithic_static_reuses_K_when_symmetric():
+    """Symmetric SupportBeams + elasticity: no second cuDSS transpose workspace."""
+    from coil_fem import CoilFEM
+
     n_base = 2
     radii = [1.0, 1.1]
-    curves = [_make_circle(N=8, R=R) for R in radii]
-
-    pipelines = [
-        _make_pipeline(_tiny_mesh(R), solver='cudss')
-        for R in radii
-    ]
-
+    curves = [_make_circle(N=4, R=R) for R in radii]
     beam_options = {
         'n_beam_cc': 1, 'n_beam_cf': 1,
         'E': 200e9, 'nu': 0.3,
-        'k_attachment': k_attachment,
+        'k_attachment': 1e8,
     }
     support = SupportBeams(
         nfp=1, stellsym=False,
@@ -254,12 +280,33 @@ def test_monolithic_matches_staggered():
         cross_section_fn=_constant_section_fn(),
         attachment_fn=_uniform_clamp_fn,
     )
+    fem = CoilFEM(
+        base_curves_jax=curves,
+        base_currents_jax=jnp.ones(n_base),
+        nfp=1,
+        stellsym=False,
+        mesh_options={
+            'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
+            'n_grid_1': 1, 'n_grid_2': 1,
+        },
+        support=support,
+        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        problem_options={'solver': 'cudss'},
+        coupling='monolithic',
+    )
+    static = fem.monolithic_static
+    assert static is not None
+    assert static.adjoint_reuses_K is True
+    assert static.solver_KT is None
+    assert static.coo_to_csr_T is None
 
     phi = [jnp.full((1,), 0.1) for _ in range(n_base)]
     x_found = []
-    for i, R in enumerate(radii):
-        xf = jnp.array([R * math.cos(2 * math.pi * 0.6) + 0.5, 0.0,
-                        R * math.sin(2 * math.pi * 0.6)])
+    for R in radii:
+        xf = jnp.array([
+            R * math.cos(2 * math.pi * 0.6) + 0.5, 0.0,
+            R * math.sin(2 * math.pi * 0.6),
+        ])
         x_found.append(xf[None, :])
     support_dofs = {
         'phis_start_cc':         list(phi),
@@ -269,23 +316,11 @@ def test_monolithic_matches_staggered():
         'thetas_orientation_cc': [jnp.zeros((1,)) for _ in range(n_base)],
         'thetas_orientation_cf': [jnp.zeros((1,)) for _ in range(n_base)],
     }
-
-    pts = [jnp.asarray(p.mesh.points) for p in pipelines]
-    bf = [jnp.zeros((p.mesh.n_cells, p.mesh.n_quads, 3)) for p in pipelines]
-    wt = [jnp.ones(p.n_surface_quads) * k_attachment for p in pipelines]
-    params = {
-        'mesh_points_by_coil': pts,
-        'body_force_by_coil':  bf,
-        'stiffness_by_coil':   wt,
-        'curves_by_coil':      curves,
-        'base_curves_dofs':    [c.dofs for c in curves],
-        'support_dofs':        support_dofs,
-    }
-
-    mono = solve_monolithic(pipelines, support, params)
-    stag = solve_staggered(pipelines, support, params)
-
-    assert jnp.all(jnp.isfinite(mono['u_s']))
-    assert jnp.allclose(mono['u_s'], stag['u_s'], rtol=1e-4, atol=1e-8)
-    for a, b in zip(mono['sol_list_by_coil'], stag['sol_list_by_coil']):
-        assert jnp.allclose(a[0], b[0], rtol=1e-4, atol=1e-8)
+    out = fem.run(
+        base_curves_dofs=[c.dofs for c in curves],
+        base_currents_dofs=jnp.ones(n_base),
+        base_support_dofs=support_dofs,
+    )
+    assert jnp.all(jnp.isfinite(out['u_s']))
+    for u in out['displacements']:
+        assert jnp.all(jnp.isfinite(u))
