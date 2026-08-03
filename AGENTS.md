@@ -188,6 +188,7 @@ Two kinds of data bundles appear in this codebase; use the correct container for
 - Use plain `dict` or `NamedTuple`.  Both are JAX pytrees.
 - Example: `geom` dict returned by `SupportBeams.beam_geometry(curves_jax, support_dofs)` contains endpoint positions, lengths, DCMs, and (when meshes are bound) `L_eff` — all traced arrays.
 - Example: `support_dofs` passed to solvers and metrics.
+- **Never freeze `beam_geometry` in the monolithic constraint VJP** (`make_merged_solve` `_bwd` in `coupling/drivers.py`). Attachment DOFs (`phis_*`, etc.) enter `K_ss`/`K_cs`/`K_sc` through that geom; freezing it breaks `dJ` / Taylor tests. Forward-only geom sharing in `_solve_all` is fine; for memory use `jax.checkpoint`/remat, not a freeze.
 
 **Static bundles** (fixed at construction, never traced):
 - Use `@dataclasses.dataclass(frozen=True, eq=False)`.  The `eq=False` flag prevents JAX from treating the dataclass as a pytree leaf during hashing; the `frozen=True` flag enforces immutability.

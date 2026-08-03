@@ -758,7 +758,11 @@ class CoilFEM:
         # Build live CurveXYZFourierJAX objects once (used for weights + drivers).
         curves_jax_list = self.curves_from_dofs(base_curves_dofs)
 
-        # When coupled, compute beam geometry once and reuse for weights.
+        # When coupled, compute beam geometry once and reuse for *forward*
+        # weights + monolithic assemble.  This is a forward-only cache: the
+        # custom_vjp constraint in make_merged_solve must recompute
+        # beam_geometry from support DOFs so ∂K/∂φ reaches the adjoint.
+        # Do not freeze geom in that VJP as a "memory optimization".
         support_geom = None
         if self.support.is_coupled:
             support_geom = self.support.beam_geometry(
@@ -806,8 +810,8 @@ class CoilFEM:
             # pipeline.solve / monolithic assemble → set_params to skip
             # recompute_fe_geometry there.
             'fe_geom_by_coil':     fe_geom_by_coil,
-            # Pre-computed beam geometry; reused by monolithic assemble so
-            # SupportBeams.beam_geometry is not evaluated a second time.
+            # Pre-computed beam geometry for the forward assemble only.
+            # Adjoint path in make_merged_solve recomputes beam_geometry.
             'support_geom':        support_geom,
         }
 

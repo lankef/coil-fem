@@ -10,8 +10,10 @@ without requiring the GPU stack:
 * the transpose CSR pattern used by the general (non-symmetric) adjoint path;
 * the ``gpu_assembly`` gate and ``_fe_geom`` assemble parity.
 
-A GPU-gated test checks that a symmetric SupportBeams + elasticity merge
-skips ``solver_KT`` and that a forward monolithic solve stays finite.
+GPU-gated tests check that a symmetric SupportBeams + elasticity merge
+skips ``solver_KT``, that a forward monolithic solve stays finite, and that
+``∂J/∂φ`` for a beam attachment angle matches a centered finite difference
+(regression for freezing ``beam_geometry`` in the constraint VJP).
 """
 
 from __future__ import annotations
@@ -237,7 +239,7 @@ def test_assemble_coo_fe_geom_parity():
 
 
 # ---------------------------------------------------------------------------
-# 4. GPU-gated: symmetric merged system skips solver_KT
+# 4. GPU-gated: SupportBeams monolithic + gradient checks
 # ---------------------------------------------------------------------------
 
 def _constant_section_fn(A_val=1e-4, Iy_val=1e-8, Iz_val=1e-8, J_val=2e-8):
@@ -260,9 +262,8 @@ def _uniform_clamp_fn(surface_pts_beam_frame, dofs, sign_x, constants):
     return jnp.ones(surface_pts_beam_frame.shape[0])
 
 
-@pytest.mark.skipif(not (_HAS_SPINEAX and _HAS_GPU), reason=_GPU_REASON)
-def test_monolithic_static_reuses_K_when_symmetric():
-    """Symmetric SupportBeams + elasticity: no second cuDSS transpose workspace."""
+def _tiny_support_beams_fem():
+    """Shared tiny 2-coil SupportBeams + monolithic CoilFEM for GPU tests."""
     from coil_fem import CoilFEM
 
     n_base = 2
@@ -294,12 +295,6 @@ def test_monolithic_static_reuses_K_when_symmetric():
         problem_options={'solver': 'cudss'},
         coupling='monolithic',
     )
-    static = fem.monolithic_static
-    assert static is not None
-    assert static.adjoint_reuses_K is True
-    assert static.solver_KT is None
-    assert static.coo_to_csr_T is None
-
     phi = [jnp.full((1,), 0.1) for _ in range(n_base)]
     x_found = []
     for R in radii:
@@ -316,11 +311,67 @@ def test_monolithic_static_reuses_K_when_symmetric():
         'thetas_orientation_cc': [jnp.zeros((1,)) for _ in range(n_base)],
         'thetas_orientation_cf': [jnp.zeros((1,)) for _ in range(n_base)],
     }
+    return fem, curves, support_dofs
+
+
+@pytest.mark.skipif(not (_HAS_SPINEAX and _HAS_GPU), reason=_GPU_REASON)
+def test_monolithic_static_reuses_K_when_symmetric():
+    """Symmetric SupportBeams + elasticity: no second cuDSS transpose workspace."""
+    fem, curves, support_dofs = _tiny_support_beams_fem()
+    static = fem.monolithic_static
+    assert static is not None
+    assert static.adjoint_reuses_K is True
+    assert static.solver_KT is None
+    assert static.coo_to_csr_T is None
+
     out = fem.run(
         base_curves_dofs=[c.dofs for c in curves],
-        base_currents_dofs=jnp.ones(n_base),
+        base_currents_dofs=jnp.ones(len(curves)),
         base_support_dofs=support_dofs,
     )
     assert jnp.all(jnp.isfinite(out['u_s']))
     for u in out['displacements']:
         assert jnp.all(jnp.isfinite(u))
+
+
+@pytest.mark.skipif(not (_HAS_SPINEAX and _HAS_GPU), reason=_GPU_REASON)
+def test_monolithic_support_phi_grad_matches_fd():
+    """Analytic ∂J/∂phis_start_cc must match centered FD (geom VJP regression).
+
+    Freezing ``beam_geometry`` in ``make_merged_solve``'s constraint VJP cuts
+    ∂K/∂φ through the beam frame; the analytic directional derivative then
+    disagrees with FD by orders of magnitude.  This tiny-mesh check catches
+    that class of bug without the full-resolution Taylor job.
+    """
+    fem, curves, support_dofs0 = _tiny_support_beams_fem()
+    cdofs = [c.dofs for c in curves]
+    idofs = jnp.ones(len(curves))
+
+    def J_of_phi0(phi0):
+        sdofs = {
+            **support_dofs0,
+            'phis_start_cc': [
+                jnp.full((1,), phi0),
+                support_dofs0['phis_start_cc'][1],
+            ],
+        }
+        out = fem.objective(
+            cdofs, idofs, sdofs, metrics=('l2_von_mises',),
+        )
+        return out['l2_von_mises']
+
+    phi0 = float(support_dofs0['phis_start_cc'][0][0])
+    dJ_analytic = float(jax.grad(J_of_phi0)(phi0))
+
+    eps = 1e-5
+    J_p = float(J_of_phi0(phi0 + eps))
+    J_m = float(J_of_phi0(phi0 - eps))
+    dJ_fd = (J_p - J_m) / (2.0 * eps)
+
+    assert np.isfinite(dJ_analytic) and np.isfinite(dJ_fd)
+    # Frozen-geom bug gave |analytic|/|FD| ~ 1e4+; require close agreement.
+    scale = max(abs(dJ_fd), abs(dJ_analytic), 1.0)
+    assert abs(dJ_analytic - dJ_fd) / scale < 5e-2, (
+        f"dJ_analytic={dJ_analytic!r}, dJ_fd={dJ_fd!r}, "
+        f"rel_err={abs(dJ_analytic - dJ_fd) / scale!r}"
+    )
