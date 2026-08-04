@@ -222,6 +222,127 @@ def _rotated_rmf_frame_pure(gamma, gammadash, alpha):
 # are hashable by identity and stable, so the cache key is stable.
 
 
+def _trig_interp(values, phi):
+    """Band-limited periodic interpolation of a uniformly sampled scalar field.
+
+    ``values`` are samples of a 1-periodic scalar at ``phi_k = k/N``.  The
+    band-limited Fourier series is reconstructed and evaluated at arbitrary
+    *phi*, reproducing ``values`` exactly at the sample points.  Smooth
+    (C-infinity) everywhere, so ``jax.grad`` through *phi* is exact.
+
+    Parameters
+    ----------
+    values : jax.Array, shape (N,)
+        Samples on the uniform grid ``phi_k = k/N``.
+    phi : array-like
+        Target parameter values, arbitrary shape.
+
+    Returns
+    -------
+    jax.Array
+        Shape ``phi.shape``.
+    """
+    phi_arr = jnp.asarray(phi, dtype=float)
+    N = values.shape[0]
+    hat = jnp.fft.rfft(values)                        # (K,), K = N//2 + 1
+    K = hat.shape[0]
+    k = jnp.arange(K, dtype=float)                    # (K,)
+
+    angle = 2.0 * jnp.pi * k * phi_arr[..., None]     # (..., K)
+    real = hat.real * jnp.cos(angle) - hat.imag * jnp.sin(angle)
+
+    # Reconstruction weights: 1 for DC; 2 for general k; 1 for Nyquist (only
+    # present when N is even).  Matches the band-limited periodic interpolant
+    # that ``irfft`` produces at the sampling phases.
+    if N % 2 == 0:
+        weights = jnp.where((k == 0) | (k == K - 1), 1.0, 2.0)
+    else:
+        weights = jnp.where(k == 0, 1.0, 2.0)
+
+    return jnp.sum(weights * real, axis=-1) / N
+
+
+def _centroid_reference(gamma, gammadash, centroid):
+    """Closed-form centroid reference frame ``(t, p, q)`` at arbitrary points.
+
+    Shared by the centroid frame itself and by the RMF twist representation,
+    which stores the RMF as a rotation angle relative to this frame.
+    """
+    t = gammadash / jnp.linalg.norm(gammadash, axis=-1, keepdims=True)
+    delta = gamma - centroid
+    p = delta - jnp.sum(delta * t, axis=-1, keepdims=True) * t
+    p = p / _safe_norm(p, axis=-1)[..., None]
+    q = jnp.cross(t, p)
+    return t, p, q
+
+
+def _rmf_twist_pure(gamma, gammadash):
+    """RMF twist angle relative to the centroid frame, per quadpoint.
+
+    Returns ``theta`` such that the (pre-``alpha``) RMF normal satisfies
+    ``p_rmf = cos(theta) p_c - sin(theta) q_c`` in the centroid reference
+    frame.  Reducing the frame to a single scalar per quadpoint is what makes
+    smooth off-grid evaluation possible: interpolating this angle keeps
+    ``(t, p, q)`` exactly orthonormal by construction, whereas interpolating
+    the vectors componentwise does not.
+
+    Parameters
+    ----------
+    gamma, gammadash : jax.Array, shape (N, 3)
+
+    Returns
+    -------
+    jax.Array, shape (N,)
+    """
+    t = gammadash / jnp.linalg.norm(gammadash, axis=1, keepdims=True)
+    p_rmf = _rmf_normals_pure_jax(gamma, gammadash)
+    # Re-orthogonalise exactly as _rotated_rmf_frame_pure does, so the stored
+    # twist reproduces that function's frame.
+    p_rmf = p_rmf - jnp.sum(p_rmf * t, axis=1, keepdims=True) * t
+    p_rmf = p_rmf / jnp.linalg.norm(p_rmf, axis=1, keepdims=True)
+
+    _, p_c, q_c = _centroid_reference(gamma, gammadash, jnp.mean(gamma, axis=0))
+    return jnp.arctan2(
+        -jnp.sum(p_rmf * q_c, axis=1), jnp.sum(p_rmf * p_c, axis=1)
+    )
+
+
+def _unwrap_periodic(theta):
+    """Split a sampled angle field into a linear winding ramp and a periodic part.
+
+    ``theta`` is sampled at ``phi_k = k/N`` and is continuous only modulo 2pi.
+    The RMF's periodic closure correction (:func:`_rmf_normals_pure_jax`) leaves
+    an O(1/N) residual, so ``theta`` is not exactly periodic and interpolating
+    it directly would ring at the ``phi = 0`` seam.  Unwrapping over one full
+    period (including the wrap step back to index 0) and subtracting the linear
+    ramp leaves an exactly periodic remainder that is safe to interpolate.
+
+    Returns
+    -------
+    periodic : jax.Array, shape (N,)
+        Exactly periodic remainder, for :func:`_trig_interp`.
+    total : jax.Array, scalar
+        Net winding over one full period; add ``total * phi`` analytically.
+    """
+    N = theta.shape[0]
+    # Include the wrap step so the winding is measured over the full period.
+    ext = jnp.unwrap(jnp.concatenate([theta, theta[:1]]))
+    total = ext[-1] - ext[0]
+    ramp = jnp.arange(N, dtype=float) * (total / N)
+    return ext[:-1] - ramp, total
+
+
+@partial(jax.jit, static_argnums=(0,))
+def _twist_jitted(twist_pure, gamma, gammadash):
+    """JIT-cached evaluation of a pure twist function ``-> theta``.
+
+    Shares the rationale of :func:`_frame_jitted`: the RMF twist runs the
+    ``lax.scan`` double-reflection sweep, which must not be re-lowered on every
+    eager call.
+    """
+    return twist_pure(gamma, gammadash)
+
+
 @partial(jax.jit, static_argnums=(0,))
 def _frame_jitted(frame_pure, gamma, gammadash, alpha):
     """JIT-cached evaluation of a pure frame function ``-> (t, p, q)``."""
@@ -259,17 +380,32 @@ class FramedCurveJAX:
     alpha : jax.Array (nquad,)
         Rotation angles around the tangent at quadrature points
         (default: zeros).
+    twist : jax.Array (nquad,) or None
+        Frame-specific angle field built once at construction; ``None`` for
+        frames with a closed-form pointwise evaluation (see
+        :attr:`_twist_pure_fn`).  Carried as a pytree child so that JAX
+        transformations never rebuild it.
 
     The derivative ``alphadash()`` is computed automatically from ``alpha``
     via spectral (FFT) differentiation and does not need to be supplied.
     """
 
-    def __init__(self, curve, alpha=None):
+    def __init__(self, curve, alpha=None, *, twist=None):
         self.curve = curve
         n = curve.quadpoints.shape[0]
         if alpha is None:
             alpha = jnp.zeros(n)
         self.alpha = jnp.asarray(alpha, dtype=float)
+        # Built here, once, and only when not supplied.  tree_unflatten passes
+        # the stored value straight back through, so pytree round-trips (every
+        # jit/grad/vmap boundary, every tree_map) never re-run the lax.scan.
+        # with_dofs deliberately omits it, so new DOFs rebuild exactly once.
+        if twist is None and type(self)._twist_pure_fn is not None:
+            twist = _twist_jitted(
+                type(self)._twist_pure_fn,
+                self.curve.gamma(), self.curve.gammadash(),
+            )
+        self.twist = twist
 
     def with_dofs(self, dofs):
         """Return a new framed curve of the same type built from new curve DOFs.
@@ -280,6 +416,9 @@ class FramedCurveJAX:
         used to regenerate mesh geometry from traced DOFs: ``dofs`` is the only
         traced input; ``quadpoints``/``order``/``alpha`` are treated as
         constants.  The stored ``self.curve.dofs`` is intentionally ignored.
+
+        ``twist`` is *not* carried over — new DOFs mean a new frame, so this is
+        the single point at which frame construction happens per DOF update.
 
         Parameters
         ----------
@@ -359,12 +498,12 @@ class FramedCurveJAX:
         return jnp.sum(weights * real, axis=-1) / N
 
     def tree_flatten(self):
-        return (self.curve, self.alpha), None
+        return (self.curve, self.alpha, self.twist), None
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        curve, alpha = children
-        return cls(curve, alpha)
+        curve, alpha, twist = children
+        return cls(curve, alpha, twist=twist)
 
     # ============================================================================
     # Curve pass-throughs
@@ -409,6 +548,14 @@ class FramedCurveJAX:
     # argument to the JIT-cached helpers, so it must be a stable, hashable
     # module-level function (a ``staticmethod`` wrapping such a function).
     _frame_pure_fn = None
+
+    # Subclasses whose frame has no closed-form pointwise evaluation set this
+    # to a module-level pure function ``(gamma, gammadash) -> theta`` giving a
+    # per-quadpoint angle relative to the centroid reference frame.  When set,
+    # ``__init__`` builds and stores that angle field once (see :attr:`twist`)
+    # and evaluation off-grid interpolates it.  ``None`` means the subclass
+    # evaluates itself in closed form and needs no stored state.
+    _twist_pure_fn = None
 
     def _rotated_frame_fn(self, gamma, gammadash, alpha):
         """Pure frame function (gamma, gammadash, alpha) -> (t, p, q).
@@ -621,29 +768,39 @@ class FramedCurveRMFJAX(FramedCurveJAX):
     """
 
     _frame_pure_fn = staticmethod(_rotated_rmf_frame_pure)
+    _twist_pure_fn = staticmethod(_rmf_twist_pure)
 
     def _rotated_frame_fn(self, gamma, gammadash, alpha):
         return _rotated_rmf_frame_pure(gamma, gammadash, alpha)
 
+    def rotated_frame(self):
+        """Return (t, p, q) at quadrature points, each shape (nquad, 3).
+
+        Evaluated through :meth:`rotated_frame_eval` so that on- and off-grid
+        queries come from the same stored twist — there is exactly one frame.
+        """
+        return self.rotated_frame_eval(self.curve.quadpoints)
+
     def rotated_frame_eval(self, phi):
-        r"""RMF at arbitrary parameter values via a fresh-grid scan.
+        r"""RMF at arbitrary parameter values, from the twist built at construction.
 
-        Builds a fresh :class:`FramedCurveRMFJAX` whose quadpoints are the
-        (flattened) target *phi* values with ``alpha`` analytically
-        resampled via :meth:`alpha_eval`, then runs the standard RMF
-        double-reflection sweep.
+        The RMF is defined by discrete propagation along the curve, so it has
+        no closed-form pointwise expression.  Instead the propagation is run
+        **once** (in ``__init__``, giving :attr:`twist`) and evaluation
+        interpolates that angle field against the closed-form centroid
+        reference frame.  Consequences:
 
-        The RMF is inherently defined by a discrete propagation along the
-        curve, so the result depends on the *ordering and density* of the
-        supplied *phi*.  Pass a sorted uniform grid
-        (e.g. ``jnp.linspace(0., 1., K, endpoint=False)``) for best
-        accuracy and to preserve the periodic closure of the frame.
+        * ``t`` is exact — it comes from :meth:`CurveXYZFourierJAX.gamma_eval`,
+          never from interpolation.
+        * ``p`` and ``q`` are exactly orthonormal by construction, because only
+          a scalar angle is interpolated.
+        * The result is smooth in *phi* and independent of the ordering or
+          density of the query points, so scattered *phi* is fully supported.
 
         Parameters
         ----------
         phi : array-like
-            Target parameter values, arbitrary shape. Propagation runs
-            over the *flattened* ordering before being reshaped back.
+            Target parameter values, arbitrary shape.
 
         Returns
         -------
@@ -651,13 +808,19 @@ class FramedCurveRMFJAX(FramedCurveJAX):
             Each array has shape ``phi.shape + (3,)``.
         """
         phi_arr = jnp.asarray(phi, dtype=float)
-        flat = phi_arr.ravel()
-        new_curve = type(self.curve)(flat, self.curve.dofs, self.curve.order)
-        new_alpha = self.alpha_eval(flat)
-        new_fc = type(self)(new_curve, new_alpha)
-        t, p, q = new_fc.rotated_frame()
-        out_shape = phi_arr.shape + (3,)
-        return t.reshape(out_shape), p.reshape(out_shape), q.reshape(out_shape)
+        gamma = self.curve.gamma_eval(phi_arr, 0)
+        gammadash = self.curve.gamma_eval(phi_arr, 1)
+        t, p_c, q_c = _centroid_reference(
+            gamma, gammadash, jnp.mean(self.curve.gamma(), axis=0)
+        )
+
+        periodic, total = _unwrap_periodic(self.twist)
+        theta = _trig_interp(periodic, phi_arr) + total * phi_arr
+        angle = theta + self.alpha_eval(phi_arr)
+
+        ca = jnp.cos(angle)[..., None]
+        sa = jnp.sin(angle)[..., None]
+        return t, ca * p_c - sa * q_c, sa * p_c + ca * q_c
 
 
 # ============================================================================
