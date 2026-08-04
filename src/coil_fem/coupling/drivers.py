@@ -30,11 +30,22 @@ import jax.numpy as jnp
 
 # Debug ablations for grounded-w_a VJP isolation (see notes/WINKLER_WA_VJP.md).
 # Set COIL_FEM_VJP_ABLATION before constructing CoilFEM / make_merged_solve:
-#   "" | "none"            — normal reverse mode
-#   "freeze_k"             — zero g_k (cut outer sdofs→k→R_coil path)
-#   "freeze_sdofs_geom"    — stop_gradient(sdofs) in constraint geom/coupling
-#                            (keep k_in live; only outer k path for support DOFs)
+#   "" | "none"               — normal reverse mode
+#   "freeze_k"                — zero g_k (cut outer sdofs→k→R_coil path)
+#   "freeze_sdofs_geom"       — stop_gradient(sdofs) in constraint geom/coupling
+#                               (keep k_in live)
+#   "freeze_wa_in_k"          — stop_gradient(w_a) when building outer Winkler k
+#                               in CoilFEM._solve_all (clamp + coupling stay live)
+#   "freeze_wa_in_coupling"   — stop_gradient(attachment weight) inside constraint
+#                               K_ss / K_cs / K_sc only (outer k path stays live)
 _VJP_ABLATION_ENV = "COIL_FEM_VJP_ABLATION"
+_VJP_ABLATION_CHOICES = (
+    "none",
+    "freeze_k",
+    "freeze_sdofs_geom",
+    "freeze_wa_in_k",
+    "freeze_wa_in_coupling",
+)
 
 if TYPE_CHECKING:
     from ..pipelines import ElasticPipeline
@@ -320,10 +331,10 @@ def make_merged_solve(
     vjp_ablation = os.environ.get(_VJP_ABLATION_ENV, "").strip().lower()
     if vjp_ablation in ("", "none"):
         vjp_ablation = "none"
-    if vjp_ablation not in ("none", "freeze_k", "freeze_sdofs_geom"):
+    if vjp_ablation not in _VJP_ABLATION_CHOICES:
         raise ValueError(
             f"{_VJP_ABLATION_ENV}={vjp_ablation!r} invalid; "
-            "use none|freeze_k|freeze_sdofs_geom."
+            f"use {'|'.join(_VJP_ABLATION_CHOICES)}."
         )
     if vjp_ablation != "none":
         print(
@@ -331,6 +342,7 @@ def make_merged_solve(
             f"(env {_VJP_ABLATION_ENV})",
             flush=True,
         )
+    freeze_wa_in_coupling = (vjp_ablation == "freeze_wa_in_coupling")
 
     coil_dof_offsets          = static.coil_dof_offsets
     support_dof_offset        = static.support_dof_offset
@@ -467,10 +479,7 @@ def make_merged_solve(
             csr_values_T = assemble_csr_values(V_merged, coo_to_csr_T, nnz_csr_T)
             lambda_flat, _inertia = solver_KT(g_flat, csr_values_T)
 
-        def _merged_constraint(bcd_in, sdofs_in, pts_in, bf_in, _k_fwd_cache, fe_geom_in):
-            # ``_k_fwd_cache`` unused: Winkler k that depends on support DOFs is
-            # rebuilt below (same forward-cache policy as geom_arg).  Kept as a
-            # traced argument so the merged_solve signature stays stable.
+        def _merged_constraint(bcd_in, sdofs_in, pts_in, bf_in, k_in, fe_geom_in):
             s_quad_pts = _surf_quad_pts(pts_in)
             jxw_list_in = _surf_jxw(pts_in)
             curves = _make_curves(bcd_in)
@@ -478,15 +487,23 @@ def make_merged_solve(
             # REQUIRED FOR CORRECT GRADIENTS — do not "optimize" this away.
             #
             # SupportBeams attachment DOFs (phis_*, x_foundation, thetas_*)
-            # enter both (1) K_ss / K_cs / K_sc through beam_geometry and
-            # (2) grounded Winkler k via w_a(geom).  Reusing the forward-cached
-            # geom_arg / k_arg here freezes those paths.  Forward-only sharing
-            # in _solve_all / _assemble_merged_values is fine; the constraint
-            # VJP must recompute geom and k from sdofs.  For memory, use
-            # jax.checkpoint/remat — never freeze geom/k.
+            # enter K_ss / K_cs / K_sc almost entirely through beam_geometry
+            # (endpoints, gamma3, L_eff).  Reusing the forward-cached geom_arg
+            # here freezes that path, so jax.grad / CoilFEMObjective.dJ miss
+            # ∂K/∂φ and Taylor tests / L-BFGS on beam networks fail badly
+            # (analytic |dJh| ≫ FD).  Forward-only sharing of support_geom in
+            # _solve_all / _assemble_merged_values is fine; the constraint VJP
+            # must recompute.  For memory, use jax.checkpoint/remat — never
+            # freeze geom.
+            #
+            # Grounded Winkler k (incl. k_att*w_a) remains an outer argument;
+            # its support-DOF grads flow via g_k through the producer in
+            # _solve_all.  Rebuilding k inside the constraint (k_live) was
+            # tried and did not fix the ~1.2% W7-X Taylor gap — see
+            # notes/autodiff_fixes.md / notes/WINKLER_WA_VJP.md.
             # ------------------------------------------------------------------
-            # Ablation: freeze_sdofs_geom cuts sdofs→geom→{K_*, k} inside the
-            # constraint.
+            # Ablation: freeze_sdofs_geom cuts sdofs→geom→K_* inside the
+            # constraint so only the outer k path carries support-DOF grads.
             sdofs_geom = (
                 jax.lax.stop_gradient(sdofs_in)
                 if vjp_ablation == "freeze_sdofs_geom"
@@ -494,21 +511,14 @@ def make_merged_solve(
             )
             geom_in = support.beam_geometry(curves, sdofs_geom)
             geom_kw = {'geom': geom_in} if geom_in is not None else {}
-            # Rebuild Winkler k from the same geom_in (weights + stiffness only;
-            # no second beam_geometry).  Grounded k_att*w_a then shares one
-            # tape with coupling — see notes/WINKLER_WA_VJP.md.
-            k_live = [
-                support.stiffness(*support.compute_weights(
-                    i, s_quad_pts[i], curves, sdofs_geom, **geom_kw,
-                ))
-                for i in range(n_pipelines)
-            ]
-            # Ablation: freeze_k cuts the rebuilt grounded-Winkler path only.
-            if vjp_ablation == "freeze_k":
-                k_live = jax.tree_util.tree_map(jax.lax.stop_gradient, k_live)
+            # Surgical ablation: freeze attachment weight in K_ss/K_cs/K_sc only.
+            coup_kw = {
+                **geom_kw,
+                'freeze_attachment_weight': freeze_wa_in_coupling,
+            }
             residuals = []
             for i, pipeline in enumerate(pipelines):
-                p_par = _coil_params(i, pts_in, bf_in, k_live, fe_geom_in)
+                p_par = _coil_params(i, pts_in, bf_in, k_in, fe_geom_in)
                 u_c_i = sol_flat[
                     coil_dof_offsets[i]:coil_dof_offsets[i] + n_dofs_per_coil[i]
                 ].reshape(pipeline.problem.fes[0].num_total_nodes, 3)
@@ -521,7 +531,9 @@ def make_merged_solve(
                 residuals.append(jax.flatten_util.ravel_pytree(res_i)[0])
             Iss, Jss = support.support_pattern()
             Vss = support.support_values(
-                curves, sdofs_geom, s_quad_pts, **geom_kw, jxw_by_coil=jxw_list_in,
+                curves, sdofs_geom, s_quad_pts,
+                jxw_by_coil=jxw_list_in,
+                **coup_kw,
             )
             u_s = sol_flat[support_dof_offset:]
             ns = n_s
@@ -531,7 +543,7 @@ def make_merged_solve(
                 curves, sdofs_geom, s_quad_pts,
                 surf_interp_by_coil=surf_interp_by_coil,
                 jxw_by_coil=jxw_list_in,
-                **geom_kw,
+                **coup_kw,
             )
             if has_cs:
                 r_full = r_full.at[I_cs_jax].add(
@@ -547,11 +559,13 @@ def make_merged_solve(
             _merged_constraint, bcd, sdofs, pts, bf, k, fe_geom,
         )
         g_bcd, g_sdofs, g_pts, g_bf, g_k, g_fe_geom = vjp_fn(-lambda_flat)
-        # Outer ``k`` and ``geom`` are forward-only caches from _solve_all.
-        # Support-DOF derivatives for grounded Winkler and coupling both flow
-        # through sdofs → beam_geometry / weights inside the constraint above.
-        # Always zero these cotangents (same policy for k and geom).
-        g_k = jax.tree_util.tree_map(jnp.zeros_like, g_k)
+        # Ablation: freeze_k zeros the outer Winkler-k cotangent so support-DOF
+        # grads only flow through constraint geom/coupling.
+        if vjp_ablation == "freeze_k":
+            g_k = jax.tree_util.tree_map(jnp.zeros_like, g_k)
+        # Outer ``geom`` is a forward-only cache from _solve_all.  Support-DOF
+        # derivatives for coupling flow through sdofs → beam_geometry inside
+        # the constraint above — not through this cotangent.  Always zero.
         g_geom = jax.tree_util.tree_map(
             jnp.zeros_like, geom_arg,
         ) if geom_arg is not None else None
