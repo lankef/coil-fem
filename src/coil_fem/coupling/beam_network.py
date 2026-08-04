@@ -619,27 +619,6 @@ class SupportBeams(Support):
         self.beam_geometry = jax.jit(self.beam_geometry)
 
     @staticmethod
-    def _frame_at_phi(fc, phi: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Interpolate coil frame ``(p, q)`` at ``phi`` from native quadpoints.
-
-        Uses periodic linear interpolation of :meth:`rotated_frame` on the
-        mesh quadpoint grid (RMF-safe; avoids sparse ``rotated_frame_eval``).
-        """
-        N = fc.curve.quadpoints.shape[0]
-        _, p_qp, q_qp = fc.rotated_frame()
-        phi = jnp.asarray(phi, dtype=float) % 1.0
-        x = phi * N
-        i0 = jnp.floor(x).astype(jnp.int32) % N
-        i1 = (i0 + 1) % N
-        frac = (x - jnp.floor(x))[..., None]
-        p = (1.0 - frac) * p_qp[i0] + frac * p_qp[i1]
-        q = (1.0 - frac) * q_qp[i0] + frac * q_qp[i1]
-        p = p / (jnp.linalg.norm(p, axis=-1, keepdims=True) + 1e-300)
-        q = q - jnp.sum(q * p, axis=-1, keepdims=True) * p
-        q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-300)
-        return p, q
-
-    @staticmethod
     def _xi_surface_exit(
         d: jax.Array,
         p: jax.Array,
@@ -701,8 +680,8 @@ class SupportBeams(Support):
             start_idx, end_idx, end_tfm = self._cc_groups[g]
             sl = slice(b0, b0 + n_g)
             d = x_end[sl] - x_start[sl]
-            p_s, q_s = self._frame_at_phi(fcs[start_idx], phis_start_cc[g])
-            p_e, q_e = self._frame_at_phi(fcs[end_idx], phis_end_cc[g])
+            _, p_s, q_s = fcs[start_idx].rotated_frame_eval(phis_start_cc[g])
+            _, p_e, q_e = fcs[end_idx].rotated_frame_eval(phis_end_cc[g])
             p_e = self._apply_end_transform(p_e, end_tfm)
             q_e = self._apply_end_transform(q_e, end_tfm)
             xi_s_list.append(self._xi_surface_exit(
@@ -721,7 +700,7 @@ class SupportBeams(Support):
             if n_cf > 0:
                 sl = slice(b0, b0 + n_cf)
                 d = x_end[sl] - x_start[sl]
-                p_s, q_s = self._frame_at_phi(fcs[i], phis_start_cf[i])
+                _, p_s, q_s = fcs[i].rotated_frame_eval(phis_start_cf[i])
                 xi_s_list.append(self._xi_surface_exit(
                     d, p_s, q_s, a_all[i], b_all[i], is_disk[i],
                 ))
