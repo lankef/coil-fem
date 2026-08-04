@@ -759,11 +759,10 @@ class CoilFEM:
         curves_jax_list = self.curves_from_dofs(base_curves_dofs)
 
         # When coupled, compute beam geometry once and reuse for *forward*
-        # weights + monolithic assemble.  support_geom and the k_by_coil built
-        # from it are forward-only caches: make_merged_solve's constraint VJP
-        # recomputes beam_geometry and Winkler k from support DOFs so both
-        # coupling and grounded k_att*w_a reach the adjoint (see
-        # notes/WINKLER_WA_VJP.md).  Do not freeze those in the VJP.
+        # weights + monolithic assemble.  This is a forward-only cache: the
+        # custom_vjp constraint in make_merged_solve must recompute
+        # beam_geometry from support DOFs so ∂K/∂φ reaches the adjoint.
+        # Do not freeze geom in that VJP as a "memory optimization".
         support_geom = None
         if self.support.is_coupled:
             support_geom = self.support.beam_geometry(
@@ -788,10 +787,17 @@ class CoilFEM:
                 all_gammas, all_gammadashs, all_currents,
                 pqp_i,
             )
-            k_i = self.support.stiffness(*self._support_weights(
+            w_g_i, w_a_i = self._support_weights(
                 i, pts_i, curves_jax_list, base_support_dofs,
                 geom=support_geom,
-            ))
+            )
+            # Diagnostic ablation freeze_wa_in_k: cut only grounded attachment
+            # through the outer k producer (clamp + coupling stay live).
+            if os.environ.get("COIL_FEM_VJP_ABLATION", "").strip().lower() == (
+                "freeze_wa_in_k"
+            ):
+                w_a_i = jax.lax.stop_gradient(w_a_i)
+            k_i = self.support.stiffness(w_g_i, w_a_i)
             pts_by_coil.append(pts_i)
             bf_by_coil.append(bf_i)
             bself_by_coil.append(bself_i)
@@ -804,7 +810,6 @@ class CoilFEM:
         driver_params = {
             'mesh_points_by_coil': pts_by_coil,
             'body_force_by_coil':  bf_by_coil,
-            # Forward cache only for monolithic AD (constraint rebuilds k).
             'stiffness_by_coil':   k_by_coil,
             'curves_by_coil':      curves_jax_list,
             'support_dofs':        base_support_dofs or {},
@@ -812,7 +817,8 @@ class CoilFEM:
             # pipeline.solve / monolithic assemble → set_params to skip
             # recompute_fe_geometry there.
             'fe_geom_by_coil':     fe_geom_by_coil,
-            # Forward cache only; constraint VJP recomputes beam_geometry.
+            # Pre-computed beam geometry for the forward assemble only.
+            # Adjoint path in make_merged_solve recomputes beam_geometry.
             'support_geom':        support_geom,
         }
 
