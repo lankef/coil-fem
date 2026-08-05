@@ -173,11 +173,13 @@ class CoilSupportBeams(CoilSupport):
         Initial foundation anchor positions, a length-``n_base`` sequence with
         entry ``i`` of shape ``(n_beam_cf[i], 3)``.
     thetas_orientation_cc : sequence of array-like or None
-        Initial cross-section roll angles for CC beams, one entry per CC
-        group with entry ``g`` of shape ``(n_beam_cc[g],)``.
+        Initial cross-section roll angles for CC beams (fraction of a turn
+        in ``[0, 1]``), one entry per CC group with entry ``g`` of shape
+        ``(n_beam_cc[g],)``.
     thetas_orientation_cf : sequence of array-like or None
-        Initial cross-section roll angles for CF beams, a length-``n_base``
-        sequence with entry ``i`` of shape ``(n_beam_cf[i],)``.
+        Initial cross-section roll angles for CF beams (fraction of a turn
+        in ``[0, 1]``), a length-``n_base`` sequence with entry ``i`` of
+        shape ``(n_beam_cf[i],)``.
     fixed_clamp_options : dict
         Optional additional fixed-sphere Winkler clamps on the coil surface.
         Set ``{'enabled': True, 'k_clamp': ..., 'r_clamp': ..., 'n_clamp': ...}``

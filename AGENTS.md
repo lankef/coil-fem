@@ -259,7 +259,7 @@ Optimisable quantities live in `support_dofs` (passed at solve time, never store
 - **Note:** `params['support_k']` is the per-surface-quad stiffness [N/m³] (`(n_surface_quads,)`), obtained via `pipeline.surface_quad_points(pts)` → `support.compute_weights` → `support.stiffness`.
 - `phis_start_cf` — attachment angles for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i],)`.
 - `x_foundation` — foundation anchor positions for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i], 3)`.
-- `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam (same per-group / per-coil list layout as the attachment angles).
+- `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam as a fraction of a turn in ``[0, 1]`` (same per-group / per-coil list layout as the attachment angles); applied as ``2π · θ`` in Rodrigues.
 
 ### Solver drivers (`coupling/drivers.py`)
 
