@@ -9,8 +9,10 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
+
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
+from jax.tree_util import tree_map
 
 from ..presets import cross_section_fns
 from ..utils import estimate_k, curve_center
@@ -484,7 +486,7 @@ class CoilSupportBeams(CoilSupport):
         # Build the boolean fixed-mask over the same (possibly ragged) pytree
         # structure as support_dofs_jax so it stays bit-aligned after ravel.
         probe = {
-            k: jax.tree_util.tree_map(
+            k: tree_map(
                 lambda leaf, kk=k: np.full(np.shape(leaf), kk in fixed_dof_names, dtype=bool),
                 v,
             )
