@@ -183,6 +183,10 @@ class CoilSupport(Optimizable):
         size.
     fixed : array-like or None
         Boolean fixed-mask aligned with the flattened DOF vector.
+    lower_bounds : array-like or None
+        Lower bounds aligned with the flattened DOF vector (default ``-inf``).
+    upper_bounds : array-like or None
+        Upper bounds aligned with the flattened DOF vector (default ``+inf``).
     dofs : DOFs or None
         Simsopt ``DOFs`` object used to restore serialised state (passed by
         :meth:`from_dict` / :meth:`from_file`).  Leave as ``None`` when
@@ -199,6 +203,8 @@ class CoilSupport(Optimizable):
         constants: dict | None = None,
         names=None,
         fixed=None,
+        lower_bounds=None,
+        upper_bounds=None,
         dofs=None,
     ):
         if not _HAS_SIMSOPT:
@@ -214,11 +220,15 @@ class CoilSupport(Optimizable):
         if dofs is not None:
             Optimizable.__init__(self, dofs=dofs, depends_on=self._base_coils)
         else:
+            if names is None:
+                names = self._make_names(support_dofs_jax)
             Optimizable.__init__(
                 self,
                 x0=np.array(flat, dtype=float),
                 names=names,
                 fixed=fixed,
+                lower_bounds=lower_bounds,
+                upper_bounds=upper_bounds,
                 depends_on=self._base_coils,
             )
 
@@ -262,6 +272,92 @@ class CoilSupport(Optimizable):
     def flatten_grad(self, grad_dofs: dict) -> np.ndarray:
         """Flatten a JAX gradient pytree into a simsopt DOF-aligned array."""
         return np.asarray(ravel_pytree(grad_dofs)[0], dtype=float)
+
+    def _make_names(self, support_dofs_jax: dict) -> list[str]:
+        """Build simsopt DOF names from a ``support_dofs`` pytree path.
+
+        Names follow the flatten order of :func:`jax.flatten_util.ravel_pytree`.
+        List/array indices are written as ``key(i,j,...)``.
+
+        Parameters
+        ----------
+        support_dofs_jax : dict
+            Optimisable support DOF pytree (same structure as
+            :attr:`support_dofs`).
+
+        Returns
+        -------
+        list of str
+            One name per scalar in the flattened DOF vector.
+        """
+        names: list[str] = []
+        paths_and_leaves, _ = jax.tree_util.tree_flatten_with_path(support_dofs_jax)
+        for path, leaf in paths_and_leaves:
+            key = None
+            prefix: list[int] = []
+            for part in path:
+                if isinstance(part, jax.tree_util.DictKey):
+                    key = part.key
+                elif isinstance(part, jax.tree_util.SequenceKey):
+                    prefix.append(part.idx)
+            assert key is not None
+            arr = np.asarray(leaf)
+            for idx in np.ndindex(arr.shape):
+                full = (*prefix, *idx)
+                names.append(f"{key}({','.join(map(str, full))})")
+        return names
+
+    def _make_bounds(
+        self,
+        support_dofs_jax: dict,
+        unit_interval_keys=(),
+        nonnegative_keys=(),
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build full-length lower/upper bound arrays for ``support_dofs_jax``.
+
+        Bounds are raveled in the same order as
+        :func:`jax.flatten_util.ravel_pytree` / :meth:`_make_names`.
+
+        Parameters
+        ----------
+        support_dofs_jax : dict
+            Optimisable support DOF pytree.
+        unit_interval_keys : iterable of str
+            Keys bounded to ``[0, 1]``.
+        nonnegative_keys : iterable of str
+            Keys bounded to ``[0, +inf)``.
+
+        Returns
+        -------
+        lower_bounds, upper_bounds : ndarray
+            Full-length bound arrays aligned with the flattened DOF vector.
+        """
+        unit = set(unit_interval_keys)
+        nonneg = set(nonnegative_keys)
+
+        def _lb_leaf(leaf, key):
+            shape = np.shape(leaf)
+            if key in unit or key in nonneg:
+                return np.zeros(shape, dtype=float)
+            return np.full(shape, -np.inf, dtype=float)
+
+        def _ub_leaf(leaf, key):
+            shape = np.shape(leaf)
+            if key in unit:
+                return np.ones(shape, dtype=float)
+            return np.full(shape, np.inf, dtype=float)
+
+        lb_tree = {
+            k: jax.tree_util.tree_map(lambda leaf, kk=k: _lb_leaf(leaf, kk), v)
+            for k, v in support_dofs_jax.items()
+        }
+        ub_tree = {
+            k: jax.tree_util.tree_map(lambda leaf, kk=k: _ub_leaf(leaf, kk), v)
+            for k, v in support_dofs_jax.items()
+        }
+        lb, _ = ravel_pytree(lb_tree)
+        ub, _ = ravel_pytree(ub_tree)
+        return np.asarray(lb, dtype=float), np.asarray(ub, dtype=float)
 
 
 def _broadcast_phis(phis, n_coils, n_clamp):
@@ -355,15 +451,21 @@ class CoilSupportFixed(CoilSupport):
         self._names = names
         # ─────────────────────────────────────────────────────────────────────────
 
+        support_dofs_jax = {'phis': phis_arr}
+        lb, ub = self._make_bounds(
+            support_dofs_jax, unit_interval_keys=('phis',),
+        )
         super().__init__(
             base_coils, nfp, stellsym,
             support=Support(k_clamp=float(k_clamp), fixed_clamp_fns=self._clamp_fn),
-            support_dofs_jax={'phis': phis_arr},
+            support_dofs_jax=support_dofs_jax,
             constants={
                 'r_clamp': float(r_clamp),
                 'eps_sigmoid': float(eps_sigmoid),
             },
             names=names,
+            lower_bounds=lb,
+            upper_bounds=ub,
             dofs=dofs,
         )
 
@@ -919,6 +1021,15 @@ class CoilSupportBeams(CoilSupport):
             print('   ', k)
         print('Total # dofs:', len(fixed_mask) - int(np.sum(fixed_mask)))
 
+        lb, ub = self._make_bounds(
+            support_dofs_jax,
+            unit_interval_keys=(
+                'phis', 'phis_start_cc', 'phis_end_cc', 'phis_start_cf',
+                'thetas_orientation_cc', 'thetas_orientation_cf',
+            ),
+            nonnegative_keys=tuple(cross_section_dof_keys),
+        )
+
         # ── Initialize CoilSupport (calls Optimizable.__init__) ───────────────
         super().__init__(
             base_coils,
@@ -929,6 +1040,8 @@ class CoilSupportBeams(CoilSupport):
             constants=None,
             names=names,
             fixed=np.array(fixed_mask),
+            lower_bounds=lb,
+            upper_bounds=ub,
             dofs=dofs,
         )
 
