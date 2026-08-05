@@ -791,8 +791,6 @@ class SupportBeams(Support):
         spec: EndpointSpec,
         surf_pts: jax.Array,
         support_dofs,
-        *,
-        freeze_attachment_weight: bool = False,
     ):
         """Compute weights and moment arms for one beam endpoint.
 
@@ -807,9 +805,6 @@ class SupportBeams(Support):
         surf_pts : jax.Array, shape ``(n_surf, 3)``
             Surface points of the *coupled* coil (``surface_pts_by_coil[spec.coil]``).
         support_dofs : dict
-        freeze_attachment_weight : bool
-            When True, apply ``stop_gradient`` to ``w_k`` only (diagnostic
-            ablation ``freeze_wa_in_coupling``).  Moment arms ``r_k`` stay live.
 
         Returns
         -------
@@ -835,8 +830,6 @@ class SupportBeams(Support):
         else:
             beam_dofs = support_dofs
         w_k      = self.attachment_fn(pts_beam, beam_dofs, spec.sign_x, self.beam_options)
-        if freeze_attachment_weight:
-            w_k = jax.lax.stop_gradient(w_k)
         return w_k, r_k
 
     # ============================================================================
@@ -1440,7 +1433,6 @@ class SupportBeams(Support):
         *,
         jxw_by_coil: list,
         geom: dict | None = None,
-        freeze_attachment_weight: bool = False,
     ) -> tuple:
         """Traced V arrays for the off-diagonal K_cs / K_sc blocks.
 
@@ -1493,7 +1485,6 @@ class SupportBeams(Support):
             surf_pts = surface_pts_by_coil[coil_i]
             w_k, r_k = self._clamp_weights_for_spec(
                 spec, surf_pts, support_dofs,
-                freeze_attachment_weight=freeze_attachment_weight,
             )
 
             Q    = self._tfm_Q[spec.tfm]
@@ -1546,8 +1537,6 @@ class SupportBeams(Support):
         support_dofs: dict,
         surface_pts_by_coil: list[jax.Array],
         jxw_by_coil: list | None = None,
-        *,
-        freeze_attachment_weight: bool = False,
     ) -> list[list[EndpointResult]]:
         """Per-beam endpoint spring weights, moment arms, and area measure.
 
@@ -1589,7 +1578,6 @@ class SupportBeams(Support):
                 surf_pts = surface_pts_by_coil[spec.coil]
                 w_k, r_k = self._clamp_weights_for_spec(
                     spec, surf_pts, support_dofs,
-                    freeze_attachment_weight=freeze_attachment_weight,
                 )
                 jxw_k = (
                     jnp.asarray(jxw_by_coil[spec.coil]).reshape(-1)
@@ -1739,7 +1727,6 @@ class SupportBeams(Support):
         *,
         jxw_by_coil: list | None = None,
         beam_endpoints: list[list[EndpointResult]] | None = None,
-        freeze_attachment_weight: bool = False,
     ) -> jax.Array:
         """Traced COO values for the support-local stiffness block ``K_ss``.
 
@@ -1797,7 +1784,6 @@ class SupportBeams(Support):
             beam_endpoints = self._endpoint_weights_and_r(
                 curves_jax, geom, Gamma_3, support_dofs, surface_pts_by_coil,
                 jxw_by_coil,
-                freeze_attachment_weight=freeze_attachment_weight,
             )
 
         K_spring = self._spring_stiffness_contributions(beam_endpoints)
