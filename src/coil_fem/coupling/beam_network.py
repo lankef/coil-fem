@@ -215,7 +215,8 @@ class SupportBeams(Support):
       ``x_local`` is the beam axis (unit vector node1 → node2);
       ``z_local`` is ``cross(x_local, t_coil_start)`` — the direction normal
       to both the beam axis and the coil's tangent at the node-1 attachment
-      point — rolled about ``x_local`` by ``thetas_orientation``;
+      point — rolled about ``x_local`` by ``2π · thetas_orientation``
+      (``thetas_orientation`` is a fraction of a turn in ``[0, 1]``);
       ``y_local = cross(z_local, x_local)`` completes the right-handed triad.
       ``z_local`` is therefore geometry-dependent (and optimizable via the
       roll angle), not a fixed global axis.
@@ -1103,7 +1104,8 @@ class SupportBeams(Support):
                 jnp.array([0., 0., 1.]) - t_b * t_b[2],
             )
             ref = ref / (jnp.linalg.norm(ref) + 1e-300)
-            z_local = _rodrigues(t_b, theta) @ ref
+            # theta is a fraction of a turn in [0, 1]; Rodrigues expects radians.
+            z_local = _rodrigues(t_b, 2.0 * jnp.pi * theta) @ ref
             z_local = z_local / (jnp.linalg.norm(z_local) + 1e-300)
             x_local = t_b
             y_local = jnp.cross(z_local, x_local)
