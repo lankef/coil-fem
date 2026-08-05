@@ -205,7 +205,6 @@ class Support:
         *,
         jxw_by_coil: list | None = None,
         beam_endpoints=None,
-        freeze_attachment_weight: bool = False,
     ):
         """Traced COO values for the support stiffness block ``K_ss``.
 
@@ -275,7 +274,6 @@ class Support:
         *,
         jxw_by_coil: list,
         geom: dict | None = None,
-        freeze_attachment_weight: bool = False,
     ) -> tuple:
         """Traced V arrays for K_cs and K_sc coupling blocks.
 

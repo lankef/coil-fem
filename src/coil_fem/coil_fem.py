@@ -791,12 +791,6 @@ class CoilFEM:
                 i, pts_i, curves_jax_list, base_support_dofs,
                 geom=support_geom,
             )
-            # Diagnostic ablation freeze_wa_in_k: cut only grounded attachment
-            # through the outer k producer (clamp + coupling stay live).
-            if os.environ.get("COIL_FEM_VJP_ABLATION", "").strip().lower() == (
-                "freeze_wa_in_k"
-            ):
-                w_a_i = jax.lax.stop_gradient(w_a_i)
             k_i = self.support.stiffness(w_g_i, w_a_i)
             pts_by_coil.append(pts_i)
             bf_by_coil.append(bf_i)

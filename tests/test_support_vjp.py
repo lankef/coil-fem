@@ -425,8 +425,18 @@ def test_residual_fd_vs_vjp_coil_vs_coupling():
         rows[name] = _print_row(name, d_an, d_fd)
 
     # Frozen-k coil residual must be φ-insensitive (k is the only φ path).
-    assert abs(rows["R_coil frozen k"][0]) < 1e-6, rows["R_coil frozen k"]
-    assert abs(rows["R_coil frozen k"][1]) < 1e-6, rows["R_coil frozen k"]
+    #
+    # Assert against the FD's own noise floor, not an absolute threshold: this
+    # fixture's residual is ~1e39, so differencing it at eps=1e-6 has a float64
+    # granularity of |s|*eps_mach/eps_fd ~ 1e28.  A fixed 1e-6 bound sits 34
+    # orders below that and passes only when the two evaluations happen to land
+    # bit-identical — which made this assert order-dependent.  A genuine phi
+    # dependence would be of order the live-k sensitivity (~1e39), so this floor
+    # still catches one with ~30 orders of margin.
+    live_sens = abs(rows["R_coil live k(φ)"][0])
+    fd_floor = max(live_sens * 1e-9, 1e-6)
+    assert abs(rows["R_coil frozen k"][0]) < fd_floor, rows["R_coil frozen k"]
+    assert abs(rows["R_coil frozen k"][1]) < fd_floor, rows["R_coil frozen k"]
 
     # Live-k coil residual and coupling should both match their own VJPs.
     for name in ("R_coil live k(φ)", "R_coupling"):
