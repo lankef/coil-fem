@@ -75,9 +75,11 @@ src/coil_fem/                  # main package (Hatchling src-layout)
     beam_network.py            # SupportBeams — bisymmetric beam-network support (coil-coil + coil-foundation)
     drivers.py                 # solve_staggered (BG-S + Aitken + IFT grad), solve_monolithic (cuDSS-only)
   simsopt/                     # simsopt Optimizable interop subpackage
-    __init__.py                # re-exports CoilFEMObjective, CoilSupport, CoilSupportFixed, CoilSupportTopBottom
+    __init__.py                # re-exports CoilFEMObjective, CoilSupport*, CoilSupportBeams*
     objectives.py              # CoilFEMObjective — simsopt Optimizable wrapper
-    optimizables.py            # CoilSupport (base), CoilSupportFixed, CoilSupportTopBottom
+    coil_support.py            # CoilSupport base + shared dphis / k_clamp helpers
+    coil_support_fixed.py      # CoilSupportFixed, TopBottom, FixedSorted
+    coil_support_beams.py      # CoilSupportBeams, CoilSupportBeamsSorted
   solvers/                     # Optional GPU solver subpackage
     __init__.py
     cudss.py                   # GPU sparse direct solver (spineax + NVIDIA cuDSS)
@@ -277,7 +279,7 @@ Two module-level driver functions replace the uncoupled per-coil loop in `CoilFE
 
 `support` is a required `CoilFEM` argument.  Both moduli (`k_clamp`, `k_attachment`) live on `Support`; `problem_options` no longer carries a Winkler modulus.
 
-### simsopt interop (`simsopt/optimizables.py`)
+### simsopt interop (`simsopt/coil_support*.py`)
 
 `CoilSupport` is the simsopt `Optimizable` base class that holds `base_coils`, `nfp`, `stellsym`, and the `Support` instance.  `CoilSupportFixed` and `CoilSupportTopBottom` are concrete subclasses.  `CoilFEMObjective` takes a single `CoilSupport` as its primary argument.
 

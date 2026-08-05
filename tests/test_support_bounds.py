@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
-from coil_fem.simsopt.optimizables import CoilSupport
+from coil_fem.simsopt.coil_support import CoilSupport
 
 
 def test_make_bounds_fixed_phis():
