@@ -12,9 +12,14 @@ Also provides shared helpers used by Fixed/Beams subclasses (angle broadcast,
 from __future__ import annotations
 
 import numpy as np
-import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
+from jax.tree_util import (
+    tree_map,
+    tree_flatten_with_path,
+    DictKey,
+    SequenceKey,
+)
 from ..utils import estimate_k
 from ..coupling import Support
 
@@ -49,15 +54,15 @@ def _cumsum_last_vjp(g):
 
 
 def _tree_diff_last(tree):
-    return jax.tree_util.tree_map(_diff_last, tree)
+    return tree_map(_diff_last, tree)
 
 
 def _tree_cumsum_last(tree):
-    return jax.tree_util.tree_map(_cumsum_last, tree)
+    return tree_map(_cumsum_last, tree)
 
 
 def _tree_cumsum_last_vjp(g_tree):
-    return jax.tree_util.tree_map(_cumsum_last_vjp, g_tree)
+    return tree_map(_cumsum_last_vjp, g_tree)
 
 
 def _encode_dphis(phi_dofs: dict) -> dict:
@@ -295,14 +300,14 @@ class CoilSupport(Optimizable):
             One name per scalar in the flattened DOF vector.
         """
         names: list[str] = []
-        paths_and_leaves, _ = jax.tree_util.tree_flatten_with_path(support_dofs_jax)
+        paths_and_leaves, _ = tree_flatten_with_path(support_dofs_jax)
         for path, leaf in paths_and_leaves:
             key = None
             prefix: list[int] = []
             for part in path:
-                if isinstance(part, jax.tree_util.DictKey):
+                if isinstance(part, DictKey):
                     key = part.key
-                elif isinstance(part, jax.tree_util.SequenceKey):
+                elif isinstance(part, SequenceKey):
                     prefix.append(part.idx)
             assert key is not None
             arr = np.asarray(leaf)
@@ -352,11 +357,11 @@ class CoilSupport(Optimizable):
             return np.full(shape, np.inf, dtype=float)
 
         lb_tree = {
-            k: jax.tree_util.tree_map(lambda leaf, kk=k: _lb_leaf(leaf, kk), v)
+            k: tree_map(lambda leaf, kk=k: _lb_leaf(leaf, kk), v)
             for k, v in support_dofs_jax.items()
         }
         ub_tree = {
-            k: jax.tree_util.tree_map(lambda leaf, kk=k: _ub_leaf(leaf, kk), v)
+            k: tree_map(lambda leaf, kk=k: _ub_leaf(leaf, kk), v)
             for k, v in support_dofs_jax.items()
         }
         lb, _ = ravel_pytree(lb_tree)
