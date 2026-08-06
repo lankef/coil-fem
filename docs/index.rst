@@ -4,12 +4,12 @@ coil-fem
 A differentiable structural mechanics toolkit for stellarator coils.
 
 Publications
-============
+------------
 
 1. `Towards joint optimization of stellarator coils and support structures <https://arxiv.org/abs/2607.05749>`_
 
 Installation
-============
+------------
 
 .. code-block:: bash
 
@@ -24,7 +24,7 @@ please see:
 - The `JAX documentation <https://docs.jax.dev/en/latest/installation.html>`_.
 
 Installing solvers
-==================
+------------------
 
 ``coil-fem`` supports multiple sparse solvers that can be selected via
 ``problem_options``, e.g. ``problem_options={'solver': 'umfpack'}`` (and
@@ -59,7 +59,9 @@ are:
   The recommended solver for ``coil-fem`` is a GPU sparse direct solver via
   `spineax <https://github.com/johnviljoen/spineax>`_ + NVIDIA cuDSS. This is
   a zero-copy solver that directly works with JIT-compiled JAX programs on
-  GPU. To install, follow the steps below:
+  GPU. To install, follow the steps below. We also strongly recommend disabling
+  ``XLA_PYTHON_CLIENT_PREALLOCATE``. For details, please read
+  :ref:`cuDSS preallocation issues <cudss-preallocation-issues>`.
 
   .. code-block:: bash
 
@@ -88,13 +90,14 @@ are:
    :caption: Contents:
 
    self
+   perf
    theory/index
    tutorial/index
    api/index
    developers/index
 
 Indices and tables
-==================
+------------------
 
 * :ref:`genindex`
 * :ref:`modindex`
