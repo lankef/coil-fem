@@ -17,6 +17,8 @@ Landreman, Hurwitz & Antonsen, Nucl. Fusion 65, 036008 (2025)
 """
 
 from __future__ import annotations
+# NOTE: simsopt's process-wide jax_platform_name="cpu" pin is cleared in
+# coil_fem.gpu_env, invoked from coil_fem/__init__.py after this import.
 from simsopt.field.selffield import B_regularized_pure
 import os
 import jax

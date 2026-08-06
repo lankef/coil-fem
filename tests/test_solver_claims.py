@@ -198,8 +198,51 @@ def test_require_cuda_for_cudss_rejects_host_backend():
         with mock.patch(
             'coil_fem.solvers.cudss.jax.default_backend', return_value='cpu'
         ):
-            with pytest.raises(RuntimeError, match="JAX_PLATFORMS"):
+            with pytest.raises(RuntimeError, match="clear_simsopt_cpu_pin"):
                 require_cuda_for_cudss()
+
+
+# ============================================================================
+# simsopt CPU pin clear
+# ============================================================================
+
+def test_clear_simsopt_cpu_pin_via_config_values():
+    """clear_simsopt_cpu_pin reads/writes jax_platform_name via config.values."""
+    from coil_fem.gpu_env import clear_simsopt_cpu_pin
+
+    jax.config.update("jax_platform_name", "cpu")
+    previous = clear_simsopt_cpu_pin()
+    assert previous == "cpu"
+    assert jax.config.values.get("jax_platform_name") in (None, "")
+
+
+def test_simsopt_cpu_pin_cleared_on_coil_fem_import():
+    """Subprocess: after import coil_fem, simsopt's pin is not 'cpu'.
+
+    Uses JAX_PLATFORMS=cpu so CoilFEM→interpax can import without a free GPU.
+    """
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["JAX_PLATFORMS"] = "cpu"
+    code = (
+        "import coil_fem;"
+        "import jax;"
+        "from simsopt.mhd import Vmec;"  # noqa: F401 — extra simsopt subpkg
+        "print(repr(jax.config.values.get('jax_platform_name')))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    # Banner / warnings may precede the print; take the last line.
+    last = out.stdout.strip().splitlines()[-1]
+    assert last in ("None", "''"), out.stdout
 
 
 # ============================================================================

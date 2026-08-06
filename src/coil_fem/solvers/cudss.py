@@ -41,10 +41,10 @@ _SPINEAX_INSTALL_HINT = (
 _CUDA_BACKEND_HINT = (
     "problem_options['solver']='cudss' requires a CUDA JAX backend, but "
     "jax.default_backend()={backend!r} and jax.devices()={devices}. "
-    "simsopt sets jax_platform_name='cpu' on import, which pins JAX to Host "
-    "if it initialises before a GPU backend is selected. Fix: restart the "
-    "process/kernel and set os.environ['JAX_PLATFORMS']='cuda' before "
-    "importing simsopt (or import coil_fem before simsopt)."
+    "simsopt pins jax_platform_name='cpu' on import; coil_fem clears that "
+    "pin from coil_fem/__init__.py. If you imported simsopt after coil_fem, "
+    "call coil_fem.gpu_env.clear_simsopt_cpu_pin() and restart if the "
+    "backend is already live."
 )
 
 _PREALLOC_HINT = (
@@ -114,10 +114,12 @@ def adjoint_reuses_forward_K(merged_sym: str, mtype_id: int) -> bool:
 def require_cuda_for_cudss() -> None:
     """Raise if the cuDSS path is used without a CUDA JAX device.
 
-    spineax registers ``solve_single_f64`` only for ``platform='CUDA'``.  When
-    JAX is pinned to Host (commonly by simsopt's
-    ``jax_platform_name='cpu'``), the FFI call fails with an opaque
-    ``NOT_FOUND`` error; this check fails earlier with a clear fix.
+    spineax registers ``solve_single_f64`` only for ``platform='CUDA'``.
+    A Host-only device (e.g. simsopt's ``jax_platform_name='cpu'`` pin left
+    uncleared) makes the FFI fail with opaque ``NOT_FOUND``; this check fails
+    earlier. ``coil_fem`` clears that pin on import; call
+    :func:`coil_fem.gpu_env.clear_simsopt_cpu_pin` if simsopt was imported
+    afterward.
     """
     devices = jax.devices()
     if not any(d.platform == 'gpu' for d in devices):
