@@ -6,15 +6,11 @@ interop lives in :mod:`coil_fem.simsopt`, magnetic helpers in
 optional GPU cuDSS backend in :mod:`coil_fem.solvers`.
 """
 
-# Must precede every other import: clears simsopt's process-wide JAX CPU pin
-# before any JAX computation can happen. See coil_fem._jax_compat.
-from . import gpu_env  # noqa: F401
-
+from .gpu_env import clear_simsopt_cpu_pin
 from .coil_fem import CoilFEM
 
-# Re-clear: the import above pulls in simsopt submodules that _jax_compat's own
-# `import simsopt.geo` may not have covered, any of which could have re-applied
-# the pin. Cheap, idempotent.
-gpu_env.clear_simsopt_cpu_pin(force_simsopt_import=False)
+# MUST stay last: CoilFEM → magnetic imports simsopt and applies its global
+# jax_platform_name="cpu" pin. Clear after that import, before user code.
+clear_simsopt_cpu_pin()
 
 __all__ = ["CoilFEM"]
