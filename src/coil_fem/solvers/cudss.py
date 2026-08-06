@@ -12,7 +12,7 @@ constructed.
 """
 
 from __future__ import annotations
-
+import os
 import functools
 import importlib.util
 import time
@@ -45,6 +45,17 @@ _CUDA_BACKEND_HINT = (
     "if it initialises before a GPU backend is selected. Fix: restart the "
     "process/kernel and set os.environ['JAX_PLATFORMS']='cuda' before "
     "importing simsopt (or import coil_fem before simsopt)."
+)
+
+_PREALLOC_HINT = (
+    "Your FEM solve may be using only 25% of available VRAM! "
+    "problem_options['solver']='cudss', but XLA_PYTHON_CLIENT_PREALLOCATE is "
+    "{value!r}. XLA preallocates 75% of the device by default; cuDSS allocates "
+    "its factorisation *outside* XLA's pool and cannot borrow from it, so the "
+    "GPU utilization may be inefficient if you are not using other jax/XLA "
+    "codes. Set XLA_PYTHON_CLIENT_PREALLOCATE=false and "
+    "XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 in your job script, or call "
+    "coil_fem.gpu_env.configure_gpu_memory() before importing coil_fem and jax."
 )
 
 # ============================================================================
@@ -116,6 +127,12 @@ def require_cuda_for_cudss() -> None:
                 devices=devices,
             )
         )
+    # If pre-allocation is not disabled, throw a warning that cuDSS may be 
+    # using only a fraction of available memory.
+    val = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE")
+    if val is None or val.lower() not in ("false", "0"):
+        warnings.warn(_PREALLOC_HINT.format(value=val), RuntimeWarning, stacklevel=3)
+
 
 
 def _import_cudss_solver():
