@@ -17,24 +17,12 @@ Landreman, Hurwitz & Antonsen, Nucl. Fusion 65, 036008 (2025)
 """
 
 from __future__ import annotations
-
+from simsopt.field.selffield import B_regularized_pure
 import os
-
 import jax
 import jax.numpy as jnp
 from jax import vmap
 
-from simsopt.field.selffield import B_regularized_pure
-
-# Importing simsopt pins JAX to the CPU backend (simsopt/geo/jit.py calls
-# jax.config.update("jax_platform_name", "cpu")). Reset to the default so JAX
-# keeps its normal backend auto-selection (GPU when available). This runs at
-# import time, before any JAX computation, so it has no effect on an already
-# initialised backend.
-# Only reset when the user has not set JAX_PLATFORMS explicitly: overwriting a
-# deliberate JAX_PLATFORMS=cpu setting would silently break GPU-free installs.
-if os.environ.get("JAX_PLATFORMS") is None:
-    jax.config.update("jax_platform_name", None)
 
 # mu_0 / (4 pi)
 _BIOT_SAVART_PREFACTOR = 1e-7
