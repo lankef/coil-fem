@@ -6,6 +6,8 @@ Connects coil geometry DOFs to the structural FEM pipeline via
 A single :class:`~coil_fem.simsopt.CoilSupport` object is the one entry
 point: it holds the base coils (curves + currents), ``nfp``, ``stellsym``,
 and any optimisable support DOFs (e.g. clamp locations).
+:class:`BeamSurfaceDistance` is a geometric companion penalty that keeps
+support beams clear of a target surface.
 """
 
 from __future__ import annotations
@@ -15,6 +17,8 @@ import jax
 from jax import value_and_grad
 import numpy as np
 import jax.numpy as jnp
+
+from ..geo import CurveXYZFourierJAX
 
 try:
     from simsopt._core.optimizable import Optimizable
@@ -430,3 +434,244 @@ class CoilFEMObjective(Optimizable):
             import matplotlib.pyplot as plt
             plt.show()
         return ax
+
+
+# ============================================================================
+# Beam-surface distance
+# ============================================================================
+
+
+def _segment_point_dists(x_start, x_end, pts):
+    """Distances from points to line segments.
+
+    Parameters
+    ----------
+    x_start : jax.Array, shape (N, 3)
+        Segment start points.
+    x_end : jax.Array, shape (N, 3)
+        Segment end points.
+    pts : jax.Array, shape (M, 3)
+        Query points.
+
+    Returns
+    -------
+    jax.Array, shape (N, M)
+        ``dists[i, j]`` is the distance from ``pts[j]`` to segment ``i``.
+    """
+    d_vec = x_end - x_start                                     # (N, 3)
+    w = pts[None, :, :] - x_start[:, None, :]                   # (N, M, 3)
+    # Chord station of the closest point, clamped to the segment.
+    t = jnp.clip(
+        jnp.sum(w * d_vec[:, None, :], axis=2)
+        / (jnp.sum(d_vec * d_vec, axis=1)[:, None] + 1e-300),
+        0.0,
+        1.0,
+    )                                                           # (N, M)
+    delta = w - t[:, :, None] * d_vec[:, None, :]               # (N, M, 3)
+    return jnp.sqrt(jnp.sum(delta ** 2, axis=2))
+
+
+def _beam_surface_distance_pure(x_start, x_end, L, gammas, ns, minimum_distance):
+    r"""Hinge penalty on beam-chord-to-surface distance.
+
+    .. math::
+        J = \left\langle L_b \, \|\mathbf{n}_s\| \,
+            \max(0, d_\min - d_{bs})^2 \right\rangle_{b, s}
+
+    Parameters
+    ----------
+    x_start : jax.Array, shape (N, 3)
+        Beam endpoints at node 1.
+    x_end : jax.Array, shape (N, 3)
+        Beam endpoints at node 2.
+    L : jax.Array, shape (N,)
+        Beam chord lengths; the arclength element of a chord on ``[0, 1]``.
+    gammas : jax.Array, shape (M, 3)
+        Surface quadrature points.
+    ns : jax.Array, shape (M, 3)
+        Unnormalised surface normals; the magnitude is the area element.
+    minimum_distance : float
+        Threshold below which the penalty activates.
+
+    Returns
+    -------
+    jax.Array, shape ()
+        Scalar penalty value.
+    """
+    dists = _segment_point_dists(x_start, x_end, gammas)
+    integralweight = L[:, None] * jnp.linalg.norm(ns, axis=1)[None, :]
+    return jnp.mean(integralweight * jnp.maximum(minimum_distance - dists, 0) ** 2)
+
+
+class BeamSurfaceDistance(Optimizable):
+    r"""Penalise support beams that come closer than ``minimum_distance`` to a surface.
+
+    The beam analogue of :class:`simsopt.geo.CurveSurfaceDistance`: the same
+    hinge form and scaling, so the two terms share a weight scale.  Support
+    beams are straight chords rather than sampled curves, so distances use the
+    exact point-to-segment formula instead of a quadrature over beam points.
+    All coil-coil and coil-foundation beams contribute.
+
+    .. math::
+        J = \left\langle L_b \, \|\mathbf{n}_s\| \,
+            \max(0, d_\min - d_{bs})^2 \right\rangle_{b, s}
+
+    where :math:`d_{bs}` is the distance from surface point :math:`s` to beam
+    chord :math:`b` and :math:`L_b` is the chord length.
+
+    Parameters
+    ----------
+    coil_support_beams : CoilSupportBeams
+        Provides the base curves, the beam DOFs, and the underlying
+        :class:`~coil_fem.coupling.SupportBeams` model.
+    surface : simsopt.geo.Surface
+        Target surface (typically the plasma boundary).  It is *not* a DOF
+        parent, so it contributes no gradient — matching
+        :class:`simsopt.geo.CurveSurfaceDistance`.
+    minimum_distance : float
+        Desired minimum beam-to-surface clearance [m].
+
+    Notes
+    -----
+    Only the base (master) beams held in ``SupportBeams.beam_geometry`` are
+    summed; stellarator-mirrored partners and field-period rotations are not
+    replicated.  For a symmetric surface those images have identical distances,
+    so the omitted symmetry factor is absorbed into the objective weight.
+
+    The full centreline chord ``x_start -> x_end`` is used, not the free span
+    between ``xi_start`` and ``xi_end``.
+
+    Examples
+    --------
+    >>> Jbeam = BeamSurfaceDistance(coil_support, surface, minimum_distance=0.15)
+    >>> Jbeam.shortest_distance()  # doctest: +SKIP
+    0.2731...
+    """
+
+    def __init__(self, coil_support_beams, surface, minimum_distance: float):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for BeamSurfaceDistance.")
+
+        self._coil_support = coil_support_beams
+        self._support = coil_support_beams.support
+        self.surface = surface
+        self.minimum_distance = float(minimum_distance)
+
+        # Reference curves supply the (static) quadpoints and order; the DOFs
+        # are re-read live so the curve path stays differentiable.
+        self._base_curves_jax = [
+            CurveXYZFourierJAX.from_simsopt(c)
+            for c in coil_support_beams.base_curves
+        ]
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=(0, 1)))
+
+        # Cache invalidated via recompute_bell() when any DOFs change.
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_curves: list | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support_beams])
+
+    # ============================================================================
+    # Cache invalidation
+    # ============================================================================
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    # ============================================================================
+    # Core computation
+    # ============================================================================
+
+    def _read_dofs(self):
+        """Read coil / support DOFs live from the simsopt graph."""
+        base_curves_dofs = [
+            jnp.asarray(c.get_dofs())
+            for c in self._coil_support.base_curves
+        ]
+        return base_curves_dofs, self._coil_support.support_dofs
+
+    def _surface_arrays(self):
+        """Surface quadrature points and unnormalised normals, both ``(M, 3)``."""
+        return (
+            jnp.asarray(self.surface.gamma().reshape((-1, 3))),
+            jnp.asarray(self.surface.normal().reshape((-1, 3))),
+        )
+
+    def _beam_chords(self, cdofs, sdofs):
+        """Beam chord ``(x_start, x_end, L)`` for the given DOFs (traced)."""
+        curves_jax = [
+            CurveXYZFourierJAX(ref.quadpoints, d, ref.order)
+            for ref, d in zip(self._base_curves_jax, cdofs)
+        ]
+        # SupportBeams caches nothing, so this recomputes the full geom dict;
+        # only these three of its ten entries are used.
+        geom = self._support.beam_geometry(curves_jax, sdofs)
+        return geom['x_start'], geom['x_end'], geom['L']
+
+    def _J_pure(self, cdofs, sdofs, gammas, ns):
+        """Beam-to-surface hinge penalty (traced scalar)."""
+        x_start, x_end, L = self._beam_chords(cdofs, sdofs)
+        return _beam_surface_distance_pure(
+            x_start, x_end, L, gammas, ns, self.minimum_distance,
+        )
+
+    def _compute(self):
+        """Evaluate J and its gradients from the single ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        cdofs, sdofs = self._read_dofs()
+        gammas, ns = self._surface_arrays()
+
+        J_val, (grad_cdofs, grad_sdofs) = self._jit_vg(cdofs, sdofs, gammas, ns)
+
+        self._J_cache = float(J_val)
+        self._grad_curves = [np.asarray(g) for g in grad_cdofs]
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    # ============================================================================
+    # Simsopt interface
+    # ============================================================================
+
+    def J(self):
+        """Beam-to-surface hinge penalty (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the coil and support DOFs.
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+
+        d = Derivative({})
+        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+            d = d + Derivative({curve: g})
+        return d + Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def shortest_distance(self):
+        """Smallest beam-chord-to-surface-point distance [m].
+
+        Returns
+        -------
+        float
+            Diagnostic clearance; the penalty is zero when this exceeds
+            ``minimum_distance``.
+        """
+        cdofs, sdofs = self._read_dofs()
+        x_start, x_end, _ = self._beam_chords(cdofs, sdofs)
+        gammas, _ = self._surface_arrays()
+        return float(jnp.min(_segment_point_dists(x_start, x_end, gammas)))
