@@ -15,7 +15,6 @@ import logging
 import os
 import warnings
 
-import interpax
 import meshio
 import numpy as np
 import numpy as onp
@@ -619,8 +618,8 @@ class CoilFEM:
 
         Pipeline
         --------
-        1. Interpolate tangent ``t_hat`` from centerline to FEM quad points
-           via ``interpax`` periodic cubic spline.
+        1. Evaluate tangent ``t_hat`` at FEM quad points via
+           ``curve.gamma_eval(..., diff_order=1)`` (exact Fourier derivative).
         2. Build current density ``J_q = (I / A) * t_hat_q``.
         3. Compute ``B_self_q`` via
            :func:`~coil_fem.magnetic.B_self_quadrature` (rect; raises for disk).
@@ -640,15 +639,11 @@ class CoilFEM:
         curve = fc.curve
         I     = all_currents[coil_idx]
 
-        # ── 1. Tangent at FEM quad points (interpolated, not spread) ──────────
-        gammadash_cl = curve.gammadash()   # (n_phi, 3)
-        t_hat_cl     = gammadash_cl / jnp.linalg.norm(
-            gammadash_cl, axis=1, keepdims=True
+        # ── 1. Tangent at FEM quad points (exact Fourier derivative) ──────────
+        gammadash_q = curve.gamma_eval(phi_q, diff_order=1)  # (n_cells, n_quads, 3)
+        t_hat_q = gammadash_q / jnp.linalg.norm(
+            gammadash_q, axis=-1, keepdims=True
         )
-        t_hat_q = interpax.interp1d(
-            phi_q.ravel(), curve.quadpoints, t_hat_cl,
-            method='cubic2', period=1.0,
-        ).reshape(n_cells, n_quads, 3)
 
         # ── 2. Current density at FEM quad points (uniform current model) ─────
         J_q = jnp.broadcast_to(

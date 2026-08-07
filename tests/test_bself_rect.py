@@ -32,7 +32,7 @@ import jax.numpy as jnp
 
 from coil_fem.geo import CurveXYZFourierJAX
 from coil_fem.geo import make_centroid_frame
-from coil_fem.magnetic import B_self_quadrature
+from coil_fem.magnetic import B_regularized_eval, B_self_quadrature
 
 
 # ---------------------------------------------------------------------------
@@ -264,3 +264,35 @@ class TestBSelfRectFullConsistency:
         cs    = {'shape': 'disk', 'radius': 0.03}
         with pytest.raises(NotImplementedError):
             B_self_quadrature(fc, 1e4, cs, phi_q, uv_quad=None)
+
+
+class TestEvalAtQuadpoints:
+    """Direct eval APIs must match centerline-quadpoint baselines."""
+
+    def test_B_regularized_eval_matches_simsopt_pure(self):
+        from simsopt.field.selffield import B_regularized_pure, regularization_rect
+
+        fc = _make_circle_framed(N=32)
+        curve = fc.curve
+        I = 1e4
+        reg = float(regularization_rect(0.05, 0.03))
+
+        B_eval = B_regularized_eval(curve, curve.quadpoints, I, reg)
+        B_pure = B_regularized_pure(
+            curve.gamma(), curve.gammadash(), curve.gammadashdash(),
+            curve.quadpoints, I, reg,
+        )
+        np.testing.assert_allclose(
+            np.asarray(B_eval), np.asarray(B_pure), rtol=1e-14, atol=1e-14,
+            err_msg="B_regularized_eval != B_regularized_pure on quadpoints",
+        )
+
+    def test_frame_curvatures_eval_matches_frame_curvatures(self):
+        fc = _make_circle_framed(N=32)
+        k_eval = fc.frame_curvatures_eval(fc.curve.quadpoints)
+        k_qp = fc.frame_curvatures()
+        for a, b, name in zip(k_eval, k_qp, ("kappa1", "kappa2", "kappa3")):
+            np.testing.assert_allclose(
+                np.asarray(a), np.asarray(b), rtol=1e-14, atol=1e-14,
+                err_msg=f"{name}: frame_curvatures_eval != frame_curvatures",
+            )
