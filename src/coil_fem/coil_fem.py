@@ -124,7 +124,7 @@ def _broadcast_problem_options(problem_options: dict | None) -> dict:
 
     Returns
     -------
-    dict with at least keys ``'solver'``, ``'adjoint_solver'``.
+    dict with at least keys ``'solver'``, ``'adjoint_solver'``, ``'remat_bs'``.
 
     Recognised solver names
     -----------------------
@@ -136,10 +136,16 @@ def _broadcast_problem_options(problem_options: dict | None) -> dict:
     * ``'cudss_mtype_id'``  : int, optional override — cuDSS matrix type
       (0=general, 1=symmetric, 3=SPD); derived automatically from
       ``problem.matrix_symmetry``; override emits ``UserWarning``.
+
+    Other keys
+    ----------
+    * ``'remat_bs'`` : bool, default True — checkpoint the Biot–Savart
+      per-source scan body (see :func:`~coil_fem.magnetic.biot_savart`).
     """
     opts = dict(problem_options) if problem_options else {}
     opts.setdefault('solver', 'umfpack')
     opts.setdefault('adjoint_solver', 'umfpack')
+    opts.setdefault('remat_bs', True)
 
     for key in ('solver', 'adjoint_solver'):
         val = opts[key]
@@ -220,6 +226,8 @@ class CoilFEM:
 
         * ``'solver'`` : ``'umfpack'`` (default).
         * ``'adjoint_solver'`` : ``'umfpack'`` (default).
+        * ``'remat_bs'`` : bool (default True) — checkpoint Biot–Savart
+          scan body to cut reverse-mode peak memory.
 
     verbose : int
         Logging verbosity (0 = silent, 1 = INFO, 2 = DEBUG).
@@ -674,6 +682,7 @@ class CoilFEM:
             all_gammas,
             all_gammadashs,
             all_currents.at[coil_idx].set(0.0),
+            remat=self.problem_options['remat_bs'],
         ).reshape(n_cells, n_quads, 3)
 
         # ── 5. Lorentz body force (+ gravity) ─────────────────────────────────

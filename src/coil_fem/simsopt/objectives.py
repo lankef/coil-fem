@@ -61,7 +61,8 @@ class CoilFEMObjective(Optimizable):
     material_options : dict or None
         Material properties (``'E'``, ``'nu'``, ``'density'``, ``'itc'``).
     problem_options : dict or None
-        Solver options forwarded to :class:`~coil_fem.CoilFEM`.
+        Solver options forwarded to :class:`~coil_fem.CoilFEM`
+        (including ``'remat_bs'``, default True).
     gravity_options : dict or None
         Gravity body-force options forwarded to :class:`~coil_fem.CoilFEM`.
     verbose : int

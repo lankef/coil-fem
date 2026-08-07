@@ -146,6 +146,8 @@ def biot_savart(
     source_gammas: jax.Array,
     source_gammadashs: jax.Array,
     source_currents: jax.Array,
+    *,
+    remat: bool = True,
 ) -> jax.Array:
     """Biot-Savart field at arbitrary target points from filament sources.
 
@@ -163,6 +165,11 @@ def biot_savart(
     source_gammadashs : (n_src, n_quad, 3)
         Unnormalised tangent vectors d(gamma)/d(phi).
     source_currents : (n_src,) [A]
+    remat : bool
+        If True (default), checkpoint the per-source scan body so reverse-mode
+        AD recomputes pairwise ``r`` / ``dB`` intermediates instead of storing
+        them for every source.  Trades extra backward FLOPs for much lower
+        peak memory under ``value_and_grad``.
 
     Returns
     -------
@@ -194,8 +201,9 @@ def biot_savart(
 
         return B_acc + vmap(at_one_target)(target_points), None  # (n_targets, 3)
 
+    body = jax.checkpoint(_one_source) if remat else _one_source
     B, _ = jax.lax.scan(
-        _one_source,
+        body,
         jnp.zeros_like(target_points),
         (source_gammas, source_gammadashs, source_currents),
     )
