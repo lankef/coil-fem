@@ -5,11 +5,11 @@ Choosing a solver
 -----------------
 
 We strongly advise installing ``spineax`` and using ``solver="cudss"``. ``JAX-FEM``,
-The FEM library that ``coil-fem`` uses is designed to be a CPU code, and only uses
-JAX for auto-differentiation. When any other backends are chosen, arrays can 
+The FEM library that ``coil-fem`` uses, is designed to be a CPU code. It only uses
+JAX for auto-differentiation. When any other backends are chosen, arrays will 
 be copied within or to/from GPU, causing performance drop.  
 
-When other JAX sparse solvers become available, this recommendation may change.
+When other JAX/CUDA sparse solvers become available, this recommendation may change.
 
 .. _cudss-preallocation-issues:
 
@@ -25,7 +25,7 @@ memory cap to 50%.
 - Why disabling preallocation?
 
   XLA preallocates 75% of the device by default; cuDSS allocates
-  its factorisation *outside* XLA's pool and cannot borrow from it, so the
+  its factorization *outside* XLA's pool and cannot borrow from it, so the
   GPU utilization may be inefficient if you are not using other jax/XLA
   codes. As the next section shows, XLA and cuDSS roughly use the same amount of 
   memory.
@@ -50,10 +50,10 @@ Memory scales cubically with resolution.
 
 Higher resolutions are more realistic, but require higher memory use and evaluation time. 
 
-This table was run on an L40s using the NYU Torch cluster. It is last updated on Aug 7. 2026.
+This table was run on an L40s using the NYU Torch cluster. It was last updated on Aug 7. 2026.
 
 ======= ========== ========== ============== =============== ============== ================== ================
-ppp     # nodes    # cells    JAX memory     JAX memory pool cuDSS memory   total peak memory  grad eval time
+``ppp`` # nodes    # cells    JAX memory     JAX memory pool cuDSS memory   Total peak memory  Eval time
 ======= ========== ========== ============== =============== ============== ================== ================
 12      24000 x 5  11520 x 5  0.727 GB       0.826 GB        1.958 GB       2.784 GB           0.73 s
 18      70560 x 5  38880 x 5  1.804 GB       2.686 GB        3.624 GB       6.310 GB           2.17 s

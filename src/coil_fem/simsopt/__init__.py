@@ -8,6 +8,7 @@ from .coil_support_fixed import (
     CoilSupportTopBottom,
 )
 from .coil_support_beams import CoilSupportBeams, CoilSupportBeamsSorted
+from .utils import constraint_from_optimizable
 
 __all__ = [
     "BeamSurfaceDistance",
@@ -18,4 +19,5 @@ __all__ = [
     "CoilSupportTopBottom",
     "CoilSupportBeams",
     "CoilSupportBeamsSorted",
+    "constraint_from_optimizable",
 ]

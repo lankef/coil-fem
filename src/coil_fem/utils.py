@@ -80,6 +80,7 @@ def estimate_k(L, E, eps):
     """
     return E/L/eps
 
+
 def curve_center(curve):
     """ A fast way to calcualate a CurveXYZFourier or a CurveXYZFourierJAX's center.
     
