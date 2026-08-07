@@ -38,8 +38,8 @@ memory cap to 50%.
   A hard cap prevents the ratchet from eating the whole device. 
   JAX Documentation
 
-Resource use on an L40s
------------------------
+Resource use table
+------------------
 
 This section provides a reference table for the required GPU resources for calculating
 the value and grad of ``CoilFEMObjective`` once on the 5 non-planar coils of W7-X
@@ -49,7 +49,7 @@ Memory scales cubically with resolution.
 
 Higher resolutions are more realistic, but require higher memory use and evaluation time. 
 
-This table was last updated on Aug 7. 2026.
+This table was run on an L40s using the NYU Torch cluster. It is last updated on Aug 7. 2026.
 
 ======= ========== ========== ============== =============== ============== ================== ================
 ppp     # nodes    # cells    JAX memory     JAX memory pool cuDSS memory   total peak memory  grad eval time
