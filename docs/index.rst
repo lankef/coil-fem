@@ -1,7 +1,7 @@
-coil-fem
+Overview
 ========
 
-A differentiable structural mechanics toolkit for stellarator coils.
+`coil-fem <https://github.com/lankef/coil-fem>`_ is a differentiable structural mechanics toolkit for stellarator coils.
 
 Publications
 ------------
