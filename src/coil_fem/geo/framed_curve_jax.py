@@ -439,23 +439,32 @@ class FramedCurveJAX:
         """Return (t, p, q) at quadrature points, each shape (nquad, 3)."""
         return self.rotated_frame_eval(self.curve.quadpoints)
 
-    def _rotated_frame_and_dash(self):
-        """Compute the frame and its phi-derivative in a single JVP call.
+    def rotated_frame_and_dash_eval(self, phi):
+        """Compute the frame and its phi-derivative at arbitrary *phi*.
 
         :meth:`rotated_frame_eval` is a smooth function of *phi*, so d/dphi is a
         plain JVP in *phi* — no chain rule through
         ``(gammadash, gammadashdash, d_alpha/d_phi)`` is needed, and the derivative
         is guaranteed to be that of the frame every other method returns.
 
+        Parameters
+        ----------
+        phi : array-like
+            Target parameter values, arbitrary shape.
+
         Returns
         -------
-        (t, p, q) : tuple of jnp.ndarray, each shape (nquad, 3)
-            Frame vectors at quadrature points (primals).
-        (tdash, pdash, qdash) : tuple of jnp.ndarray, each shape (nquad, 3)
-            Frame vector derivatives d/dphi at quadrature points (tangents).
+        (t, p, q) : tuple of jnp.ndarray, each shape ``phi.shape + (3,)``
+            Frame vectors (primals).
+        (tdash, pdash, qdash) : tuple of jnp.ndarray, each shape ``phi.shape + (3,)``
+            Frame vector derivatives d/dphi (tangents).
         """
-        phi = jnp.asarray(self.curve.quadpoints, dtype=float)
+        phi = jnp.asarray(phi, dtype=float)
         return jax.jvp(self.rotated_frame_eval, (phi,), (jnp.ones_like(phi),))
+
+    def _rotated_frame_and_dash(self):
+        """Frame and d/dphi at the curve quadrature points."""
+        return self.rotated_frame_and_dash_eval(self.curve.quadpoints)
 
     def rotated_frame_eval(self, phi):
         """Evaluate the rotated frame at arbitrary parameter values.
@@ -516,8 +525,28 @@ class FramedCurveJAX:
         gd_norm = jnp.linalg.norm(self.curve.gammadash(), axis=1)
         return jnp.sum(pdash * q, axis=1) / gd_norm
 
+    def frame_curvatures_eval(self, phi):
+        r"""Compute :math:`(\kappa_1, \kappa_2, \kappa_3)` at arbitrary *phi*.
+
+        Parameters
+        ----------
+        phi : array-like
+            Target parameter values, arbitrary shape.
+
+        Returns
+        -------
+        kappa1, kappa2, kappa3 : jnp.ndarray, each shape ``phi.shape``
+            Frame normal curvature, binormal curvature, and torsion.
+        """
+        (_, p, q), (tdash, pdash, _) = self.rotated_frame_and_dash_eval(phi)
+        gd_norm = jnp.linalg.norm(self.curve.gamma_eval(phi, 1), axis=-1)
+        kappa1 = jnp.sum(tdash * p, axis=-1) / gd_norm
+        kappa2 = jnp.sum(tdash * q, axis=-1) / gd_norm
+        kappa3 = jnp.sum(pdash * q, axis=-1) / gd_norm
+        return kappa1, kappa2, kappa3
+
     def frame_curvatures(self):
-        r"""Compute :math:`(\kappa_1, \kappa_2, \kappa_3)` in one JVP call.
+        r"""Compute :math:`(\kappa_1, \kappa_2, \kappa_3)` at quadrature points.
 
         More efficient than calling :meth:`frame_normal_curvature`,
         :meth:`frame_binormal_curvature`, and :meth:`frame_torsion`
@@ -528,12 +557,7 @@ class FramedCurveJAX:
         kappa1, kappa2, kappa3 : jnp.ndarray, each shape (nquad,)
             Frame normal curvature, binormal curvature, and torsion.
         """
-        (_, p, q), (tdash, pdash, _) = self._rotated_frame_and_dash()
-        gd_norm = jnp.linalg.norm(self.curve.gammadash(), axis=1)
-        kappa1 = jnp.sum(tdash * p, axis=1) / gd_norm
-        kappa2 = jnp.sum(tdash * q, axis=1) / gd_norm
-        kappa3 = jnp.sum(pdash * q, axis=1) / gd_norm
-        return kappa1, kappa2, kappa3
+        return self.frame_curvatures_eval(self.curve.quadpoints)
 
     def binorm(self):
         """Alias for :meth:`frame_binormal_curvature` (:math:`\\kappa_2`)."""

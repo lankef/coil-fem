@@ -623,8 +623,8 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
         """Populate ``n_quads``/``phi_quad``/``uv_quad`` from a built problem.
 
         ``phi_quad[c, q]`` is the curve parameter phi at FEM quadrature point
-        ``q`` of cell ``c`` (values exceed 1.0 for seam cells; ``interpax``
-        handles this via ``period=1.0``).  ``uv_quad`` holds the cross-section
+        ``q`` of cell ``c`` (values may exceed 1.0 for seam cells; consumers
+        treat phi as 1-periodic).  ``uv_quad`` holds the cross-section
         ``(u, v)`` coordinates and is shape-specific (``None`` unless the
         subclass overrides :meth:`_compute_uv_quad`).
 

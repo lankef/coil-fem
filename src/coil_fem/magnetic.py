@@ -1,6 +1,7 @@
 """Magnetic field computation for stellarator coils.
 
 Provides :func:`biot_savart` (filament Biot-Savart kernel),
+:func:`B_regularized_eval` (regularized filament field at arbitrary φ),
 :func:`B_self_quadrature` (self-field at FEM quadrature points via the
 Landreman-Hurwitz-Antonsen 2025 formula for rectangular cross-sections), and
 :func:`lorentz_body_force` (``J × B`` body-force density).
@@ -19,8 +20,10 @@ Landreman, Hurwitz & Antonsen, Nucl. Fusion 65, 036008 (2025)
 from __future__ import annotations
 # NOTE: simsopt's process-wide jax_platform_name="cpu" pin is cleared in
 # coil_fem.gpu_env, invoked from coil_fem/__init__.py after this import.
-from simsopt.field.selffield import B_regularized_pure
-import os
+from simsopt.field.selffield import (
+    B_regularized_singularity_term,
+    Biot_savart_prefactor,
+)
 import jax
 import jax.numpy as jnp
 from jax import vmap
@@ -200,6 +203,76 @@ def biot_savart(
 
 
 # ============================================================================
+# Regularized filament field at arbitrary phi
+# ============================================================================
+
+def B_regularized_eval(
+    curve,
+    phi: jax.Array,
+    current: jax.Array | float,
+    regularization: jax.Array | float,
+) -> jax.Array:
+    r"""Regularized Biot-Savart field at arbitrary curve parameter values.
+
+    Same Landreman–Hurwitz regularized filament integral as simsopt's
+    ``B_regularized_pure``, but with **separate** source and target samples:
+    the filament quadrature stays on ``curve.quadpoints`` (uniform), while
+    targets are evaluated via :meth:`~coil_fem.geo.CurveXYZFourierJAX.gamma_eval`
+    at *phi*.  Matches ``B_regularized_pure`` when ``phi == curve.quadpoints``.
+
+    Parameters
+    ----------
+    curve : CurveXYZFourierJAX
+        Coil centerline (provides uniform source quadrature).
+    phi : array-like
+        Target parameter values, arbitrary shape.  Naturally 1-periodic.
+    current : scalar [A]
+    regularization : scalar
+        Regularization length² (e.g. ``regularization_rect(a, b)``).
+
+    Returns
+    -------
+    jax.Array, shape ``phi.shape + (3,)`` [T]
+    """
+    phi_arr = jnp.asarray(phi, dtype=float)
+    phi_shape = phi_arr.shape
+    phi_t = phi_arr.ravel()
+
+    gamma_s = curve.gamma()
+    gd_s = curve.gammadash()
+    qp_s = curve.quadpoints
+
+    gamma_t = curve.gamma_eval(phi_t, 0)
+    gd_t = curve.gamma_eval(phi_t, 1)
+    gdd_t = curve.gamma_eval(phi_t, 2)
+
+    # simsopt uses an angle that goes up to 2π, not 1.
+    phi_s = qp_s * 2.0 * jnp.pi
+    phi_tt = phi_t * 2.0 * jnp.pi
+    rcp_s = gd_s / (2.0 * jnp.pi)
+    rcp_t = gd_t / (2.0 * jnp.pi)
+    rcpp_t = gdd_t / (4.0 * jnp.pi ** 2)
+    dphi = 2.0 * jnp.pi / phi_s.shape[0]
+    reg = jnp.asarray(regularization, dtype=float)
+
+    analytic = B_regularized_singularity_term(rcp_t, rcpp_t, reg)
+    dr = gamma_t[:, None] - gamma_s[None, :]
+    first = jnp.cross(rcp_s[None, :], dr) / (
+        (jnp.sum(dr * dr, axis=2) + reg) ** 1.5
+    )[:, :, None]
+    cos_fac = 2.0 - 2.0 * jnp.cos(phi_s[None, :] - phi_tt[:, None])
+    second = jnp.cross(rcpp_t, rcp_t)[:, None, :] * (
+        0.5 * cos_fac
+        / (cos_fac * jnp.sum(rcp_t * rcp_t, axis=1)[:, None] + reg) ** 1.5
+    )[:, :, None]
+    integral = dphi * jnp.sum(first + second, axis=1)
+    B = jnp.asarray(current, dtype=float) * Biot_savart_prefactor * (
+        analytic + integral
+    )
+    return B.reshape(phi_shape + (3,))
+
+
+# ============================================================================
 # Self-field at FEM quadrature points
 # ============================================================================
 
@@ -227,8 +300,9 @@ def B_self_quadrature(
         *w1* and *w2* are the **full** conductor widths (a = w1, b = w2
         in the LHA 2025 notation).
     phi_quad : (n_cells, n_quads) array
-        Curve parameter phi at each FEM quadrature point.  Values outside
-        ``[0, 1)`` at the periodic seam are handled via ``period=1.0``.
+        Curve parameter phi at each FEM quadrature point.  Values may exceed
+        ``[0, 1)`` at the periodic seam; Fourier / frame evaluations are
+        naturally 1-periodic.
     uv_quad : (n_cells, n_quads, 2) array or None
         Cross-section coordinates (u, v) in [-1, 1] at each FEM quadrature
         point.  Required for ``shape='rect'``; ignored for ``'disk'`` (which
@@ -245,8 +319,6 @@ def B_self_quadrature(
         analogous to the LHA (2025) formula for circular cross-sections has
         not yet been implemented.  See the coil-fem issue tracker.
     """
-    import interpax
-
     shape = cross_section['shape']
     if shape == 'disk':
         raise NotImplementedError(
@@ -264,16 +336,7 @@ def B_self_quadrature(
     a = jnp.asarray(cross_section['w1'], dtype=float)   # full width in p dir
     b = jnp.asarray(cross_section['w2'], dtype=float)   # full width in q dir
     I = jnp.asarray(current, dtype=float).reshape(())
-
-    # ---------- Curve quantities at centerline quadrature points ----------
-    curve         = framed_curve.curve
-    gamma         = curve.gamma()           # (n_phi, 3)
-    gammadash     = curve.gammadash()
-    gammadashdash = curve.gammadashdash()
-    quadpoints    = curve.quadpoints        # (n_phi,) uniform in [0, 1)
-
-    _, p_cl, q_cl = framed_curve.rotated_frame()               # each (n_phi, 3)
-    kappa1_cl, kappa2_cl, _ = framed_curve.frame_curvatures()  # each (n_phi,)
+    curve = framed_curve.curve
 
     # ------------------------------------------------------------------
     # delta and regularization  (Eqs. 12-13)
@@ -281,50 +344,29 @@ def B_self_quadrature(
     # The product ``delta * a * b`` equals ``regularization_rect(a, b)`` from
     # simsopt.
     # ------------------------------------------------------------------
-    delta = jnp.exp(-25.0 / 6.0 + _rect_k(a, b))  
-    reg   = delta * a * b
+    delta = jnp.exp(-25.0 / 6.0 + _rect_k(a, b))
+    reg = delta * a * b
 
-    # ------------------------------------------------------------------
-    # B_reg at centerline quadpoints  (Eq. 15)
-    # ------------------------------------------------------------------
-    B_reg_cl = B_regularized_pure(
-        gamma, gammadash, gammadashdash, quadpoints, I, reg
-    )  # (n_phi, 3)
-
-    # ------------------------------------------------------------------
-    # B_b at centerline quadpoints  (Eq. 21)
-    # B_b = (mu_0 I / 8pi) (4 + 2 ln2 + ln delta) (kappa1 q - kappa2 p)
-    # mu_0 I / (8 pi) = _BIOT_SAVART_PREFACTOR * I / 2
-    # ------------------------------------------------------------------
-    log_delta  = jnp.log(delta)
-    b_coeff    = 4.0 + 2.0 * jnp.log(2.0) + log_delta
-    kappa_b_cl = kappa1_cl[:, None] * q_cl - kappa2_cl[:, None] * p_cl  # (n_phi,3)
-    B_b_cl     = 0.5 * _BIOT_SAVART_PREFACTOR * I * b_coeff * kappa_b_cl
-
-    # ------------------------------------------------------------------
-    # Interpolate phi-dependent quantities to FEM quad points via
-    # periodic C2 cubic splines.  phi_quad may contain values > 1 at
-    # the periodic seam; interpax wraps them via period=1.0.
-    # ------------------------------------------------------------------
     n_cells, n_quads_per_cell = phi_quad.shape
     phi_flat = phi_quad.ravel()   # (n_pts,)
-
-    def _interp(y):
-        """Lift (n_phi, ...) -> (n_pts, ...) via C2 cubic periodic spline."""
-        return interpax.interp1d(
-            phi_flat, quadpoints, y, method='cubic2', period=1.0
-        )
-
-    B_reg_q  = _interp(B_reg_cl)   # (n_pts, 3)
-    B_b_q    = _interp(B_b_cl)     # (n_pts, 3)
-    p_q      = _interp(p_cl)       # (n_pts, 3)
-    q_q      = _interp(q_cl)       # (n_pts, 3)
-    kappa1_q = _interp(kappa1_cl)  # (n_pts,)
-    kappa2_q = _interp(kappa2_cl)  # (n_pts,)
-
     n_pts = n_cells * n_quads_per_cell
     u_flat = uv_quad[..., 0].ravel()  # (n_pts,)
     v_flat = uv_quad[..., 1].ravel()  # (n_pts,)
+
+    # ------------------------------------------------------------------
+    # Phi-dependent quantities evaluated directly at FEM quad points
+    # ------------------------------------------------------------------
+    B_reg = B_regularized_eval(curve, phi_flat, I, reg)              # (n_pts, 3)
+    _, p, q = framed_curve.rotated_frame_eval(phi_flat)              # (n_pts, 3)
+    kappa1, kappa2, _ = framed_curve.frame_curvatures_eval(phi_flat)
+
+    # B_b  (Eq. 21)
+    # B_b = (mu_0 I / 8pi) (4 + 2 ln2 + ln delta) (kappa1 q - kappa2 p)
+    # mu_0 I / (8 pi) = _BIOT_SAVART_PREFACTOR * I / 2
+    b_coeff = 4.0 + 2.0 * jnp.log(2.0) + jnp.log(delta)
+    B_b = 0.5 * _BIOT_SAVART_PREFACTOR * I * b_coeff * (
+        kappa1[:, None] * q - kappa2[:, None] * p
+    )
 
     # ------------------------------------------------------------------
     # B_0  (Eq. 17)
@@ -332,36 +374,35 @@ def B_self_quadrature(
     #   sum_{su,sv=+/-1} su*sv [G(b(v-sv), a(u-su)) q - G(a(u-su), b(v-sv)) p]
     # Prefactor: _BIOT_SAVART_PREFACTOR * I / (a * b)
     # ------------------------------------------------------------------
-    B_0_q = jnp.zeros((n_pts, 3))
+    B_0 = jnp.zeros((n_pts, 3))
     for su in (1.0, -1.0):
         for sv in (1.0, -1.0):
             U = u_flat - su    # (n_pts,)
             V = v_flat - sv
             G_bV_aU = _G_rect(b * V, a * U)   # (n_pts,)
             G_aU_bV = _G_rect(a * U, b * V)   # (n_pts,)
-            B_0_q = B_0_q + su * sv * (
-                G_bV_aU[:, None] * q_q - G_aU_bV[:, None] * p_q
+            B_0 = B_0 + su * sv * (
+                G_bV_aU[:, None] * q - G_aU_bV[:, None] * p
             )
-    B_0_q = (_BIOT_SAVART_PREFACTOR * I / (a * b)) * B_0_q
+    B_0 = (_BIOT_SAVART_PREFACTOR * I / (a * b)) * B_0
 
     # ------------------------------------------------------------------
     # B_kappa  (Eqs. 19-20)
     # Prefactor: mu_0 I / (64 pi) = _BIOT_SAVART_PREFACTOR * I / 16
     # ------------------------------------------------------------------
-    B_kappa_q = jnp.zeros((n_pts, 3))
+    B_kappa = jnp.zeros((n_pts, 3))
     for su in (1.0, -1.0):
         for sv in (1.0, -1.0):
             U = u_flat - su   # (n_pts,)
             V = v_flat - sv
-            K_val = _K_rect_flat(U, V, a, b, kappa1_q, kappa2_q, p_q, q_q)
-            B_kappa_q = B_kappa_q + su * sv * K_val
-    B_kappa_q = (_BIOT_SAVART_PREFACTOR / 16.0) * I * B_kappa_q
+            K_val = _K_rect_flat(U, V, a, b, kappa1, kappa2, p, q)
+            B_kappa = B_kappa + su * sv * K_val
+    B_kappa = (_BIOT_SAVART_PREFACTOR / 16.0) * I * B_kappa
 
     # ------------------------------------------------------------------
     # Sum and reshape to (n_cells, n_quads_per_cell, 3)
     # ------------------------------------------------------------------
-    B_total = B_reg_q + B_0_q + B_kappa_q + B_b_q
-    return B_total.reshape(n_cells, n_quads_per_cell, 3)
+    return (B_reg + B_0 + B_kappa + B_b).reshape(n_cells, n_quads_per_cell, 3)
 
 
 # ============================================================================

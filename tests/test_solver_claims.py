@@ -219,7 +219,7 @@ def test_clear_simsopt_cpu_pin_via_config_values():
 def test_simsopt_cpu_pin_cleared_on_coil_fem_import():
     """Subprocess: after import coil_fem, simsopt's pin is not 'cpu'.
 
-    Uses JAX_PLATFORMS=cpu so CoilFEM→interpax can import without a free GPU.
+    Uses JAX_PLATFORMS=cpu so the subprocess can import without a free GPU.
     """
     import os
     import subprocess
