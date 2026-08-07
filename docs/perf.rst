@@ -37,3 +37,25 @@ memory cap to 50%.
   cuDSS factorizations, XLA's pool ratchets upward and progressively starves cuDSS.
   A hard cap prevents the ratchet from eating the whole device. 
   JAX Documentation
+
+Resource use on an L40s
+-----------------------
+
+This section provides a reference table for the required GPU resources for calculating
+the value and grad of ``CoilFEMObjective`` once on the 5 non-planar coils of W7-X
+coil represented by ``simsopt.geo.CurveXYZFourier(curve_order=8)`` (51 dofs). 
+
+Memory scales cubically with resolution.
+
+Higher resolutions are more realistic, but require higher memory use and evaluation time. 
+
+This table was last updated on Aug 7. 2026.
+
+======= ========== ========== ============== =============== ============== ================== ================
+ppp     # nodes    # cells    JAX memory     JAX memory pool cuDSS memory   total peak memory  grad eval time
+======= ========== ========== ============== =============== ============== ================== ================
+12      24000 x 5  11520 x 5  0.727 GB       0.826 GB        1.958 GB       2.784 GB           0.73 s
+18      70560 x 5  38880 x 5  1.804 GB       2.686 GB        3.624 GB       6.310 GB           2.17 s
+24      201600 x 5 123264 x 5 5.951 GB       10.373 GB       9.149 GB       19.522 GB          8.28 s
+30      405600 x 5 259200 x 5 12.331 GB      18.748 GB       18.849 GB      37.597 GB          28.34 s
+======= ========== ========== ============== =============== ============== ================== ================
