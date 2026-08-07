@@ -17,7 +17,7 @@ cuDSS preallocation issues
 --------------------------
 
 ``coil-fem`` is based on a dual backend of JAX and cuDSS. This causes some unusual
-behaviors in memory allocation. When no other heavy JAX/XLA codes (such as ``DESC``)
+behaviors in memory allocation. When no other heavy JAX/XLA codes (such as DESC)
 we strongly recommend running ``coil_fem.gpu_env.configure_gpu_memory()`` before 
 importing ``coil_fem`` and ``jax``, which disables pre-allocation and sets a XLA
 memory cap to 50%.
@@ -27,7 +27,8 @@ memory cap to 50%.
   XLA preallocates 75% of the device by default; cuDSS allocates
   its factorisation *outside* XLA's pool and cannot borrow from it, so the
   GPU utilization may be inefficient if you are not using other jax/XLA
-  codes. 
+  codes. As the next section shows, XLA and cuDSS roughly use the same amount of 
+  memory.
 
 - Why memory capping?
 
