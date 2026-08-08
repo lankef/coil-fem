@@ -8,11 +8,14 @@ point: it holds the base coils (curves + currents), ``nfp``, ``stellsym``,
 and any optimisable support DOFs (e.g. clamp locations).
 :class:`BeamSurfaceDistance` is a geometric companion penalty that keeps
 support beams clear of a target surface.
+:class:`CoilBeamAngle` penalises beam–coil attachments that are too nearly
+tangent.
 """
 
 from __future__ import annotations
 
 from typing import Sequence
+import math
 import jax
 from jax import value_and_grad
 import numpy as np
@@ -676,3 +679,199 @@ class BeamSurfaceDistance(Optimizable):
         x_start, x_end, _ = self._beam_chords(cdofs, sdofs)
         gammas, _ = self._surface_arrays()
         return float(jnp.min(_segment_point_dists(x_start, x_end, gammas)))
+
+
+def _coil_beam_angle_hinge(abs_dot, cos_min, mask):
+    """Sum of ``max(|n·t| - cos θ_min, 0)^2`` over masked beam endpoints."""
+    hinge = jnp.maximum(abs_dot - cos_min, 0.0) ** 2
+    return jnp.sum(jnp.where(mask, hinge, 0.0))
+
+
+class CoilBeamAngle(Optimizable):
+    r"""Penalise beam–coil attachments that are too nearly tangent.
+
+    For each active attachment the hinge
+
+    .. math::
+        \max\bigl(|\mathbf{t}_\mathrm{beam}\cdot\mathbf{t}_\mathrm{coil}|
+                  - \cos\theta_\min,\, 0\bigr)^2
+
+    is summed.  Coil–coil (CC) beams contribute start and end terms; coil–
+    foundation (CF) beams contribute only the start term.  ``mode`` selects
+    which families enter the sum: ``'cc'``, ``'cf'``, or ``'all'``.
+
+    Parameters
+    ----------
+    coil_support_beams : CoilSupportBeams
+        Provides the base curves, the beam DOFs, and the underlying
+        :class:`~coil_fem.coupling.SupportBeams` model.
+    minimum_angle : float
+        Minimum allowed beam–coil angle in radians.  Must satisfy
+        ``0 <= minimum_angle < π/2``.
+    mode : {'cc', 'cf', 'all'}
+        Which attachment families contribute to ``J`` and
+        :meth:`smallest_angle`.
+
+    Notes
+    -----
+    Only the base (master) beams held in ``SupportBeams.beam_geometry`` are
+    summed; stellarator-mirrored partners and field-period rotations are not
+    replicated.
+
+    Examples
+    --------
+    >>> Jang = CoilBeamAngle(coil_support, minimum_angle=0.2, mode='all')
+    >>> Jang.smallest_angle()  # doctest: +SKIP
+    0.35...
+    """
+
+    _VALID_MODES = ('cc', 'cf', 'all')
+
+    def __init__(
+        self,
+        coil_support_beams,
+        minimum_angle: float,
+        mode: str = 'all',
+    ):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for CoilBeamAngle.")
+
+        minimum_angle = float(minimum_angle)
+        if not (0.0 <= minimum_angle < 0.5 * math.pi):
+            raise ValueError(
+                "minimum_angle must satisfy 0 <= minimum_angle < π/2; "
+                f"got {minimum_angle}."
+            )
+        if mode not in self._VALID_MODES:
+            raise ValueError(
+                f"mode must be one of {self._VALID_MODES}; got {mode!r}."
+            )
+
+        self._coil_support = coil_support_beams
+        self._support = coil_support_beams.support
+        self.minimum_angle = minimum_angle
+        self.mode = mode
+        self._cos_min = float(math.cos(minimum_angle))
+
+        _, beam_type = self._support.beam_labels()
+        is_cc = np.asarray(beam_type == 0)
+        is_cf = np.asarray(beam_type == 1)
+        self._is_cc = jnp.asarray(is_cc)
+        self._is_cf = jnp.asarray(is_cf)
+        self._use_cc = mode in ('cc', 'all')
+        self._use_cf = mode in ('cf', 'all')
+
+        self._base_curves_jax = [
+            CurveXYZFourierJAX.from_simsopt(c)
+            for c in coil_support_beams.base_curves
+        ]
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=(0, 1)))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_curves: list | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support_beams])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _read_dofs(self):
+        """Read coil / support DOFs live from the simsopt graph."""
+        base_curves_dofs = [
+            jnp.asarray(c.get_dofs())
+            for c in self._coil_support.base_curves
+        ]
+        return base_curves_dofs, self._coil_support.support_dofs
+
+    def _geom(self, cdofs, sdofs):
+        """Traced ``(t_beam, t_coil_start, t_coil_end)`` for the given DOFs."""
+        curves_jax = [
+            CurveXYZFourierJAX(ref.quadpoints, d, ref.order)
+            for ref, d in zip(self._base_curves_jax, cdofs)
+        ]
+        geom = self._support.beam_geometry(curves_jax, sdofs)
+        return geom['t_beam'], geom['t_coil_start'], geom['t_coil_end']
+
+    def _J_pure(self, cdofs, sdofs):
+        """Beam–coil angle hinge penalty (traced scalar)."""
+        t_beam, t_start, t_end = self._geom(cdofs, sdofs)
+        c_s = jnp.abs(jnp.sum(t_beam * t_start, axis=-1))
+        c_e = jnp.abs(jnp.sum(t_beam * t_end, axis=-1))
+        cos_min = self._cos_min
+        J = jnp.array(0.0)
+        if self._use_cc:
+            J = J + _coil_beam_angle_hinge(c_s, cos_min, self._is_cc)
+            J = J + _coil_beam_angle_hinge(c_e, cos_min, self._is_cc)
+        if self._use_cf:
+            J = J + _coil_beam_angle_hinge(c_s, cos_min, self._is_cf)
+        return J
+
+    def _compute(self):
+        """Evaluate J and its gradients from the single ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        cdofs, sdofs = self._read_dofs()
+        J_val, (grad_cdofs, grad_sdofs) = self._jit_vg(cdofs, sdofs)
+        self._J_cache = float(J_val)
+        self._grad_curves = [np.asarray(g) for g in grad_cdofs]
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """Beam–coil angle hinge penalty (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the coil and support DOFs.
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+
+        d = Derivative({})
+        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+            d = d + Derivative({curve: g})
+        return d + Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def smallest_angle(self):
+        """Smallest beam–coil angle [rad] among attachments selected by ``mode``.
+
+        Returns
+        -------
+        float
+            ``min arccos(|t_beam · t_coil|)`` over active endpoints.  If no
+            endpoints contribute (e.g. ``mode='cf'`` with no CF beams),
+            returns ``π/2``.
+        """
+        cdofs, sdofs = self._read_dofs()
+        t_beam, t_start, t_end = self._geom(cdofs, sdofs)
+        c_s = jnp.abs(jnp.sum(t_beam * t_start, axis=-1))
+        c_e = jnp.abs(jnp.sum(t_beam * t_end, axis=-1))
+
+        angles = []
+        if self._use_cc:
+            angles.append(jnp.where(self._is_cc, jnp.arccos(jnp.clip(c_s, 0.0, 1.0)), jnp.inf))
+            angles.append(jnp.where(self._is_cc, jnp.arccos(jnp.clip(c_e, 0.0, 1.0)), jnp.inf))
+        if self._use_cf:
+            angles.append(jnp.where(self._is_cf, jnp.arccos(jnp.clip(c_s, 0.0, 1.0)), jnp.inf))
+
+        if not angles:
+            return 0.5 * math.pi
+
+        smallest = float(jnp.min(jnp.concatenate(angles)))
+        if not np.isfinite(smallest):
+            return 0.5 * math.pi
+        return smallest
