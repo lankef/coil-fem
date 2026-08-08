@@ -633,13 +633,17 @@ class SupportBeams(Support):
         For a rectangular section, surface is ``max(|u|, |v|) = 1`` with
         ``u = 2 (d·p)/a``, ``v = 2 (d·q)/b``.  For a disk of radius ``a``,
         surface is ``sqrt(u² + v²) = 1`` with ``u = (d·p)/a``, ``v = (d·q)/a``.
+
         """
         dp = jnp.sum(d * p, axis=-1)
         dq = jnp.sum(d * q, axis=-1)
         xi_rect = 1.0 / (
-            jnp.maximum(jnp.abs(2.0 * dp / a), jnp.abs(2.0 * dq / b)) + 1e-300
+            jnp.maximum(jnp.abs(2.0 * dp / a), jnp.abs(2.0 * dq / b)) + eps
         )
-        xi_disk = a / (jnp.sqrt(dp * dp + dq * dq) + 1e-300)
+        # A floor of ``1e-3`` is added to each denominator so grazing chords
+        # (nearly tangent to the coil) stay finite under reverse-mode AD.
+                
+        xi_disk = a / (jnp.sqrt(dp * dp + dq * dq) + 1e-3)
         return jnp.where(is_disk, xi_disk, xi_rect)
 
     def _surface_exit_params(
@@ -653,6 +657,8 @@ class SupportBeams(Support):
         """Closed-form ``xi_start``, ``xi_end``, ``L_eff`` for every beam.
 
         When coil meshes have not been bound, returns ``(0, 1, L)``.
+        Computed exits are clipped to ``[0, 1]`` so the free span stays on
+        the centerline chord even for grazing (near-tangent) attachments.
         """
         n = L.shape[0]
         if self._coil_framed_templates is None:
@@ -711,8 +717,11 @@ class SupportBeams(Support):
         if self.stellsym:
             append_cc_group(self.n_base)
 
-        xi_start = jnp.concatenate(xi_s_list, axis=0)
-        xi_end = jnp.concatenate(xi_e_list, axis=0)
+        # Clipping to [0,1] ensures that when the coil-beam 
+        # angle is small, and the beam has high-curvature,
+        # the beam does not "protrude" outside the coil surface. 
+        xi_start = jnp.clip(jnp.concatenate(xi_s_list, axis=0), 0.0, 1.0)
+        xi_end = jnp.clip(jnp.concatenate(xi_e_list, axis=0), 0.0, 1.0)
         L_eff = jnp.maximum(L * (xi_end - xi_start), 1e-3 * L)
         return xi_start, xi_end, L_eff
 
