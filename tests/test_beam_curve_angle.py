@@ -1,4 +1,4 @@
-"""Checks for the CoilBeamAngle beam–coil attachment-angle penalty."""
+"""Checks for the BeamCurveAngle beam–coil attachment-angle penalty."""
 
 import math
 
@@ -11,7 +11,7 @@ from simsopt.field import Coil, Current                       # noqa: E402
 from simsopt.geo import create_equally_spaced_curves  # noqa: E402
 
 from coil_fem.simsopt import (                                # noqa: E402
-    CoilBeamAngle,
+    BeamCurveAngle,
     CoilSupportBeams,
     CoilSupportBeamsSorted,
 )
@@ -58,17 +58,17 @@ def _dof_index(opt, pattern, prefix=False):
 def test_rejects_minimum_angle_out_of_range():
     cs = _make_coil_support()
     with pytest.raises(ValueError, match="minimum_angle"):
-        CoilBeamAngle(cs, minimum_angle=-0.1)
+        BeamCurveAngle(cs, minimum_angle=-0.1)
     with pytest.raises(ValueError, match="minimum_angle"):
-        CoilBeamAngle(cs, minimum_angle=0.5 * math.pi)
+        BeamCurveAngle(cs, minimum_angle=0.5 * math.pi)
     with pytest.raises(ValueError, match="minimum_angle"):
-        CoilBeamAngle(cs, minimum_angle=math.pi)
+        BeamCurveAngle(cs, minimum_angle=math.pi)
 
 
 def test_rejects_invalid_mode():
     cs = _make_coil_support()
     with pytest.raises(ValueError, match="mode"):
-        CoilBeamAngle(cs, minimum_angle=0.2, mode='coil')
+        BeamCurveAngle(cs, minimum_angle=0.2, mode='coil')
 
 
 # ============================================================================
@@ -77,18 +77,18 @@ def test_rejects_invalid_mode():
 
 def test_J_zero_when_clear_and_positive_when_violated():
     cs = _make_coil_support()
-    alpha = CoilBeamAngle(cs, minimum_angle=0.0, mode='all').smallest_angle()
+    alpha = BeamCurveAngle(cs, minimum_angle=0.0, mode='all').smallest_angle()
     assert 0.0 < alpha < 0.5 * math.pi
 
-    assert CoilBeamAngle(cs, minimum_angle=0.5 * alpha, mode='all').J() == 0.0
+    assert BeamCurveAngle(cs, minimum_angle=0.5 * alpha, mode='all').J() == 0.0
     theta_violate = 0.5 * (alpha + 0.5 * math.pi)
-    assert CoilBeamAngle(cs, minimum_angle=theta_violate, mode='all').J() > 0.0
+    assert BeamCurveAngle(cs, minimum_angle=theta_violate, mode='all').J() > 0.0
 
 
 def test_smallest_angle_matches_host_arccos():
     """smallest_angle agrees with a host-side sweep of active attachments."""
     cs = _make_coil_support()
-    Jang = CoilBeamAngle(cs, minimum_angle=0.1, mode='all')
+    Jang = BeamCurveAngle(cs, minimum_angle=0.1, mode='all')
 
     cdofs, sdofs = Jang._read_dofs()
     t_beam, t_start, t_end = Jang._geom(cdofs, sdofs)
@@ -111,9 +111,9 @@ def test_smallest_angle_matches_host_arccos():
 
 def test_J_matches_hinge_formula_on_host():
     cs = _make_coil_support()
-    alpha = CoilBeamAngle(cs, minimum_angle=0.0).smallest_angle()
+    alpha = BeamCurveAngle(cs, minimum_angle=0.0).smallest_angle()
     theta = 0.5 * (alpha + 0.5 * math.pi)
-    Jang = CoilBeamAngle(cs, minimum_angle=theta, mode='all')
+    Jang = BeamCurveAngle(cs, minimum_angle=theta, mode='all')
     cos_min = math.cos(theta)
 
     cdofs, sdofs = Jang._read_dofs()
@@ -147,21 +147,21 @@ def test_mode_switches_cc_cf_all():
             x[i] += 0.5
     cs.x = x
 
-    alpha_cc = CoilBeamAngle(cs, 0.0, mode='cc').smallest_angle()
-    alpha_cf = CoilBeamAngle(cs, 0.0, mode='cf').smallest_angle()
+    alpha_cc = BeamCurveAngle(cs, 0.0, mode='cc').smallest_angle()
+    alpha_cf = BeamCurveAngle(cs, 0.0, mode='cf').smallest_angle()
     assert alpha_cf < 0.5 * math.pi - 1e-6
     theta = 0.5 * (max(alpha_cc, alpha_cf) + 0.5 * math.pi)
 
-    J_cc = CoilBeamAngle(cs, theta, mode='cc').J()
-    J_cf = CoilBeamAngle(cs, theta, mode='cf').J()
-    J_all = CoilBeamAngle(cs, theta, mode='all').J()
+    J_cc = BeamCurveAngle(cs, theta, mode='cc').J()
+    J_cf = BeamCurveAngle(cs, theta, mode='cf').J()
+    J_all = BeamCurveAngle(cs, theta, mode='all').J()
 
     assert J_cc > 0.0
     assert J_cf > 0.0
     np.testing.assert_allclose(J_all, J_cc + J_cf, rtol=1e-12)
     assert (
-        CoilBeamAngle(cs, theta, mode='cf').smallest_angle()
-        >= CoilBeamAngle(cs, theta, mode='all').smallest_angle() - 1e-15
+        BeamCurveAngle(cs, theta, mode='cf').smallest_angle()
+        >= BeamCurveAngle(cs, theta, mode='all').smallest_angle() - 1e-15
     )
 
 
@@ -184,15 +184,15 @@ def test_smallest_angle_empty_cf_mode_returns_half_pi():
             'r_clamp': 0.1,
         },
     )
-    Jang = CoilBeamAngle(cs, minimum_angle=0.2, mode='cf')
+    Jang = BeamCurveAngle(cs, minimum_angle=0.2, mode='cf')
     np.testing.assert_allclose(Jang.smallest_angle(), 0.5 * math.pi, atol=1e-15)
     assert Jang.J() == 0.0
 
 
 def test_J_cache_invalidated_on_dof_change():
     cs = _make_coil_support()
-    alpha = CoilBeamAngle(cs, 0.0).smallest_angle()
-    Jang = CoilBeamAngle(cs, 0.5 * (alpha + 0.5 * math.pi), mode='all')
+    alpha = BeamCurveAngle(cs, 0.0).smallest_angle()
+    Jang = BeamCurveAngle(cs, 0.5 * (alpha + 0.5 * math.pi), mode='all')
     J0 = Jang.J()
 
     i = _dof_index(Jang, ':phis_start_cc(0,0)')
@@ -204,8 +204,8 @@ def test_J_cache_invalidated_on_dof_change():
 
 def test_J_independent_of_currents():
     cs = _make_coil_support()
-    alpha = CoilBeamAngle(cs, 0.0).smallest_angle()
-    Jang = CoilBeamAngle(cs, 0.5 * (alpha + 0.5 * math.pi), mode='all')
+    alpha = BeamCurveAngle(cs, 0.0).smallest_angle()
+    Jang = BeamCurveAngle(cs, 0.5 * (alpha + 0.5 * math.pi), mode='all')
     J0 = Jang.J()
 
     i = _dof_index(Jang, 'Current', prefix=True)
@@ -224,8 +224,8 @@ def test_J_independent_of_currents():
 def test_dJ_taylor_test(cls):
     """Central differences of J must match dJ to second order."""
     cs = _make_coil_support(cls)
-    alpha = CoilBeamAngle(cs, 0.0).smallest_angle()
-    Jang = CoilBeamAngle(cs, 0.5 * (alpha + 0.5 * math.pi), mode='all')
+    alpha = BeamCurveAngle(cs, 0.0).smallest_angle()
+    Jang = BeamCurveAngle(cs, 0.5 * (alpha + 0.5 * math.pi), mode='all')
 
     x0 = np.array(Jang.x)
     assert x0.size > 0
@@ -251,8 +251,8 @@ def test_dJ_taylor_test(cls):
 
 def test_dJ_reaches_both_curve_and_support_dofs():
     cs = _make_coil_support()
-    alpha = CoilBeamAngle(cs, 0.0).smallest_angle()
-    Jang = CoilBeamAngle(cs, 0.5 * (alpha + 0.5 * math.pi), mode='all')
+    alpha = BeamCurveAngle(cs, 0.0).smallest_angle()
+    Jang = BeamCurveAngle(cs, 0.5 * (alpha + 0.5 * math.pi), mode='all')
 
     partials = Jang.dJ(partials=True)
     for curve in cs.base_curves:
