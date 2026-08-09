@@ -637,12 +637,11 @@ class SupportBeams(Support):
         """
         dp = jnp.sum(d * p, axis=-1)
         dq = jnp.sum(d * q, axis=-1)
-        xi_rect = 1.0 / (
-            jnp.maximum(jnp.abs(2.0 * dp / a), jnp.abs(2.0 * dq / b)) + eps
-        )
         # A floor of ``1e-3`` is added to each denominator so grazing chords
         # (nearly tangent to the coil) stay finite under reverse-mode AD.
-                
+        xi_rect = 1.0 / (
+            jnp.maximum(jnp.abs(2.0 * dp / a), jnp.abs(2.0 * dq / b)) + 1e-3
+        )
         xi_disk = a / (jnp.sqrt(dp * dp + dq * dq) + 1e-3)
         return jnp.where(is_disk, xi_disk, xi_rect)
 
