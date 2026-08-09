@@ -331,12 +331,8 @@ class CoilFEM:
         if hasattr(self.support, 'bind_coil_meshes'):
             self.support.bind_coil_meshes(self.meshes)
 
-        # Build the monolithic static bundle once (cuDSS path only; no-op otherwise).
-        self.monolithic_static: MonolithicStatic | None = None
-        if self.support.is_coupled and coupling == 'monolithic':
-            self.monolithic_static = self.build_monolithic_static(
-                self.problem_options.get('solver', 'umfpack')
-            )
+        # Monolithic CSR / cuDSS bundle is built lazily on first access to
+        # :attr:`monolithic_static` (see cached_property below).
 
         # ── Per-coil JIT body force functions ────────────────────────────────
         # Binding coil_idx statically via functools.partial lets JAX resolve
@@ -368,6 +364,21 @@ class CoilFEM:
     # ============================================================================
     # Static monolithic bundle
     # ============================================================================
+
+    @functools.cached_property
+    def monolithic_static(self) -> MonolithicStatic | None:
+        """Pre-built monolithic pattern / solver bundle, or ``None``.
+
+        Built on first access when ``coupling == 'monolithic'`` and the support
+        is coupled; otherwise ``None``.  Deferred so constructing / loading a
+        ``CoilFEM`` with ``solver='cudss'`` does not require CUDA until a
+        monolithic solve (or an explicit read of this attribute) runs.
+        """
+        if not (self.support.is_coupled and self.coupling == 'monolithic'):
+            return None
+        return self.build_monolithic_static(
+            self.problem_options.get('solver', 'umfpack')
+        )
 
     def build_monolithic_static(self, solver: str) -> MonolithicStatic:
         """Pre-build all static pattern and solver data for the monolithic solve.
