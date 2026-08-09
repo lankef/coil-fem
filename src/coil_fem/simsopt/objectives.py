@@ -8,7 +8,7 @@ point: it holds the base coils (curves + currents), ``nfp``, ``stellsym``,
 and any optimisable support DOFs (e.g. clamp locations).
 :class:`BeamSurfaceDistance` is a geometric companion penalty that keeps
 support beams clear of a target surface.
-:class:`CoilBeamAngle` penalises beam–coil attachments that are too nearly
+:class:`BeamCurveAngle` penalises beam–coil attachments that are too nearly
 tangent.
 """
 
@@ -681,13 +681,13 @@ class BeamSurfaceDistance(Optimizable):
         return float(jnp.min(_segment_point_dists(x_start, x_end, gammas)))
 
 
-def _coil_beam_angle_hinge(abs_dot, cos_min, mask):
+def _beam_curve_angle_hinge(abs_dot, cos_min, mask):
     """Sum of ``max(|n·t| - cos θ_min, 0)^2`` over masked beam endpoints."""
     hinge = jnp.maximum(abs_dot - cos_min, 0.0) ** 2
     return jnp.sum(jnp.where(mask, hinge, 0.0))
 
 
-class CoilBeamAngle(Optimizable):
+class BeamCurveAngle(Optimizable):
     r"""Penalise beam–coil attachments that are too nearly tangent.
 
     For each active attachment the hinge
@@ -720,7 +720,7 @@ class CoilBeamAngle(Optimizable):
 
     Examples
     --------
-    >>> Jang = CoilBeamAngle(coil_support, minimum_angle=0.2, mode='all')
+    >>> Jang = BeamCurveAngle(coil_support, minimum_angle=0.2, mode='all')
     >>> Jang.smallest_angle()  # doctest: +SKIP
     0.35...
     """
@@ -734,7 +734,7 @@ class CoilBeamAngle(Optimizable):
         mode: str = 'all',
     ):
         if not _HAS_SIMSOPT:
-            raise ImportError("simsopt is required for CoilBeamAngle.")
+            raise ImportError("simsopt is required for BeamCurveAngle.")
 
         minimum_angle = float(minimum_angle)
         if not (0.0 <= minimum_angle < 0.5 * math.pi):
@@ -804,10 +804,10 @@ class CoilBeamAngle(Optimizable):
         cos_min = self._cos_min
         J = jnp.array(0.0)
         if self._use_cc:
-            J = J + _coil_beam_angle_hinge(c_s, cos_min, self._is_cc)
-            J = J + _coil_beam_angle_hinge(c_e, cos_min, self._is_cc)
+            J = J + _beam_curve_angle_hinge(c_s, cos_min, self._is_cc)
+            J = J + _beam_curve_angle_hinge(c_e, cos_min, self._is_cc)
         if self._use_cf:
-            J = J + _coil_beam_angle_hinge(c_s, cos_min, self._is_cf)
+            J = J + _beam_curve_angle_hinge(c_s, cos_min, self._is_cf)
         return J
 
     def _compute(self):
