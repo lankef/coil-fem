@@ -8,6 +8,8 @@ point: it holds the base coils (curves + currents), ``nfp``, ``stellsym``,
 and any optimisable support DOFs (e.g. clamp locations).
 :class:`BeamSurfaceDistance` is a geometric companion penalty that keeps
 support beams clear of a target surface.
+:class:`BeamCurveDistance` hinges free-span beam clearance to the attached
+coil curves.
 :class:`BeamCurveAngle` penalises beam–coil attachments that are too nearly
 tangent.
 """
@@ -679,6 +681,318 @@ class BeamSurfaceDistance(Optimizable):
         x_start, x_end, _ = self._beam_chords(cdofs, sdofs)
         gammas, _ = self._surface_arrays()
         return float(jnp.min(_segment_point_dists(x_start, x_end, gammas)))
+
+
+# ============================================================================
+# Beam-curve distance
+# ============================================================================
+
+
+def _curve_segment_hinge(x_a, x_b, gamma, gammadash, minimum_distance):
+    r"""Per-beam arclength-weighted hinge of segment-to-curve distance.
+
+    .. math::
+        J_b = \bigl\langle
+            \|\gamma'\| \,
+            \max(0,\, d_\min - d_b)^2
+        \bigr\rangle_{\phi}
+
+    where :math:`d_b` is the distance from the curve sample to segment
+    ``x_a[b] -> x_b[b]``.
+
+    Parameters
+    ----------
+    x_a, x_b : jax.Array, shape (N, 3)
+        Effective free-span endpoints.
+    gamma : jax.Array, shape (M, 3)
+        Curve quadrature points.
+    gammadash : jax.Array, shape (M, 3)
+        Curve tangents ``γ'`` (``dγ/dφ``); ``‖γ'‖`` weights the quadrature.
+    minimum_distance : float
+        Threshold below which the penalty activates.
+
+    Returns
+    -------
+    jax.Array, shape (N,)
+        Per-beam mean hinge values.
+    """
+    dists = _segment_point_dists(x_a, x_b, gamma)
+    alen = jnp.linalg.norm(gammadash, axis=1)
+    return jnp.mean(
+        alen[None, :] * jnp.maximum(minimum_distance - dists, 0.0) ** 2,
+        axis=1,
+    )
+
+
+class BeamCurveDistance(Optimizable):
+    r"""Penalise support beams that come closer than ``minimum_distance`` to coils.
+
+    The beam analogue of :class:`simsopt.geo.CurveCurveDistance`: the same
+    hinge form, with distances measured from each coil curve to the beam's
+    effective free-span segment rather than between two sampled curves.
+
+    .. math::
+        J = \sum_b \Biggl(
+            \int_{\gamma_b^\mathrm{start}}
+                \max\bigl(0,\, d_\min - d_b^\mathrm{start}\bigr)^2
+                \, dl^\mathrm{start}
+            + \int_{\gamma_b^\mathrm{end}}
+                \max\bigl(0,\, d_\min - d_b^\mathrm{end}\bigr)^2
+                \, dl^\mathrm{end}
+        \Biggr)
+
+    where :math:`d_b^\mathrm{start}` (:math:`d_b^\mathrm{end}`) is the
+    Euclidean distance from a point on the start (end) coil to the free-span
+    segment :math:`S_b` of beam :math:`b`.  Coil–foundation (CF) beams omit
+    the end integral.  The free span is the chord station interval
+
+    .. math::
+        \xi_\mathrm{start}^\mathrm{eff}
+            = \max(\xi_\mathrm{start},\, r_\mathrm{safe}/L),
+        \qquad
+        \xi_\mathrm{end}^\mathrm{eff}
+            = \min(\xi_\mathrm{end},\, 1 - r_\mathrm{safe}/L),
+
+    with :math:`S_b` the segment between those stations.  When
+    :math:`\xi_\mathrm{start}^\mathrm{eff} > \xi_\mathrm{end}^\mathrm{eff}`,
+    beam :math:`b` contributes zero.
+
+    Parameters
+    ----------
+    coil_support_beams : CoilSupportBeams
+        Provides the base curves, the beam DOFs, and the underlying
+        :class:`~coil_fem.coupling.SupportBeams` model.
+    safe_radius : float
+        Length trimmed from each chord end before the free span [m].
+    minimum_distance : float
+        Desired minimum beam-to-coil clearance [m].
+
+    Notes
+    -----
+    Only the base (master) beams held in ``SupportBeams.beam_geometry`` are
+    summed; stellarator-mirrored partners and field-period rotations are not
+    replicated.
+
+    Examples
+    --------
+    >>> Jbc = BeamCurveDistance(coil_support, safe_radius=0.05, minimum_distance=0.1)
+    >>> Jbc.shortest_distance()  # doctest: +SKIP
+    0.18...
+    """
+
+    def __init__(
+        self,
+        coil_support_beams,
+        safe_radius: float,
+        minimum_distance: float,
+    ):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for BeamCurveDistance.")
+
+        safe_radius = float(safe_radius)
+        minimum_distance = float(minimum_distance)
+        if safe_radius < 0.0:
+            raise ValueError(f"safe_radius must be >= 0; got {safe_radius}.")
+        if minimum_distance < 0.0:
+            raise ValueError(
+                f"minimum_distance must be >= 0; got {minimum_distance}."
+            )
+
+        self._coil_support = coil_support_beams
+        self._support = coil_support_beams.support
+        self.safe_radius = safe_radius
+        self.minimum_distance = minimum_distance
+
+        self._base_curves_jax = [
+            CurveXYZFourierJAX.from_simsopt(c)
+            for c in coil_support_beams.base_curves
+        ]
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=(0, 1)))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_curves: list | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support_beams])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _read_dofs(self):
+        """Read coil / support DOFs live from the simsopt graph."""
+        base_curves_dofs = [
+            jnp.asarray(c.get_dofs())
+            for c in self._coil_support.base_curves
+        ]
+        return base_curves_dofs, self._coil_support.support_dofs
+
+    def _curves_jax(self, cdofs):
+        """Rebuild traced curve pytrees from live DOFs."""
+        return [
+            CurveXYZFourierJAX(ref.quadpoints, d, ref.order)
+            for ref, d in zip(self._base_curves_jax, cdofs)
+        ]
+
+    def _effective_segments(self, geom):
+        """Free-span endpoints ``(x_a, x_b)`` and active mask from ``geom``."""
+        x_start = geom['x_start']
+        x_end = geom['x_end']
+        L = geom['L']
+        xi_safe_start = self.safe_radius / (L + 1e-300)
+        xi_safe_end = 1.0 - self.safe_radius / (L + 1e-300)
+        xi_start_eff = jnp.maximum(geom['xi_start'], xi_safe_start)
+        xi_end_eff = jnp.minimum(geom['xi_end'], xi_safe_end)
+        active = xi_start_eff <= xi_end_eff
+        d = x_end - x_start
+        x_a = x_start + xi_start_eff[:, None] * d
+        x_b = x_start + xi_end_eff[:, None] * d
+        return x_a, x_b, active
+
+    def _accumulate_J(self, curves_jax, x_a, x_b, active):
+        """Sum start/end hinges over CC groups and start-only hinges over CF."""
+        support = self._support
+        dmin = self.minimum_distance
+        J = jnp.array(0.0)
+        b = 0
+        n_base = support.n_base
+
+        def add_cc(J0, g, b0):
+            n_g = support.n_beam_cc[g]
+            if n_g == 0:
+                return J0, b0
+            start_idx, end_idx, end_tfm = support.cc_groups[g]
+            sl = slice(b0, b0 + n_g)
+            c_s = curves_jax[start_idx]
+            c_e = curves_jax[end_idx]
+            gamma_e = support._apply_end_transform(c_e.gamma(), end_tfm)
+            hs = _curve_segment_hinge(
+                x_a[sl], x_b[sl], c_s.gamma(), c_s.gammadash(), dmin,
+            )
+            he = _curve_segment_hinge(
+                x_a[sl], x_b[sl], gamma_e, c_e.gammadash(), dmin,
+            )
+            return J0 + jnp.sum(jnp.where(active[sl], hs + he, 0.0)), b0 + n_g
+
+        for i in range(n_base):
+            J, b = add_cc(J, i, b)
+
+            n_cf = support.n_beam_cf[i]
+            if n_cf > 0:
+                sl = slice(b, b + n_cf)
+                c_s = curves_jax[i]
+                hs = _curve_segment_hinge(
+                    x_a[sl], x_b[sl], c_s.gamma(), c_s.gammadash(), dmin,
+                )
+                J = J + jnp.sum(jnp.where(active[sl], hs, 0.0))
+                b += n_cf
+
+        if support.stellsym:
+            J, b = add_cc(J, n_base, b)
+
+        return J
+
+    def _J_pure(self, cdofs, sdofs):
+        """Beam-to-coil free-span hinge penalty (traced scalar)."""
+        curves_jax = self._curves_jax(cdofs)
+        geom = self._support.beam_geometry(curves_jax, sdofs)
+        x_a, x_b, active = self._effective_segments(geom)
+        return self._accumulate_J(curves_jax, x_a, x_b, active)
+
+    def _compute(self):
+        """Evaluate J and its gradients from the single ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        cdofs, sdofs = self._read_dofs()
+        J_val, (grad_cdofs, grad_sdofs) = self._jit_vg(cdofs, sdofs)
+        self._J_cache = float(J_val)
+        self._grad_curves = [np.asarray(g) for g in grad_cdofs]
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """Beam-to-coil free-span hinge penalty (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the coil and support DOFs.
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+
+        d = Derivative({})
+        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+            d = d + Derivative({curve: g})
+        return d + Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def shortest_distance(self):
+        """Smallest free-span-to-coil-curve distance [m].
+
+        Returns
+        -------
+        float
+            Minimum over active beams of the distance from segment ``S`` to
+            the start coil (and, for CC beams, the end coil).  Inactive beams
+            are ignored.  If every beam is inactive, returns ``inf``.
+        """
+        cdofs, sdofs = self._read_dofs()
+        curves_jax = self._curves_jax(cdofs)
+        geom = self._support.beam_geometry(curves_jax, sdofs)
+        x_a, x_b, active = self._effective_segments(geom)
+
+        support = self._support
+        best = jnp.inf
+        b = 0
+        n_base = support.n_base
+
+        def min_cc(g, b0, best0):
+            n_g = support.n_beam_cc[g]
+            if n_g == 0:
+                return best0, b0
+            start_idx, end_idx, end_tfm = support.cc_groups[g]
+            sl = slice(b0, b0 + n_g)
+            gamma_s = curves_jax[start_idx].gamma()
+            gamma_e = support._apply_end_transform(
+                curves_jax[end_idx].gamma(), end_tfm,
+            )
+            ds = jnp.min(_segment_point_dists(x_a[sl], x_b[sl], gamma_s), axis=1)
+            de = jnp.min(_segment_point_dists(x_a[sl], x_b[sl], gamma_e), axis=1)
+            d = jnp.minimum(ds, de)
+            d = jnp.where(active[sl], d, jnp.inf)
+            return jnp.minimum(best0, jnp.min(d)), b0 + n_g
+
+        for i in range(n_base):
+            best, b = min_cc(i, b, best)
+
+            n_cf = support.n_beam_cf[i]
+            if n_cf > 0:
+                sl = slice(b, b + n_cf)
+                ds = jnp.min(
+                    _segment_point_dists(
+                        x_a[sl], x_b[sl], curves_jax[i].gamma(),
+                    ),
+                    axis=1,
+                )
+                ds = jnp.where(active[sl], ds, jnp.inf)
+                best = jnp.minimum(best, jnp.min(ds))
+                b += n_cf
+
+        if support.stellsym:
+            best, b = min_cc(n_base, b, best)
+
+        return float(best)
 
 
 def _beam_curve_angle_hinge(abs_dot, cos_min, mask):
