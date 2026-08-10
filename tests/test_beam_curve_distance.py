@@ -30,8 +30,8 @@ BEAM_OPTIONS = {
 }
 
 # Trim attachment neighbourhood so free-span endpoints are not on the coils
-# (safe_radius=0 puts chord ends on γ(φ), making shortest distance 0 and dJ NaN).
-SAFE_RADIUS = 0.05
+# (dead_length=0 puts chord ends on γ(φ), making shortest distance 0 and dJ NaN).
+DEAD_LENGTH = 0.05
 
 
 def _make_coil_support(cls=CoilSupportBeams, **beam_overrides):
@@ -92,21 +92,21 @@ def test_curve_segment_hinge_matches_mean_formula():
 
 def test_J_zero_when_clear_and_positive_when_violated():
     cs = _make_coil_support()
-    d_clear = 0.5 * BeamCurveDistance(cs, SAFE_RADIUS, 0.0).shortest_distance()
+    d_clear = 0.5 * BeamCurveDistance(cs, DEAD_LENGTH, 0.0).shortest_distance()
     assert d_clear > 0.0
     assert np.isfinite(d_clear)
 
-    assert BeamCurveDistance(cs, SAFE_RADIUS, d_clear).J() == 0.0
-    assert BeamCurveDistance(cs, SAFE_RADIUS, 4.0 * d_clear).J() > 0.0
+    assert BeamCurveDistance(cs, DEAD_LENGTH, d_clear).J() == 0.0
+    assert BeamCurveDistance(cs, DEAD_LENGTH, 4.0 * d_clear).J() > 0.0
 
 
 def test_inactive_free_span_contributes_zero():
-    """When safe_radius exceeds L/2, every free span is empty and J is 0."""
+    """When dead_length exceeds L/2, every free span is empty and J is 0."""
     cs = _make_coil_support()
     # Any finite clearance; empty free spans must still give J = 0.
-    assert BeamCurveDistance(cs, safe_radius=1e3, minimum_distance=10.0).J() == 0.0
+    assert BeamCurveDistance(cs, dead_length=1e3, minimum_distance=10.0).J() == 0.0
     assert not np.isfinite(
-        BeamCurveDistance(cs, safe_radius=1e3, minimum_distance=0.0).shortest_distance()
+        BeamCurveDistance(cs, dead_length=1e3, minimum_distance=0.0).shortest_distance()
     )
 
 
@@ -114,7 +114,7 @@ def test_cf_omits_end_curve_integral():
     """CF-only supports only hinge against the start coil (no second curve)."""
     cs = _make_coil_support(n_beam_cc=0, n_beam_cf=1)
     dmin = 1.0
-    Jb = BeamCurveDistance(cs, safe_radius=SAFE_RADIUS, minimum_distance=dmin)
+    Jb = BeamCurveDistance(cs, dead_length=DEAD_LENGTH, minimum_distance=dmin)
     cdofs, sdofs = Jb._read_dofs()
     curves_jax = Jb._curves_jax(cdofs)
     geom = cs.support.beam_geometry(curves_jax, sdofs)
@@ -141,7 +141,7 @@ def test_cf_omits_end_curve_integral():
 
 def test_shortest_distance_matches_brute_force():
     cs = _make_coil_support()
-    Jb = BeamCurveDistance(cs, safe_radius=SAFE_RADIUS, minimum_distance=0.1)
+    Jb = BeamCurveDistance(cs, dead_length=DEAD_LENGTH, minimum_distance=0.1)
     cdofs, sdofs = Jb._read_dofs()
     curves_jax = Jb._curves_jax(cdofs)
     geom = cs.support.beam_geometry(curves_jax, sdofs)
@@ -198,8 +198,8 @@ def test_shortest_distance_matches_brute_force():
 
 def test_J_matches_hinge_formula_on_host():
     cs = _make_coil_support()
-    d_min = 3.0 * BeamCurveDistance(cs, SAFE_RADIUS, 0.0).shortest_distance()
-    Jb = BeamCurveDistance(cs, safe_radius=SAFE_RADIUS, minimum_distance=d_min)
+    d_min = 3.0 * BeamCurveDistance(cs, DEAD_LENGTH, 0.0).shortest_distance()
+    Jb = BeamCurveDistance(cs, dead_length=DEAD_LENGTH, minimum_distance=d_min)
 
     cdofs, sdofs = Jb._read_dofs()
     curves_jax = Jb._curves_jax(cdofs)
@@ -255,7 +255,7 @@ def test_J_matches_hinge_formula_on_host():
 
 def test_J_cache_invalidated_on_dof_change():
     cs = _make_coil_support()
-    Jb = BeamCurveDistance(cs, safe_radius=SAFE_RADIUS, minimum_distance=1.0)
+    Jb = BeamCurveDistance(cs, dead_length=DEAD_LENGTH, minimum_distance=1.0)
     J0 = Jb.J()
 
     i = _dof_index(Jb, ':x_foundation(0,0,0)')
@@ -267,7 +267,7 @@ def test_J_cache_invalidated_on_dof_change():
 
 def test_J_independent_of_currents():
     cs = _make_coil_support()
-    Jb = BeamCurveDistance(cs, safe_radius=SAFE_RADIUS, minimum_distance=1.0)
+    Jb = BeamCurveDistance(cs, dead_length=DEAD_LENGTH, minimum_distance=1.0)
     J0 = Jb.J()
 
     i = _dof_index(Jb, 'Current', prefix=True)
@@ -280,10 +280,10 @@ def test_J_independent_of_currents():
 
 def test_rejects_negative_parameters():
     cs = _make_coil_support()
-    with pytest.raises(ValueError, match="safe_radius"):
-        BeamCurveDistance(cs, safe_radius=-0.1, minimum_distance=0.0)
+    with pytest.raises(ValueError, match="dead_length"):
+        BeamCurveDistance(cs, dead_length=-0.1, minimum_distance=0.0)
     with pytest.raises(ValueError, match="minimum_distance"):
-        BeamCurveDistance(cs, safe_radius=0.0, minimum_distance=-0.1)
+        BeamCurveDistance(cs, dead_length=0.0, minimum_distance=-0.1)
 
 
 # ============================================================================
@@ -294,8 +294,8 @@ def test_rejects_negative_parameters():
 def test_dJ_taylor_test(cls):
     """Central differences of J must match dJ to second order."""
     cs = _make_coil_support(cls)
-    d0 = BeamCurveDistance(cs, SAFE_RADIUS, 0.0).shortest_distance()
-    Jb = BeamCurveDistance(cs, safe_radius=SAFE_RADIUS, minimum_distance=4.0 * d0)
+    d0 = BeamCurveDistance(cs, DEAD_LENGTH, 0.0).shortest_distance()
+    Jb = BeamCurveDistance(cs, dead_length=DEAD_LENGTH, minimum_distance=4.0 * d0)
 
     x0 = np.array(Jb.x)
     assert x0.size > 0
@@ -320,8 +320,8 @@ def test_dJ_taylor_test(cls):
 
 def test_dJ_reaches_both_curve_and_support_dofs():
     cs = _make_coil_support()
-    d0 = BeamCurveDistance(cs, SAFE_RADIUS, 0.0).shortest_distance()
-    Jb = BeamCurveDistance(cs, safe_radius=SAFE_RADIUS, minimum_distance=4.0 * d0)
+    d0 = BeamCurveDistance(cs, DEAD_LENGTH, 0.0).shortest_distance()
+    Jb = BeamCurveDistance(cs, dead_length=DEAD_LENGTH, minimum_distance=4.0 * d0)
 
     partials = Jb.dJ(partials=True)
     for curve in cs.base_curves:
