@@ -762,8 +762,8 @@ class BeamCurveDistance(Optimizable):
     coil_support_beams : CoilSupportBeams
         Provides the base curves, the beam DOFs, and the underlying
         :class:`~coil_fem.coupling.SupportBeams` model.
-    safe_radius : float
-        Length trimmed from each chord end before the free span [m].
+    dead_length : float
+        Length ignored from each chord end before the free span [m].
     minimum_distance : float
         Desired minimum beam-to-coil clearance [m].
 
@@ -775,7 +775,7 @@ class BeamCurveDistance(Optimizable):
 
     Examples
     --------
-    >>> Jbc = BeamCurveDistance(coil_support, safe_radius=0.05, minimum_distance=0.1)
+    >>> Jbc = BeamCurveDistance(coil_support, dead_length=0.05, minimum_distance=0.1)
     >>> Jbc.shortest_distance()  # doctest: +SKIP
     0.18...
     """
@@ -783,16 +783,16 @@ class BeamCurveDistance(Optimizable):
     def __init__(
         self,
         coil_support_beams,
-        safe_radius: float,
+        dead_length: float,
         minimum_distance: float,
     ):
         if not _HAS_SIMSOPT:
             raise ImportError("simsopt is required for BeamCurveDistance.")
 
-        safe_radius = float(safe_radius)
+        dead_length = float(dead_length)
         minimum_distance = float(minimum_distance)
-        if safe_radius < 0.0:
-            raise ValueError(f"safe_radius must be >= 0; got {safe_radius}.")
+        if dead_length < 0.0:
+            raise ValueError(f"dead_length must be >= 0; got {dead_length}.")
         if minimum_distance < 0.0:
             raise ValueError(
                 f"minimum_distance must be >= 0; got {minimum_distance}."
@@ -800,7 +800,7 @@ class BeamCurveDistance(Optimizable):
 
         self._coil_support = coil_support_beams
         self._support = coil_support_beams.support
-        self.safe_radius = safe_radius
+        self.dead_length = dead_length
         self.minimum_distance = minimum_distance
 
         self._base_curves_jax = [
@@ -841,8 +841,8 @@ class BeamCurveDistance(Optimizable):
         x_start = geom['x_start']
         x_end = geom['x_end']
         L = geom['L']
-        xi_safe_start = self.safe_radius / (L + 1e-300)
-        xi_safe_end = 1.0 - self.safe_radius / (L + 1e-300)
+        xi_safe_start = self.dead_length / (L + 1e-300)
+        xi_safe_end = 1.0 - self.dead_length / (L + 1e-300)
         xi_start_eff = jnp.maximum(geom['xi_start'], xi_safe_start)
         xi_end_eff = jnp.minimum(geom['xi_end'], xi_safe_end)
         active = xi_start_eff <= xi_end_eff
