@@ -197,6 +197,7 @@ def to_full_body(
     Jstress,
     mesh_scale: float = 0.5,
     path: str | Path = "full_body_fields.vtu",
+    output_msh: bool = False,
 ) -> Path:
     """Build a fused full-device TET10 mesh and write ``full_body_fields.vtu``.
 
@@ -208,6 +209,9 @@ def to_full_body(
         Multiplier on gmsh ``MeshSizeMax`` / ``MeshSizeMin``.
     path : path-like
         Output VTU path (default ``full_body_fields.vtu``).
+    output_msh : bool
+        If True, also write ``full_mesh.msh`` next to ``path`` (for
+        ``beam_dolfinx.py`` / ``gmshio.read_from_msh``).
 
     Returns
     -------
@@ -318,6 +322,12 @@ def to_full_body(
         gmsh.option.setNumber("Mesh.ElementOrder", 2)
         gmsh.model.mesh.generate(3)
 
+        if output_msh:
+            # Same artifact as mesh.ipynb / beam_dolfinx.MESH_PATH: one
+            # physical volume "device", TET10, MSH 4.x via gmsh.write.
+            msh_path = path.with_name("full_mesh.msh")
+            gmsh.write(str(msh_path))
+
         # Nodes/cells must be read before finalize/clear.
         node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
         X = np.asarray(node_coords, dtype=np.float64).reshape(-1, 3)
@@ -333,6 +343,24 @@ def to_full_body(
         cells = inv[enodes.reshape(-1, 10)][:, [0, 1, 2, 3, 4, 5, 6, 7, 9, 8]]
 
         owner_coil, owner_sym = _classify_nodes(X, meshes, Q_list, w1, w2)
+
+        # Mesh size summary: all / conductor (coil) / remaining (support).
+        # Nodes use owner_coil from _classify_nodes; cells are coil if a
+        # majority of their 4 corner vertices are coil-owned.
+        n_nodes = int(X.shape[0])
+        n_cells = int(cells.shape[0])
+        coil_node = owner_coil >= 0
+        n_coil_nodes = int(np.count_nonzero(coil_node))
+        n_support_nodes = n_nodes - n_coil_nodes
+        coil_cell = coil_node[cells[:, :4]].mean(axis=1) >= 0.5
+        n_coil_cells = int(np.count_nonzero(coil_cell))
+        n_support_cells = n_cells - n_coil_cells
+        print(
+            "to_full_body mesh counts:\n"
+            f"  all bodies:       {n_nodes} nodes, {n_cells} cells\n"
+            f"  conductor (coil): {n_coil_nodes} nodes, {n_coil_cells} cells\n"
+            f"  support:          {n_support_nodes} nodes, {n_support_cells} cells"
+        )
 
         n_base = len(meshes)
         n_sym = Q_list.shape[0]
