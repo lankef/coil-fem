@@ -1,6 +1,11 @@
 """Simsopt integration."""
 
-from .objectives import BeamSurfaceDistance, BeamCurveAngle, CoilFEMObjective
+from .objectives import (
+    BeamSurfaceDistance,
+    BeamCurveDistance,
+    BeamCurveAngle,
+    CoilFEMObjective,
+)
 from .coil_support import CoilSupport
 from .coil_support_fixed import (
     CoilSupportFixed,
@@ -12,6 +17,7 @@ from .utils import constraint_from_optimizable
 
 __all__ = [
     "BeamSurfaceDistance",
+    "BeamCurveDistance",
     "BeamCurveAngle",
     "CoilFEMObjective",
     "CoilSupport",
