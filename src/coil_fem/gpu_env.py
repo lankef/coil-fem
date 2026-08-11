@@ -78,7 +78,7 @@ def _backend_is_initialized() -> bool:
 _VARS = ("XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_MEM_FRACTION")
 
 
-def configure_gpu_memory(mem_fraction: float = 0.5, *, force: bool = False) -> dict[str, str]:
+def configure_gpu_memory(mem_fraction: float = 0.9, *, force: bool = False) -> dict[str, str]:
     """Leave GPU memory free for cuDSS, which allocates outside XLA's pool.
 
     Disables XLA pre-allocation and caps the BFC pool. Call before importing
