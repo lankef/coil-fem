@@ -324,7 +324,7 @@ class CoilFEMObjective(Optimizable):
         strain_energy = 0.0
         for i in range(len(result['von_mises'])):
             prob = fem.pipelines[i].problem
-            pts  = result['mesh_points'][i]
+            pts = result['mesh_points'][i]
             sg, jxw_j, _, _ = recompute_fe_geometry(
                 pts, prob._cells_jnp, prob._sg_ref, prob._sv, prob._qw)
             jxw   = np.asarray(jxw_j)               # (n_cells, n_quads)
