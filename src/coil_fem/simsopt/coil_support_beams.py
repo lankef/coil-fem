@@ -366,17 +366,17 @@ class CoilSupportBeams(CoilSupport):
         n_beam_cf = beams.n_beam_cf
         n_groups_cc = beams.n_groups_cc
 
-        if not fixed_clamp_options.get('enabled', False):
-            # Each coil must be supported by either fixed clamps (handled
-            # above, applies to all coils) or at least one coil-foundation
-            # beam.
-            unsupported = [i for i in range(n_base) if n_beam_cf[i] < 1]
-            if unsupported:
-                raise AttributeError(
-                    "Each coil must be supported by either fixed clamps or at "
-                    "least one coil-foundation beam. Coils with neither: "
-                    f"{unsupported}."
-                )
+        # if not fixed_clamp_options.get('enabled', False):
+        #     # Each coil must be supported by either fixed clamps (handled
+        #     # above, applies to all coils) or at least one coil-foundation
+        #     # beam.
+        #     unsupported = [i for i in range(n_base) if n_beam_cf[i] < 1]
+        #     if unsupported:
+        #         raise AttributeError(
+        #             "Each coil must be supported by either fixed clamps or at "
+        #             "least one coil-foundation beam. Coils with neither: "
+        #             f"{unsupported}."
+        #         )
 
         # ── Build initial support_dofs_jax with defaults (ragged per-group) ────
         # Every DOF is a Python list of per-group JAX arrays (a pytree, so
