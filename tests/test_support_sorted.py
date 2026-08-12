@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.flatten_util import ravel_pytree
 
 from coil_fem.simsopt.coil_support import (
@@ -13,6 +14,7 @@ from coil_fem.simsopt.coil_support import (
     _encode_dphis,
     _vjp_dphis,
 )
+from coil_fem.simsopt.coil_support_beams import _uniform_list
 
 
 def _make_names(tree):
@@ -132,3 +134,53 @@ def test_make_bounds_dphis_unit_interval():
             assert lo == 0.0 and np.isposinf(hi), name
         elif key == 'x_foundation':
             assert np.isneginf(lo) and np.isposinf(hi), name
+
+
+def test_uniform_list_wrap_ends_ascending():
+    """Stellsym wrap-end defaults must be ascending for Sorted dphis >= 0."""
+    # Mimic n_beam_cc after stellsym halving: (4, 4, 4, 4, 2, 2).
+    counts = (4, 4, 4, 4, 2, 2)
+    starts = _uniform_list(counts, cc_stellsym=True, cc_end=False)
+    ends = _uniform_list(counts, cc_stellsym=True, cc_end=True)
+
+    np.testing.assert_allclose(starts[-2], [0.125, 0.375])
+    np.testing.assert_allclose(starts[-1], [0.125, 0.375])
+    np.testing.assert_allclose(ends[-2], [0.625, 0.875])
+    np.testing.assert_allclose(ends[-1], [0.625, 0.875])
+
+    for arr in starts + ends:
+        dphi = np.diff(np.asarray(arr), prepend=0.0)
+        assert np.all(dphi >= -1e-15), (arr, dphi)
+
+
+def test_sorted_stellsym_defaults_inside_box_bounds():
+    """CoilSupportBeamsSorted defaults must satisfy dphis box bounds."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import create_equally_spaced_curves
+    from coil_fem.simsopt import CoilSupportBeamsSorted
+
+    n_base, nfp = 2, 2
+    curves = create_equally_spaced_curves(
+        n_base, nfp, stellsym=True, R0=1.0, R1=0.5, order=2, numquadpoints=16,
+    )
+    cs = CoilSupportBeamsSorted(
+        base_coils=[Coil(c, Current(1e5)) for c in curves],
+        nfp=nfp,
+        stellsym=True,
+        beam_options={
+            'n_beam_cc': 4,
+            'n_beam_cf': 0,
+            'E': 200e9,
+            'nu': 0.3,
+            'cross_section_type': 'solid_circle',
+            'attachment_type': 'direct',
+        },
+        r_beam=0.05,
+    )
+    x = np.asarray(cs.local_x)
+    lb, ub = cs.local_bounds
+    assert np.all(x >= np.asarray(lb) - 1e-14)
+    assert np.all(x <= np.asarray(ub) + 1e-14)
+    for pe in cs.support_dofs['phis_end_cc'][-2:]:
+        np.testing.assert_allclose(np.asarray(pe), [0.625, 0.875])
