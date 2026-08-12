@@ -47,6 +47,7 @@ from .metrics import (
     l2_von_mises,
     mean_von_mises_volume_weighted,
     total_strain_energy,
+    sq_max_von_mises_lse,
 )
 
 # ============================================================================
@@ -57,6 +58,7 @@ from .metrics import (
 _METRIC_REGISTRY = {
     'max_von_mises':     max_von_mises_hard,
     'max_von_mises_lse': max_von_mises_lse,
+    'sq_max_von_mises_lse': sq_max_von_mises_lse,
     'mean_von_mises':    mean_von_mises_volume_weighted,
     'l2_von_mises':      l2_von_mises,
     'strain_energy':     total_strain_energy,
