@@ -17,8 +17,13 @@ on a flat array directly.
 
 The geometric parameters are read from ``support_dofs`` by key, so they can
 live alongside the attachment-angle DOFs and be treated as optimizable
-variables by simsopt. Each function must be accompanied by a ``func_name_dof_keys``
-to store the required keys in support_dofs.
+variables by simsopt. Each section type ``name`` is accompanied by:
+
+* ``name_dof_keys`` — keys required in ``support_dofs``;
+* ``name_option_keys`` — keys required in ``beam_options``;
+* ``name_attachment`` — soft attachment weight function;
+* ``name_solid`` — OCC body factory for :func:`~coil_fem.io.to_full_body`
+  (``solid_fn(occ, dofs, L) -> list[(dim, tag)]`` in the beam-local frame).
 
 Conventions (matching ``docs/theory/bisymbeam.rst``)
 -----------------------------------------------------
@@ -200,6 +205,28 @@ def solid_circle_attachment(surface_pts_beam_frame, dofs, sign_x, beam_options):
     )
 
 
+def solid_circle_solid(occ, dofs, L):
+    """Build a solid circular beam body in the local frame.
+
+    Parameters
+    ----------
+    occ : gmsh.model.occ
+        OpenCASCADE geometry kernel.
+    dofs : dict
+        Must contain ``'r_beam'`` (scalar for this beam).
+    L : float
+        Beam length along local ``+x``.
+
+    Returns
+    -------
+    list of (dim, tag)
+        OCC volume entities in the beam-local frame (origin at node 1,
+        axis along ``+x``).
+    """
+    r = float(dofs['r_beam'])
+    return [(3, occ.addCylinder(0.0, 0.0, 0.0, float(L), 0.0, 0.0, r))]
+
+
 # ============================================================================
 # Solid rectangle
 # ============================================================================
@@ -304,6 +331,29 @@ def solid_rectangle_attachment(surface_pts_beam_frame, dofs, sign_x, beam_option
     )
 
 
+def solid_rectangle_solid(occ, dofs, L):
+    """Build a solid rectangular beam body in the local frame.
+
+    Parameters
+    ----------
+    occ : gmsh.model.occ
+        OpenCASCADE geometry kernel.
+    dofs : dict
+        Must contain ``'w1_beam'`` (z-extent) and ``'w2_beam'`` (y-extent).
+    L : float
+        Beam length along local ``+x``.
+
+    Returns
+    -------
+    list of (dim, tag)
+        OCC volume entities in the beam-local frame (origin at node 1,
+        axis along ``+x``).
+    """
+    w1 = float(dofs['w1_beam'])
+    w2 = float(dofs['w2_beam'])
+    return [(3, occ.addBox(0.0, -0.5 * w2, -0.5 * w1, float(L), w2, w1))]
+
+
 # ============================================================================
 # Hollow circle (annular section)
 # ============================================================================
@@ -354,6 +404,43 @@ def hollow_circle(support_dofs: dict):
 
 
 hollow_circle_attachment = solid_circle_attachment
+
+
+def hollow_circle_solid(occ, dofs, L):
+    """Build a hollow circular beam body in the local frame.
+
+    Outer radius is ``max(r_1_beam, r_2_beam)`` and inner radius is
+    ``min(...)``, matching :func:`hollow_circle`.  When the inner radius is
+    non-positive the cut is skipped and a solid cylinder is returned.
+
+    Parameters
+    ----------
+    occ : gmsh.model.occ
+        OpenCASCADE geometry kernel.
+    dofs : dict
+        Must contain ``'r_1_beam'`` and ``'r_2_beam'``.
+    L : float
+        Beam length along local ``+x``.
+
+    Returns
+    -------
+    list of (dim, tag)
+        OCC volume entities in the beam-local frame (origin at node 1,
+        axis along ``+x``).
+    """
+    r1 = float(dofs['r_1_beam'])
+    r2 = float(dofs['r_2_beam'])
+    r_o = max(r1, r2)
+    r_i = min(r1, r2)
+    L = float(L)
+    outer = [(3, occ.addCylinder(0.0, 0.0, 0.0, L, 0.0, 0.0, r_o))]
+    if r_i <= 0.0:
+        return outer
+    # Overhang both ends so the cut opens the tube.
+    eps = max(1e-6 * L, 1e-12)
+    inner = [(3, occ.addCylinder(-eps, 0.0, 0.0, L + 2.0 * eps, 0.0, 0.0, r_i))]
+    out, _ = occ.cut(outer, inner)
+    return out
 
 
 # ============================================================================
@@ -429,3 +516,43 @@ def hollow_rectangle(support_dofs: dict):
 
 
 hollow_rectangle_attachment = solid_rectangle_attachment
+
+
+def hollow_rectangle_solid(occ, dofs, L):
+    """Build a hollow rectangular beam body in the local frame.
+
+    Wall thickness is clipped to ``min(w1, w2)/2`` as in
+    :func:`hollow_rectangle`.  When the clipped thickness fills the section
+    the cut is skipped and a solid prism is returned.
+
+    Parameters
+    ----------
+    occ : gmsh.model.occ
+        OpenCASCADE geometry kernel.
+    dofs : dict
+        Must contain ``'w1_beam'``, ``'w2_beam'``, and ``'t_beam'``.
+    L : float
+        Beam length along local ``+x``.
+
+    Returns
+    -------
+    list of (dim, tag)
+        OCC volume entities in the beam-local frame (origin at node 1,
+        axis along ``+x``).
+    """
+    w1 = float(dofs['w1_beam'])
+    w2 = float(dofs['w2_beam'])
+    t = min(float(dofs['t_beam']), min(w1, w2) / 2.0)
+    L = float(L)
+    outer = [(3, occ.addBox(0.0, -0.5 * w2, -0.5 * w1, L, w2, w1))]
+    b_i = w1 - 2.0 * t
+    h_i = w2 - 2.0 * t
+    if b_i <= 0.0 or h_i <= 0.0:
+        return outer
+    # Overhang both ends so the cut opens the tube.
+    eps = max(1e-6 * L, 1e-12)
+    inner = [(3, occ.addBox(
+        -eps, -0.5 * h_i, -0.5 * b_i, L + 2.0 * eps, h_i, b_i,
+    ))]
+    out, _ = occ.cut(outer, inner)
+    return out
