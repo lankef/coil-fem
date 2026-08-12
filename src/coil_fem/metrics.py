@@ -226,6 +226,43 @@ def max_von_mises_lse(
     ).ravel()
     return (1.0 / beta) * jax.scipy.special.logsumexp(beta * vm)
 
+def sq_max_von_mises_lse(
+    problem,
+    sol_list,
+    lam: float,
+    mu: float,
+    *,
+    beta: float = 20.0,
+    shape_grads=None,
+    JxW=None,
+    epsilon_th=None,
+) -> jnp.ndarray:
+    r"""Smooth maximum von Mises stress via log-sum-exp.
+
+    Computes :math:`\frac{1}{\beta}\log\sum_q e^{\beta \sigma_{vm,q}}` over
+    all quadrature points.  Differentiable everywhere; approaches the hard
+    maximum as ``beta`` → ∞.
+
+    Parameters
+    ----------
+    problem : LinearElasticity3D
+    sol_list : list[jnp.ndarray]
+    lam, mu : float
+    beta : float
+        Smoothing parameter (default 20.0).
+    shape_grads : jnp.ndarray or None
+    JxW : jnp.ndarray or None
+    epsilon_th : jnp.ndarray or None
+
+    Returns
+    -------
+    jnp.ndarray
+        Scalar smooth-maximum von Mises stress [Pa].
+    """
+    vm = von_mises_on_quadrature(
+        problem, sol_list, lam, mu, shape_grads=shape_grads, epsilon_th=epsilon_th,
+    ).ravel()
+    return ((1.0 / beta) * jax.scipy.special.logsumexp(beta * vm))**2
 
 def l2_von_mises(
     problem,
