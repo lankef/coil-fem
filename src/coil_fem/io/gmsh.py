@@ -1,6 +1,8 @@
 """OCC full-body meshing for a CoilFEMObjective → ``full_body_fields.vtu``.
 
-Assumes circular beam cross-sections and rectangular coil cross-sections.
+Beam cross-sections are resolved from ``presets.cross_section_fns`` via
+``cross_section_type``; coil cross-sections must be rectangular
+(:class:`~coil_fem.meshing.CoilMeshRectangle`).
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import pyvista as pv
 from scipy.spatial import cKDTree
 
 from coil_fem.meshing import CoilMeshRectangle
+from coil_fem.presets import cross_section_fns
 
 
 _N_SLICES = 96
@@ -63,6 +66,34 @@ def _coil_solid(occ, mesh, n_slices: int = _N_SLICES):
     )
     occ.remove([(1, w) for w in wires], recursive=True)
     return out
+
+
+def _beam_solids(occ, support, sdofs, geom, solid_fn):
+    """Build and place every beam OCC body; return ``(dim, tag)`` list.
+
+    Cross-section DOFs are flattened per-group → per-beam in the same order
+    as ``geom['x_start']`` / ``geom['gamma3']``.  Each body is created in the
+    beam-local frame by ``solid_fn`` then mapped to global coordinates with
+    ``affineTransform([gamma3 | x_start])``.
+    """
+    x_start = np.asarray(geom['x_start'], dtype=np.float64)
+    L = np.asarray(geom['L'], dtype=np.float64)
+    gamma3 = np.asarray(geom['gamma3'], dtype=np.float64)
+    flat = {
+        k: np.concatenate([
+            np.atleast_1d(np.asarray(a, dtype=np.float64))
+            for a in sdofs[k]
+        ])
+        for k in support._cross_section_dof_keys
+    }
+    solids = []
+    for b in range(x_start.shape[0]):
+        dofs = {k: float(flat[k][b]) for k in support._cross_section_dof_keys}
+        dimtags = solid_fn(occ, dofs, float(L[b]))
+        affine = list(np.hstack([gamma3[b], x_start[b, :, None]]).ravel())
+        occ.affineTransform(dimtags, affine)
+        solids.extend(dimtags)
+    return solids
 
 
 def _classify_nodes(X, meshes, Q_list, w1: float, w2: float):
@@ -204,7 +235,10 @@ def to_full_body(
     Parameters
     ----------
     Jstress : CoilFEMObjective
-        Must wrap circular-beam ``CoilSupportBeams`` and rectangular coil meshes.
+        Must wrap ``CoilSupportBeams`` whose ``cross_section_type`` has a
+        matching ``*_solid`` factory in
+        :mod:`coil_fem.presets.cross_section_fns`, and rectangular coil
+        meshes (:class:`~coil_fem.meshing.CoilMeshRectangle`).
     mesh_scale : float
         Multiplier on gmsh ``MeshSizeMax`` / ``MeshSizeMin``.
     path : path-like
@@ -229,11 +263,15 @@ def to_full_body(
     cs_type = getattr(coil_support, "beam_options", {}).get(
         "cross_section_type", "solid_circle",
     )
-    if cs_type != "solid_circle":
+    try:
+        solid_fn = getattr(cross_section_fns, cs_type + "_solid")
+    except AttributeError as exc:
         raise ValueError(
-            f"to_full_body requires circular beams "
-            f"(cross_section_type='solid_circle'); got {cs_type!r}."
-        )
+            f"to_full_body: no OCC solid factory for "
+            f"cross_section_type={cs_type!r} "
+            f"(expected {cs_type}_solid in "
+            f"coil_fem.presets.cross_section_fns)."
+        ) from exc
     if not all(isinstance(m, CoilMeshRectangle) for m in meshes):
         raise ValueError(
             "to_full_body requires rectangular coil meshes (CoilMeshRectangle)."
@@ -256,11 +294,16 @@ def to_full_body(
     k_clamp = float(support.k_clamp)
 
     geom = support.beam_geometry(curves, sdofs)
-    x_start = np.asarray(geom["x_start"])
-    x_end = np.asarray(geom["x_end"])
-    A_all, *_ = support.cross_section_fn(sdofs)
-    A = np.concatenate([np.atleast_1d(np.asarray(a)) for a in A_all])
-    radii = np.sqrt(A / np.pi)
+    # MeshSizeMin tracks the smallest cross-section DOF (r_beam, t_beam, …).
+    # For hollow sections this is typically the wall thickness, so the mesh
+    # can become substantially finer than the outer footprint alone would
+    # suggest.
+    cs_vals = np.concatenate([
+        np.atleast_1d(np.asarray(a, dtype=np.float64))
+        for k in support._cross_section_dof_keys
+        for a in sdofs[k]
+    ])
+    size_min = float(cs_vals.min())
 
     # gmsh is a process-global singleton: initialize at most once; clear if
     # a caller already owns a session so this call still starts clean.
@@ -277,13 +320,7 @@ def to_full_body(
         gmsh.model.add("device")
         occ = gmsh.model.occ
 
-        solids = []
-        for xs, xe, r in zip(x_start, x_end, radii):
-            d = xe - xs
-            tag = occ.addCylinder(
-                xs[0], xs[1], xs[2], d[0], d[1], d[2], float(r),
-            )
-            solids.append((3, tag))
+        solids = _beam_solids(occ, support, sdofs, geom, solid_fn)
 
         coil_solids = [_coil_solid(occ, m) for m in meshes]
         sector = solids + [dt for cs in coil_solids for dt in cs]
@@ -315,9 +352,8 @@ def to_full_body(
         vols = gmsh.model.getEntities(3)
         gmsh.model.addPhysicalGroup(3, [t for _, t in vols], name="device")
 
-        r_min = float(radii.min())
         gmsh.option.setNumber("Mesh.MeshSizeMax", mesh_scale * 0.5 * w1)
-        gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_scale * 0.15 * r_min)
+        gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_scale * 0.15 * size_min)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)
         gmsh.option.setNumber("Mesh.ElementOrder", 2)
         gmsh.model.mesh.generate(3)

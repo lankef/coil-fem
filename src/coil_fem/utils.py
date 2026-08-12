@@ -50,7 +50,7 @@ def estimate_k(L, E, eps):
     This estimate of is based on the following formula:
     
     .. math::
-        \frac{FL^3}{3EI} \approx \epsilon^-1 \left(\frac{12FL^2}{kw^4}\right)
+        \frac{FL^3}{3EI} \approx \epsilon^{-1} \left(\frac{12FL^2}{kw^4}\right)
 
     Here, the LHS is the displacement of a cantilever of length L due to end force F.
     The RHS is the displacement of a rigid beam attached to a square area with area
