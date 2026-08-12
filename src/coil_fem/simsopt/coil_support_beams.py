@@ -59,8 +59,10 @@ def _uniform_list(counts, cc_stellsym=False, cc_end=False):
     does not supply explicit values.
 
     When ``cc_stellsym=True``, the last two entries (the stellsym wrap group
-    and its reflection) use a restricted range ``[0, 0.5)`` to avoid beam
-    overlap after the stellarator reflection.
+    and its reflection) use a restricted half-period range to avoid beam
+    overlap after the stellarator reflection: starts in ``[0, 0.5)``, ends in
+    ``(0.5, 1]``.  Both are ascending so
+    :class:`CoilSupportBeamsSorted` encodes non-negative ``dphis_*``.
     """
     out = []
     for i in range(len(counts)):
@@ -71,12 +73,14 @@ def _uniform_list(counts, cc_stellsym=False, cc_end=False):
         if not cc_stellsym or i < len(counts) - 2:
             a, b = 0.0, 1.0
             half_interval = 0.5 / c
+        elif cc_end:
+            # Upper half, ascending (was ``flip(1 - linspace([0, 0.5)))``).
+            a, b = 0.5, 1.0
+            half_interval = 0.5 / c / 2
         else:
             a, b = 0.0, 0.5
             half_interval = 0.5 / c / 2
         phi_init = jnp.linspace(a, b, c, endpoint=False) + half_interval
-        if cc_end and i >= len(counts) - 2:
-            phi_init = 1 - phi_init
         out.append(phi_init)
     return out
 
