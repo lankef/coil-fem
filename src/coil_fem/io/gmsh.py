@@ -276,8 +276,6 @@ def to_full_body(
         raise ValueError(
             "to_full_body requires rectangular coil meshes (CoilMeshRectangle)."
         )
-    # if coil_support._r_clamp is None or coil_support._sig_eps is None:
-    #     raise ValueError("to_full_body requires fixed clamps on coil_support.")
 
     mesh_opts = fem.mesh_opts[0]
     w1 = float(mesh_opts["w1"])
@@ -289,8 +287,13 @@ def to_full_body(
         (fem.gravity_options or {}).get("g_vec", (0.0, 0.0, 0.0)),
         dtype=np.float64,
     )
-    r_clamp = float(coil_support._r_clamp)
-    eps_sigmoid = float(coil_support._sig_eps)
+    # Fixed-sphere clamps are optional on CoilSupportBeams; when disabled,
+    # _r_clamp / _sig_eps are None and support_dofs has no 'phis'.
+    has_clamps = (
+        coil_support._r_clamp is not None and coil_support._sig_eps is not None
+    )
+    r_clamp = float(coil_support._r_clamp) if has_clamps else 0.0
+    eps_sigmoid = float(coil_support._sig_eps) if has_clamps else 0.0
     k_clamp = float(support.k_clamp)
 
     geom = support.beam_geometry(curves, sdofs)
@@ -400,14 +403,17 @@ def to_full_body(
 
         n_base = len(meshes)
         n_sym = Q_list.shape[0]
-        phis_clamp = sdofs["phis"]
-        clamp_centers = []
-        for i in range(n_base):
-            phi_i = np.asarray(phis_clamp[i], dtype=np.float64).ravel()
-            c_base = np.asarray(curves[i].gamma_eval(phi_i), dtype=np.float64)
-            for s in range(n_sym):
-                clamp_centers.append(c_base @ Q_list[s].T)
-        clamp_centers = np.vstack(clamp_centers)
+        if has_clamps and "phis" in sdofs:
+            phis_clamp = sdofs["phis"]
+            clamp_centers = []
+            for i in range(n_base):
+                phi_i = np.asarray(phis_clamp[i], dtype=np.float64).ravel()
+                c_base = np.asarray(curves[i].gamma_eval(phi_i), dtype=np.float64)
+                for s in range(n_sym):
+                    clamp_centers.append(c_base @ Q_list[s].T)
+            clamp_centers = np.vstack(clamp_centers)
+        else:
+            clamp_centers = np.zeros((0, 3), dtype=np.float64)
 
         _write_vtu(
             path,
