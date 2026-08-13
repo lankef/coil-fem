@@ -276,8 +276,8 @@ def to_full_body(
         raise ValueError(
             "to_full_body requires rectangular coil meshes (CoilMeshRectangle)."
         )
-    if coil_support._r_clamp is None or coil_support._sig_eps is None:
-        raise ValueError("to_full_body requires fixed clamps on coil_support.")
+    # if coil_support._r_clamp is None or coil_support._sig_eps is None:
+    #     raise ValueError("to_full_body requires fixed clamps on coil_support.")
 
     mesh_opts = fem.mesh_opts[0]
     w1 = float(mesh_opts["w1"])
