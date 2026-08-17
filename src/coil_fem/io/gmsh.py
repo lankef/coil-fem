@@ -229,6 +229,7 @@ def to_full_body(
     mesh_scale: float = 0.5,
     path: str | Path = "full_body_fields.vtu",
     output_msh: bool = False,
+    boolean_tol: float | None = None,
 ) -> Path:
     """Build a fused full-device TET10 mesh and write ``full_body_fields.vtu``.
 
@@ -246,6 +247,12 @@ def to_full_body(
     output_msh : bool
         If True, also write ``full_mesh.msh`` next to ``path`` (for
         ``beam_dolfinx.py`` / ``gmshio.read_from_msh``).
+    boolean_tol : float or None
+        Fuzzy value for the OCC boolean unions (gmsh
+        ``Geometry.ToleranceBoolean``), in metres.  Entities closer than
+        this are treated as coincident, which stops the fuse from emitting
+        sub-mesh-size sliver faces that the volume mesher rejects.  ``None``
+        (default) uses ``1e-2`` times the smallest cross-section DOF.
 
     Returns
     -------
@@ -323,6 +330,10 @@ def to_full_body(
         gmsh.model.add("device")
         occ = gmsh.model.occ
 
+        tol_bool = 1e-2 * size_min if boolean_tol is None else boolean_tol
+        gmsh.option.setNumber("Geometry.ToleranceBoolean", tol_bool)
+        print(f"to_full_body: Geometry.ToleranceBoolean = {tol_bool:.3g}")
+
         solids = _beam_solids(occ, support, sdofs, geom, solid_fn)
 
         coil_solids = [_coil_solid(occ, m) for m in meshes]
@@ -355,8 +366,10 @@ def to_full_body(
         vols = gmsh.model.getEntities(3)
         gmsh.model.addPhysicalGroup(3, [t for _, t in vols], name="device")
 
-        gmsh.option.setNumber("Mesh.MeshSizeMax", mesh_scale * 0.5 * w1)
-        gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_scale * 0.15 * size_min)
+        size_max = mesh_scale * 0.5 * w1
+        size_min_mesh = mesh_scale * 0.15 * size_min
+        gmsh.option.setNumber("Mesh.MeshSizeMax", size_max)
+        gmsh.option.setNumber("Mesh.MeshSizeMin", size_min_mesh)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)
         gmsh.option.setNumber("Mesh.ElementOrder", 2)
         gmsh.model.mesh.generate(3)
