@@ -25,9 +25,13 @@ from .coil_support import (
     _SortedDphisMixin,
     _broadcast_phis,
     _cumsum_last,
+    _cumsum_last_vjp,
+    _decode_dphis,
+    _diff_last,
     _encode_dphis,
     _generate_k_clamp,
     _tree_cumsum_last,
+    _vjp_dphis,
 )
 from .coil_support_fixed import CoilSupportFixed
 
@@ -58,11 +62,11 @@ def _uniform_list(counts, cc_stellsym=False, cc_end=False):
     ``phis_start_cc``, ``phis_end_cc``, and ``phis_start_cf`` when the caller
     does not supply explicit values.
 
-    When ``cc_stellsym=True``, the last two entries (the stellsym wrap group
-    and its reflection) use a restricted half-period range to avoid beam
-    overlap after the stellarator reflection: starts in ``[0, 0.5)``, ends in
-    ``(0.5, 1]``.  Both are ascending so
-    :class:`CoilSupportBeamsSorted` encodes non-negative ``dphis_*``.
+    When ``cc_stellsym=True``, the last two entries (the stellsym wrap groups)
+    use a restricted half-period range to avoid beam overlap after the
+    stellarator reflection: starts in ``[0, 0.5)``, ends as the elementwise
+    complement ``1 - starts`` (descending in ``(0.5, 1]``) so beam ``j``
+    pairs as ``phi_end[j] = 1 - phi_start[j]``.
     """
     out = []
     for i in range(len(counts)):
@@ -70,18 +74,71 @@ def _uniform_list(counts, cc_stellsym=False, cc_end=False):
         if c == 0:
             out.append(jnp.array([]))
             continue
-        if not cc_stellsym or i < len(counts) - 2:
-            a, b = 0.0, 1.0
-            half_interval = 0.5 / c
-        elif cc_end:
-            # Upper half, ascending (was ``flip(1 - linspace([0, 0.5)))``).
-            a, b = 0.5, 1.0
-            half_interval = 0.5 / c / 2
+        wrap = cc_stellsym and i >= len(counts) - 2
+        if wrap:
+            # Same linspace for starts and ends so pairing is exact.
+            phi = jnp.linspace(0.0, 0.5, c, endpoint=False) + 0.25 / c
+            if cc_end:
+                phi = 1.0 - phi  # descending; pairs index-wise with starts
         else:
-            a, b = 0.0, 0.5
-            half_interval = 0.5 / c / 2
-        phi_init = jnp.linspace(a, b, c, endpoint=False) + half_interval
-        out.append(phi_init)
+            phi = jnp.linspace(0.0, 1.0, c, endpoint=False) + 0.5 / c
+        out.append(phi)
+    return out
+
+
+# ============================================================================
+# Stellsym wrap-end dphis codec (backward walk from phi = 1)
+# ============================================================================
+
+def _wrap_end_groups(n_groups, stellsym):
+    """Indices of CC groups whose ends walk backward under stellsym.
+
+    Returns the empty set when ``stellsym`` is false or there are fewer than
+    two groups.  Otherwise returns ``{n_groups - 2, n_groups - 1}`` — the
+    ``flip_half`` and ``flip`` wrap groups.
+    """
+    if not stellsym or n_groups < 2:
+        return frozenset()
+    return frozenset({n_groups - 2, n_groups - 1})
+
+
+def _decode_end_cc(d_list, stellsym):
+    """Decode ``dphis_end_cc`` → ``phis_end_cc`` (wrap groups: ``1 - cumsum``)."""
+    wrap = _wrap_end_groups(len(d_list), stellsym)
+    out = []
+    for g, d in enumerate(d_list):
+        d = jnp.asarray(d, dtype=float)
+        if g in wrap:
+            out.append(1.0 - _cumsum_last(d))
+        else:
+            out.append(_cumsum_last(d))
+    return out
+
+
+def _encode_end_cc(phi_list, stellsym):
+    """Encode ``phis_end_cc`` → ``dphis_end_cc`` (wrap: ``diff(1 - phi)``)."""
+    wrap = _wrap_end_groups(len(phi_list), stellsym)
+    out = []
+    for g, phi in enumerate(phi_list):
+        phi = jnp.asarray(phi, dtype=float)
+        if g in wrap:
+            # diff_last(1 - phi), not -diff_last(phi): they differ at j=0.
+            out.append(_diff_last(1.0 - phi))
+        else:
+            out.append(_diff_last(phi))
+    return out
+
+
+def _vjp_end_cc(g_list, stellsym):
+    """VJP of :func:`_decode_end_cc` (wrap groups: negated reverse-cumsum)."""
+    wrap = _wrap_end_groups(len(g_list), stellsym)
+    out = []
+    for g, g_phi in enumerate(g_list):
+        g_phi = jnp.asarray(g_phi, dtype=float)
+        if g in wrap:
+            out.append(-_cumsum_last_vjp(g_phi))
+        else:
+            out.append(_cumsum_last_vjp(g_phi))
     return out
 
 
@@ -552,8 +609,12 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
 
     Simsopt stores ``dphis_start_cc``, ``dphis_end_cc``, ``dphis_start_cf``
     (and optional clamp ``dphis``) with absolute angles recovered by
-    ``cumsum`` along the last axis.  :attr:`support_dofs` exposes ``phis*``
-    for the FEM; :meth:`flatten_grad` applies the cumsum VJP.
+    ``cumsum`` along the last axis — except for the two stellsym wrap
+    groups, where ``phis_end_cc`` is recovered as ``1 - cumsum(dphis_end_cc)``
+    (a positive step *backward* from ``phi = 1``).  That keeps every
+    ``dphis_*`` non-negative while preserving the geometric pairing
+    ``phi_end[j] = 1 - phi_start[j]``.  :attr:`support_dofs` exposes
+    ``phis*`` for the FEM; :meth:`flatten_grad` applies the matching VJP.
 
     Parameters
     ----------
@@ -566,6 +627,7 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
     dphis_start_cc, dphis_end_cc, dphis_start_cf : sequence of array-like or None
         Initial increments for CC/CF attachment angles (same ragged shapes as
         the corresponding ``phis_*`` arguments of :class:`CoilSupportBeams`).
+        For stellsym wrap groups, ``dphis_end_cc`` steps backward from 1.
     dphis : array-like or None
         Initial increments for optional fixed-sphere clamps.
     """
@@ -589,6 +651,9 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
         dofs=None,
         **kwargs,
     ):
+        # Must precede super().__init__: _encode_angle_dofs runs during
+        # CoilSupportBeams.__init__ and needs this flag.
+        self._sorted_stellsym = bool(stellsym)
         self._dphis_start_cc = dphis_start_cc
         self._dphis_end_cc = dphis_end_cc
         self._dphis_start_cf = dphis_start_cf
@@ -605,7 +670,7 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
                 if dphis_start_cc is not None else None
             ),
             phis_end_cc=(
-                _tree_cumsum_last(dphis_end_cc)
+                _decode_end_cc(list(dphis_end_cc), stellsym)
                 if dphis_end_cc is not None else None
             ),
             phis_start_cf=(
@@ -626,7 +691,29 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
             **kwargs,
         )
 
+    @property
+    def support_dofs(self) -> dict:
+        raw = self._unravel(jnp.asarray(self.local_full_x))
+        out = _decode_dphis(raw)
+        if 'dphis_end_cc' in raw:
+            out['phis_end_cc'] = _decode_end_cc(
+                raw['dphis_end_cc'], self._sorted_stellsym,
+            )
+        return out
+
+    def flatten_grad(self, grad_dofs: dict) -> np.ndarray:
+        g = _vjp_dphis(grad_dofs)
+        if 'phis_end_cc' in grad_dofs:
+            g['dphis_end_cc'] = _vjp_end_cc(
+                grad_dofs['phis_end_cc'], self._sorted_stellsym,
+            )
+        return np.asarray(ravel_pytree(g)[0], dtype=float)
+
     def _encode_angle_dofs(self, support_dofs_jax, fixed_dof_names):
         encoded = _encode_dphis(support_dofs_jax)
+        if 'phis_end_cc' in support_dofs_jax:
+            encoded['dphis_end_cc'] = _encode_end_cc(
+                support_dofs_jax['phis_end_cc'], self._sorted_stellsym,
+            )
         renamed = [_PHI_TO_DPHI.get(k, k) for k in fixed_dof_names]
         return encoded, renamed
