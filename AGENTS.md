@@ -255,7 +255,7 @@ Key constructor arguments (all static; set once at construction):
 
 Optimisable quantities live in `support_dofs` (passed at solve time, never stored):
 
-- `phis_start_cc`, `phis_end_cc` — attachment angles for CC beams: per-group lists, entry `g` of shape `(n_beam_cc[g],)` (`n_base + 1` entries when `stellsym=True`, else `n_base`).
+- `phis_start_cc`, `phis_end_cc` — attachment angles for CC beams: per-group lists, entry `g` of shape `(n_beam_cc[g],)` (`n_base + 1` entries when `stellsym=True`, else `n_base`).  When `stellsym=True`, `phis_end_cc` is descending on the two wrap groups (`flip_half` / `flip`) so that `phi_end[j] = 1 - phi_start[j]`; :class:`~coil_fem.simsopt.CoilSupportBeamsSorted` stores those ends as nonnegative `dphis_end_cc` that walk backward from `phi = 1`.
 - **Note:** `params['support_k']` is the per-surface-quad stiffness [N/m³] (`(n_surface_quads,)`), obtained via `pipeline.surface_quad_points(pts)` → `support.compute_weights` → `support.stiffness`.
 - `phis_start_cf` — attachment angles for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i],)`.
 - `x_foundation` — foundation anchor positions for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i], 3)`.

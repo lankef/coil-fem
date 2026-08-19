@@ -14,11 +14,27 @@ from coil_fem.simsopt.coil_support import (
     _encode_dphis,
     _vjp_dphis,
 )
-from coil_fem.simsopt.coil_support_beams import _uniform_list
+from coil_fem.simsopt.coil_support_beams import (
+    _decode_end_cc,
+    _encode_end_cc,
+    _uniform_list,
+    _vjp_end_cc,
+)
 
 
 def _make_names(tree):
     return CoilSupport._make_names(None, tree)
+
+
+def _beam_options(n_beam_cc=4, n_beam_cf=0):
+    return {
+        'n_beam_cc': n_beam_cc,
+        'n_beam_cf': n_beam_cf,
+        'E': 200e9,
+        'nu': 0.3,
+        'cross_section_type': 'solid_circle',
+        'attachment_type': 'direct',
+    }
 
 
 def test_encode_decode_roundtrip_dense():
@@ -136,8 +152,8 @@ def test_make_bounds_dphis_unit_interval():
             assert np.isneginf(lo) and np.isposinf(hi), name
 
 
-def test_uniform_list_wrap_ends_ascending():
-    """Stellsym wrap-end defaults must be ascending for Sorted dphis >= 0."""
+def test_uniform_list_wrap_ends_pair_complement():
+    """Stellsym wrap ends are 1 - starts (descending); encoded dphis >= 0."""
     # Mimic n_beam_cc after stellsym halving: (4, 4, 4, 4, 2, 2).
     counts = (4, 4, 4, 4, 2, 2)
     starts = _uniform_list(counts, cc_stellsym=True, cc_end=False)
@@ -145,12 +161,86 @@ def test_uniform_list_wrap_ends_ascending():
 
     np.testing.assert_allclose(starts[-2], [0.125, 0.375])
     np.testing.assert_allclose(starts[-1], [0.125, 0.375])
-    np.testing.assert_allclose(ends[-2], [0.625, 0.875])
-    np.testing.assert_allclose(ends[-1], [0.625, 0.875])
+    np.testing.assert_allclose(ends[-2], [0.875, 0.625])
+    np.testing.assert_allclose(ends[-1], [0.875, 0.625])
 
-    for arr in starts + ends:
+    for g in (-2, -1):
+        np.testing.assert_allclose(
+            np.asarray(ends[g]), 1.0 - np.asarray(starts[g]), atol=1e-12,
+        )
+
+    # Interior groups stay ascending; wrap starts ascending; wrap ends
+    # descending in absolute phi — but Sorted encode must stay >= 0.
+    for arr in starts[:-2] + ends[:-2] + starts[-2:]:
         dphi = np.diff(np.asarray(arr), prepend=0.0)
         assert np.all(dphi >= -1e-15), (arr, dphi)
+
+    encoded_ends = _encode_end_cc(ends, stellsym=True)
+    for d in encoded_ends:
+        assert np.all(np.asarray(d) >= -1e-15), d
+
+
+def test_encode_decode_end_cc_roundtrip():
+    """Wrap-aware end codec roundtrips for stellsym True/False."""
+    # n_groups=3, stellsym: wrap = {1, 2}; n_base=1 stellsym: wrap = {0, 1}.
+    cases = [
+        (
+            True,
+            [
+                jnp.array([0.1, 0.15, 0.2]),
+                jnp.array([0.05, 0.1]),
+                jnp.zeros(0),
+            ],
+        ),
+        (
+            False,
+            [
+                jnp.array([0.1, 0.2]),
+                jnp.array([0.3]),
+            ],
+        ),
+        (
+            True,
+            [
+                jnp.array([0.08, 0.12]),
+                jnp.array([0.2]),
+            ],
+        ),
+    ]
+    for stellsym, d_list in cases:
+        phi = _decode_end_cc(d_list, stellsym)
+        back = _encode_end_cc(phi, stellsym)
+        for a, b in zip(back, d_list):
+            np.testing.assert_allclose(a, b, atol=1e-12)
+
+
+def test_vjp_end_cc_matches_decode():
+    """Analytic VJP of wrap-end decode matches reverse-mode AD."""
+    d_list = [
+        jnp.array([0.1, 0.2]),
+        jnp.array([0.05, 0.1, 0.15]),
+        jnp.array([0.2, 0.1]),
+    ]
+    stellsym = True
+
+    def J(d_flat):
+        # Reconstruct ragged list from flat concat of known lengths.
+        sizes = [2, 3, 2]
+        parts, i = [], 0
+        for n in sizes:
+            parts.append(d_flat[i:i + n])
+            i += n
+        phi = _decode_end_cc(parts, stellsym)
+        return sum(jnp.sum(p ** 2) for p in phi)
+
+    d_flat = jnp.concatenate(d_list)
+    g_ad = jax.grad(J)(d_flat)
+
+    phi = _decode_end_cc(d_list, stellsym)
+    g_phi = [2.0 * p for p in phi]
+    g_d = _vjp_end_cc(g_phi, stellsym)
+    g_manual = jnp.concatenate(g_d)
+    np.testing.assert_allclose(g_manual, g_ad, atol=1e-12)
 
 
 def test_sorted_stellsym_defaults_inside_box_bounds():
@@ -168,19 +258,108 @@ def test_sorted_stellsym_defaults_inside_box_bounds():
         base_coils=[Coil(c, Current(1e5)) for c in curves],
         nfp=nfp,
         stellsym=True,
-        beam_options={
-            'n_beam_cc': 4,
-            'n_beam_cf': 0,
-            'E': 200e9,
-            'nu': 0.3,
-            'cross_section_type': 'solid_circle',
-            'attachment_type': 'direct',
-        },
+        beam_options=_beam_options(n_beam_cc=4),
         r_beam=0.05,
     )
     x = np.asarray(cs.local_x)
     lb, ub = cs.local_bounds
     assert np.all(x >= np.asarray(lb) - 1e-14)
     assert np.all(x <= np.asarray(ub) + 1e-14)
+    # After halving, wrap groups have c=2 → ends = 1 - [0.125, 0.375].
     for pe in cs.support_dofs['phis_end_cc'][-2:]:
-        np.testing.assert_allclose(np.asarray(pe), [0.625, 0.875])
+        np.testing.assert_allclose(np.asarray(pe), [0.875, 0.625])
+
+
+def test_sorted_stellsym_wrap_pairing():
+    """Default Sorted wrap groups pair phi_end[j] = 1 - phi_start[j]."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import create_equally_spaced_curves
+    from coil_fem.simsopt import CoilSupportBeamsSorted
+
+    n_base, nfp = 2, 2
+    curves = create_equally_spaced_curves(
+        n_base, nfp, stellsym=True, R0=1.0, R1=0.5, order=2, numquadpoints=16,
+    )
+    cs = CoilSupportBeamsSorted(
+        base_coils=[Coil(c, Current(1e5)) for c in curves],
+        nfp=nfp,
+        stellsym=True,
+        beam_options=_beam_options(n_beam_cc=6),
+        r_beam=0.05,
+    )
+    sd = cs.support_dofs
+    n_groups = len(sd['phis_start_cc'])
+    assert n_groups == n_base + 1
+
+    for g in range(n_groups - 2):
+        ps = np.asarray(sd['phis_start_cc'][g])
+        pe = np.asarray(sd['phis_end_cc'][g])
+        assert np.all(np.diff(ps, prepend=0.0) >= -1e-15)
+        assert np.all(np.diff(pe, prepend=0.0) >= -1e-15)
+
+    for g in (n_groups - 2, n_groups - 1):
+        ps = np.asarray(sd['phis_start_cc'][g])
+        pe = np.asarray(sd['phis_end_cc'][g])
+        np.testing.assert_allclose(pe, 1.0 - ps, atol=1e-12)
+        assert pe[0] > pe[-1]  # descending absolute ends
+
+
+def test_sorted_wrap_end_flatten_grad_fd():
+    """flatten_grad VJP matches FD on a wrap dphis_end_cc DOF."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import create_equally_spaced_curves
+    from coil_fem.simsopt import CoilSupportBeamsSorted
+
+    n_base, nfp = 2, 2
+    curves = create_equally_spaced_curves(
+        n_base, nfp, stellsym=True, R0=1.0, R1=0.5, order=2, numquadpoints=16,
+    )
+    cs = CoilSupportBeamsSorted(
+        base_coils=[Coil(c, Current(1e5)) for c in curves],
+        nfp=nfp,
+        stellsym=True,
+        beam_options=_beam_options(n_beam_cc=4),
+        r_beam=0.05,
+    )
+
+    # Full DOF vector includes fixed entries; use local_full_x.
+    flat0 = np.asarray(cs.local_full_x, dtype=float).copy()
+    names = list(cs.local_full_dof_names)
+    # Pick first wrap-group end increment: group n_base-1 = 1, beam 0.
+    target = 'dphis_end_cc(1,0)'
+    matches = [i for i, n in enumerate(names) if n.endswith(':' + target) or n == target]
+    # simsopt may prefix with Optimizable name; match by suffix.
+    if not matches:
+        matches = [i for i, n in enumerate(names) if target in n]
+    assert matches, names
+    idx = matches[0]
+
+    def J_from_full(x_full):
+        cs.local_full_x = np.asarray(x_full, dtype=float)
+        pe = cs.support_dofs['phis_end_cc']
+        return float(sum(jnp.sum(p ** 2) for p in pe))
+
+    j0 = J_from_full(flat0)
+    eps = 1e-6
+    e = np.zeros_like(flat0)
+    e[idx] = eps
+    j1 = J_from_full(flat0 + e)
+    fd = (j1 - j0) / eps
+
+    # Restore and evaluate analytic flatten_grad.
+    cs.local_full_x = flat0
+    pe = cs.support_dofs['phis_end_cc']
+    g_phi = {
+        'phis_end_cc': [2.0 * p for p in pe],
+        # Other keys present in support_dofs with zero grad so ravel aligns
+        # only if flatten_grad expects the full phi tree — it takes whatever
+        # keys _vjp_dphis / ravel see.  Pass the full support_dofs structure
+        # with zeros elsewhere.
+    }
+    sd = cs.support_dofs
+    g_full = {k: jax.tree_util.tree_map(jnp.zeros_like, v) for k, v in sd.items()}
+    g_full['phis_end_cc'] = [2.0 * p for p in pe]
+    g_flat = cs.flatten_grad(g_full)
+    assert abs(fd - g_flat[idx]) < 1e-4, (fd, g_flat[idx], names[idx])
