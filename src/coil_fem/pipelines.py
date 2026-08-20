@@ -19,20 +19,20 @@ from .problems import LinearElasticity3D, lame_parameters
 from .solvers import build_fwd_pred, needs_gpu_assembly
 
 if TYPE_CHECKING:
-    from .meshing import CoilMesh
+    from .meshing import FramedCurveMesh
 
 
 class ElasticPipeline:
     """All per-coil state for a purely elastic differentiable FEM solve.
 
-    Owns the :class:`~coil_fem.meshing.CoilMesh`, the
+    Owns the :class:`~coil_fem.meshing.FramedCurveMesh`, the
     :class:`~coil_fem.problems.LinearElasticity3D` problem instance, and the
     differentiable forward-prediction callable built by
     :func:`~coil_fem.solvers.build_fwd_pred`.
 
     Parameters
     ----------
-    mesh : CoilMesh
+    mesh : FramedCurveMesh
         Coil cross-section mesh.
     E : float
         Young's modulus [Pa].
@@ -49,7 +49,7 @@ class ElasticPipeline:
 
     def __init__(
         self,
-        mesh: CoilMesh,
+        mesh: FramedCurveMesh,
         E: float,
         nu: float,
         itc: float | None,

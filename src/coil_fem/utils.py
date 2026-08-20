@@ -79,21 +79,3 @@ def estimate_k(L, E, eps):
         as ``k_clamp``.
     """
     return E/L/eps
-
-
-def curve_center(curve):
-    """ A fast way to calcualate a CurveXYZFourier or a CurveXYZFourierJAX's center.
-    
-    Parameters
-    ----------
-    curve : CurveXYZFourier or CurveXYZFourierJAX.
-        The curve.
-
-    Returns
-    -------
-    Array
-        An array storing the center point.
-    """
-    k = 2 * curve.order + 1
-    dofs = curve.get_dofs()          # or curve.x / local_x
-    return dofs[[0, k, 2 * k]]     # [xc(0), yc(0), zc(0)]

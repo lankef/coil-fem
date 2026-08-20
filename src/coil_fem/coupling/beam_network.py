@@ -588,7 +588,7 @@ class SupportBeams(Support):
 
         Parameters
         ----------
-        meshes : list[CoilMesh]
+        meshes : list[FramedCurveMesh]
             One mesh per base coil (same order as ``curves_jax``).
         """
         if len(meshes) != self.n_base:

@@ -1,14 +1,14 @@
 """
 Tests for TET10 support in the B_self reference-coordinate pipeline.
 
-Validates that ``CoilMesh.attach_ref_coords`` correctly builds ``phi_quad`` and
+Validates that ``FramedCurveMesh.attach_ref_coords`` correctly builds ``phi_quad`` and
 ``uv_quad`` for 10-node tetrahedral elements, and that the downstream
 ``B_self_quadrature`` call produces consistent results.
 
 Strategy
 --------
 1. Build TET4 and TET10 meshes for the same circular coil via
-   ``CoilMeshRectangle``, then construct JAX-FEM ``LinearElasticity3D``
+   ``FramedCurveMeshRectangle``, then construct JAX-FEM ``LinearElasticity3D``
    problems to obtain ``shape_vals`` and ``cells``.
 2. Call ``mesh.attach_ref_coords(prob)`` and read the reference-coordinate
    arrays off the mesh; check shapes, value ranges, and mutual consistency
@@ -27,7 +27,7 @@ import jax.numpy as jnp
 
 from coil_fem.geo import CurveXYZFourierJAX
 from coil_fem.geo import make_rmf_frame
-from coil_fem.meshing import CoilMeshRectangle
+from coil_fem.meshing import FramedCurveMeshRectangle
 from coil_fem.magnetic import B_self_quadrature
 from coil_fem.pipelines import ElasticPipeline
 
@@ -45,7 +45,7 @@ def _make_circle(N=32, R=1.0):
 # ---------------------------------------------------------------------------
 
 def _build_prob_dict(mesh_type, N=32, R=1.0, w1=0.05, w2=0.03):
-    """Build a CoilMeshRectangle + LinearElasticity3D problem dict.
+    """Build a FramedCurveMeshRectangle + LinearElasticity3D problem dict.
 
     Built through :class:`~coil_fem.pipelines.ElasticPipeline`, which already
     calls ``mesh.attach_ref_coords`` to populate
@@ -54,7 +54,7 @@ def _build_prob_dict(mesh_type, N=32, R=1.0, w1=0.05, w2=0.03):
     """
     curve = _make_circle(N=N, R=R)
     fc = make_rmf_frame(curve)
-    mesh = CoilMeshRectangle(
+    mesh = FramedCurveMeshRectangle(
         fc, w1, w2,
         n_grid_1=3, n_grid_2=3,
         mesh_type=mesh_type,
@@ -82,7 +82,7 @@ def _build_prob_dict(mesh_type, N=32, R=1.0, w1=0.05, w2=0.03):
 
 @pytest.fixture(scope="module", params=["TET4", "TET10"])
 def mesh_and_prob(request):
-    """Build a CoilMeshRectangle and LinearElasticity3D problem."""
+    """Build a FramedCurveMeshRectangle and LinearElasticity3D problem."""
     return _build_prob_dict(request.param)
 
 

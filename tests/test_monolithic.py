@@ -30,7 +30,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
-from coil_fem.meshing import CoilMesh
+from coil_fem.meshing import FramedCurveMesh
 from coil_fem.pipelines import ElasticPipeline
 from coil_fem.problems import LinearElasticity3D
 from coil_fem.coupling import SupportBeams
@@ -55,17 +55,17 @@ def _make_circle(N: int = 4, R: float = 1.0) -> CurveXYZFourierJAX:
     return CurveXYZFourierJAX(quadpoints, dofs, order=1)
 
 
-def _tiny_mesh(R: float = 1.0) -> CoilMesh:
+def _tiny_mesh(R: float = 1.0) -> FramedCurveMesh:
     """Smallest usable coil mesh (4 phi x 1x1 rectangular cross-section)."""
     fc = make_framed_curve(_make_circle(N=4, R=R), 'rmf')
-    return CoilMesh.from_options(
+    return FramedCurveMesh.from_options(
         fc,
         {'shape': 'rect', 'w1': 0.01, 'w2': 0.01, 'n_grid_1': 1, 'n_grid_2': 1},
         'TET4',
     )
 
 
-def _make_pipeline(mesh: CoilMesh, solver: str):
+def _make_pipeline(mesh: FramedCurveMesh, solver: str):
     return ElasticPipeline(
         mesh,
         E=200e9, nu=0.3, itc=None,
@@ -74,7 +74,7 @@ def _make_pipeline(mesh: CoilMesh, solver: str):
     )
 
 
-def _gpu_problem(mesh: CoilMesh) -> LinearElasticity3D:
+def _gpu_problem(mesh: FramedCurveMesh) -> LinearElasticity3D:
     """A ``gpu_assembly=True`` problem, built without the cuDSS forward solver.
 
     Constructs the FEM problem directly (bypassing ``build_fwd_pred``) so the

@@ -1,5 +1,5 @@
 """
-Pure JAX framed-curve wrappers for CurveXYZFourierJAX.
+Pure JAX framed-curve wrappers for :class:`~coil_fem.geo.CurveJAX`.
 
 Provides two reference frames, both fully differentiable through JAX:
 
@@ -10,8 +10,8 @@ Provides two reference frames, both fully differentiable through JAX:
 All operations are pure JAX and require **no** simsopt installation.
 
 When simsopt is available, :func:`make_centroid_frame` and
-:func:`make_rmf_frame` also accept simsopt ``CurveXYZFourier`` objects
-(they are converted via :meth:`CurveXYZFourierJAX.from_simsopt`).
+:func:`make_rmf_frame` also accept simsopt ``CurveXYZFourier`` /
+``CurveRZFourier`` objects (converted via :func:`curve_jax_from_simsopt`).
 
 Frame curvatures
 ----------------
@@ -288,7 +288,7 @@ class FramedCurveJAX:
 
     Attributes
     ----------
-    curve : CurveXYZFourierJAX
+    curve : CurveJAX
         The underlying curve.
     alpha : jax.Array (nquad,)
         Rotation angles around the tangent at quadrature points
@@ -319,12 +319,12 @@ class FramedCurveJAX:
     def with_dofs(self, dofs):
         """Return a new framed curve of the same type built from new curve DOFs.
 
-        Rebuilds the underlying :class:`CurveXYZFourierJAX` from *dofs* (reusing
-        the current ``quadpoints`` and ``order``) and wraps it in the same frame
-        subclass, preserving ``alpha``.  This is the differentiable entry point
-        used to regenerate mesh geometry from traced DOFs: ``dofs`` is the only
-        traced input; ``quadpoints``/``order``/``alpha`` are treated as
-        constants.  The stored ``self.curve.dofs`` is intentionally ignored.
+        Rebuilds the underlying :class:`~coil_fem.geo.CurveJAX` via
+        :meth:`CurveJAX.with_dofs` and wraps it in the same frame subclass,
+        preserving ``alpha``.  This is the differentiable entry point used to
+        regenerate mesh geometry from traced DOFs: ``dofs`` is the only traced
+        input; static curve metadata and ``alpha`` are treated as constants.
+        The stored ``self.curve.dofs`` is intentionally ignored.
 
         ``twist`` is *not* carried over — new DOFs mean a new frame, so this is
         the single point at which frame construction happens per DOF update.
@@ -339,18 +339,14 @@ class FramedCurveJAX:
         FramedCurveJAX
             A new instance of ``type(self)``.
         """
-        from .curve_jax import CurveXYZFourierJAX
-        new_curve = CurveXYZFourierJAX(
-            self.curve.quadpoints, dofs, self.curve.order
-        )
-        return type(self)(new_curve, self.alpha)
+        return type(self)(self.curve.with_dofs(dofs), self.alpha)
 
     def alpha_eval(self, phi):
         r"""Analytic Fourier evaluation of ``alpha`` at arbitrary *phi*.
 
-        Mirrors :meth:`CurveXYZFourierJAX.gamma_eval`: reconstructs the
-        band-limited Fourier series of ``self.alpha`` and evaluates it at
-        the supplied parameter values.
+        Mirrors :meth:`CurveJAX.gamma_eval`: reconstructs the band-limited
+        Fourier series of ``self.alpha`` and evaluates it at the supplied
+        parameter values.
 
         This is *exact* for band-limited alpha
         (fewer than N/2 active modes) sampled at the uniform quadpoints
@@ -589,7 +585,7 @@ class FramedCurveCentroidJAX(FramedCurveJAX):
         r"""Closed-form centroid frame at arbitrary parameter values.
 
         Pure JAX, fully differentiable through ``self.curve.dofs``,
-        ``self.alpha``, and ``phi``.  Uses :meth:`CurveXYZFourierJAX.gamma_eval`
+        ``self.alpha``, and ``phi``.  Uses :meth:`CurveJAX.gamma_eval`
         and :meth:`alpha_eval`, with the centroid taken as the discrete
         mean over the curve's quadpoints, ``jnp.mean(self.curve.gamma(), axis=0)``.
 
@@ -655,7 +651,7 @@ class FramedCurveRMFJAX(FramedCurveJAX):
         interpolates that angle field against the closed-form centroid
         reference frame.  Consequences:
 
-        * ``t`` is exact — it comes from :meth:`CurveXYZFourierJAX.gamma_eval`,
+        * ``t`` is exact — it comes from :meth:`CurveJAX.gamma_eval`,
           never from interpolation.
         * ``p`` and ``q`` are exactly orthonormal by construction, because only
           a scalar angle is interpolated.
@@ -693,11 +689,9 @@ class FramedCurveRMFJAX(FramedCurveJAX):
 # ============================================================================
 
 def _to_jax_curve(curve):
-    """Accept either a CurveXYZFourierJAX or a simsopt CurveXYZFourier."""
-    from .curve_jax import CurveXYZFourierJAX
-    if isinstance(curve, CurveXYZFourierJAX):
-        return curve
-    return CurveXYZFourierJAX.from_simsopt(curve)
+    """Accept a :class:`CurveJAX` or a simsopt ``CurveXYZFourier`` / ``CurveRZFourier``."""
+    from .curve_jax import curve_jax_from_simsopt
+    return curve_jax_from_simsopt(curve)
 
 
 def make_centroid_frame(curve, alpha=None):
@@ -705,7 +699,7 @@ def make_centroid_frame(curve, alpha=None):
 
     Parameters
     ----------
-    curve : CurveXYZFourierJAX or simsopt CurveXYZFourier
+    curve : CurveJAX or simsopt CurveXYZFourier / CurveRZFourier
     alpha : array-like, optional
         Rotation angles at quadrature points (default: zeros).
         ``d(alpha)/d(phi)`` is derived automatically via FFT differentiation.
@@ -722,7 +716,7 @@ def make_rmf_frame(curve, alpha=None):
 
     Parameters
     ----------
-    curve : CurveXYZFourierJAX or simsopt CurveXYZFourier
+    curve : CurveJAX or simsopt CurveXYZFourier / CurveRZFourier
     alpha : array-like, optional
         Rotation angles at quadrature points (default: zeros).
         ``d(alpha)/d(phi)`` is derived automatically via FFT differentiation.
@@ -739,7 +733,7 @@ def make_framed_curve(curve, frame_type, alpha=None):
 
     Parameters
     ----------
-    curve : CurveXYZFourierJAX or simsopt CurveXYZFourier
+    curve : CurveJAX or simsopt CurveXYZFourier / CurveRZFourier
     frame_type : {'rmf', 'centroid'}
         ``'rmf'`` for a rotation-minimising frame, ``'centroid'`` for the
         centroid frame.

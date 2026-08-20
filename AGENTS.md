@@ -124,7 +124,7 @@ Every `.py` file must start with a module docstring. Format: one-sentence summar
 """Structured volume meshes for coil cross-sections.
 
 Sweeps a rectangular or disk cross-section grid along a framed curve to
-produce a ``CoilMesh`` (TET4 or TET10) used by :class:`~coil_fem.CoilFEM`.
+produce a ``FramedCurveMesh`` (TET4 or TET10) used by :class:`~coil_fem.CoilFEM`.
 """
 ```
 

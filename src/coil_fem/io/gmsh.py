@@ -2,7 +2,7 @@
 
 Beam cross-sections are resolved from ``presets.cross_section_fns`` via
 ``cross_section_type``; coil cross-sections must be rectangular
-(:class:`~coil_fem.meshing.CoilMeshRectangle`).
+(:class:`~coil_fem.meshing.FramedCurveMeshRectangle`).
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import numpy as np
 import pyvista as pv
 from scipy.spatial import cKDTree
 
-from coil_fem.meshing import CoilMeshRectangle
+from coil_fem.meshing import FramedCurveMeshRectangle
 from coil_fem.presets import cross_section_fns
 
 
@@ -274,7 +274,7 @@ def to_full_body(
         Must wrap ``CoilSupportBeams`` whose ``cross_section_type`` has a
         matching ``*_solid`` factory in
         :mod:`coil_fem.presets.cross_section_fns`, and rectangular coil
-        meshes (:class:`~coil_fem.meshing.CoilMeshRectangle`).
+        meshes (:class:`~coil_fem.meshing.FramedCurveMeshRectangle`).
     mesh_scale : float
         Multiplier on gmsh ``MeshSizeMax`` used for the 2D surface mesh.
     path : path-like
@@ -326,9 +326,9 @@ def to_full_body(
             f"(expected {cs_type}_solid in "
             f"coil_fem.presets.cross_section_fns)."
         ) from exc
-    if not all(isinstance(m, CoilMeshRectangle) for m in meshes):
+    if not all(isinstance(m, FramedCurveMeshRectangle) for m in meshes):
         raise ValueError(
-            "to_full_body requires rectangular coil meshes (CoilMeshRectangle)."
+            "to_full_body requires rectangular coil meshes (FramedCurveMeshRectangle)."
         )
 
     mesh_opts = fem.mesh_opts[0]

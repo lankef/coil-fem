@@ -111,7 +111,7 @@ jupyter lab ../docs/tutorial/coil_fem_workflow.ipynb
          │
          ▼
 ┌─────────────────┐
-│   CoilMesh      │  Tetrahedral mesh
+│   FramedCurveMesh      │  Tetrahedral mesh
 │ (points, cells) │
 └────────┬────────┘
          │

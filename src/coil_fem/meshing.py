@@ -1,12 +1,12 @@
 """Structured volume meshes and meshing routines for finite-build coils.
 
-Sweeps a rectangular (:class:`CoilMeshRectangle`) or disk
-(:class:`CoilMeshDisk`) cross-section grid along a framed centerline curve
-to produce a tetrahedral :class:`CoilMesh` (TET4 or TET10).  The
-differentiable method :meth:`CoilMesh.mesh_points_from_dofs` regenerates node
+Sweeps a rectangular (:class:`FramedCurveMeshRectangle`) or disk
+(:class:`FramedCurveMeshDisk`) cross-section grid along a framed centerline curve
+to produce a tetrahedral :class:`FramedCurveMesh` (TET4 or TET10).  The
+differentiable method :meth:`FramedCurveMesh.mesh_points_from_dofs` regenerates node
 positions from updated curve DOFs, enabling gradient flow through the mesh
 geometry.  Use :func:`rectangle_sweep` or :func:`disk_sweep` for mesh
-generation, or :meth:`CoilMesh.from_options` for dict-driven dispatch.
+generation, or :meth:`FramedCurveMesh.from_options` for dict-driven dispatch.
 """
 
 import abc
@@ -440,17 +440,17 @@ def disk_sweep(
     aspect_ratio=1.0,
     mesh_type: str = "TET4",
 ):
-    """Backward-compatible wrapper that builds a :class:`CoilMeshDisk`.
+    """Backward-compatible wrapper that builds a :class:`FramedCurveMeshDisk`.
 
-    The mesh-generation logic now lives in :class:`CoilMeshDisk.__init__`; this
+    The mesh-generation logic now lives in :class:`FramedCurveMeshDisk.__init__`; this
     function is a thin shim so existing callers keep working.  See
-    :class:`CoilMeshDisk` for the full parameter documentation.
+    :class:`FramedCurveMeshDisk` for the full parameter documentation.
 
     Returns
     -------
-    CoilMeshDisk
+    FramedCurveMeshDisk
     """
-    return CoilMeshDisk(
+    return FramedCurveMeshDisk(
         framed_curve, radius,
         n_center=n_center, n_radial=n_radial,
         aspect_ratio=aspect_ratio, mesh_type=mesh_type,
@@ -465,27 +465,27 @@ def rectangle_sweep(
     aspect_ratio=1.0,
     mesh_type="TET4",
 ):
-    """Backward-compatible wrapper that builds a :class:`CoilMeshRectangle`.
+    """Backward-compatible wrapper that builds a :class:`FramedCurveMeshRectangle`.
 
-    The mesh-generation logic now lives in :class:`CoilMeshRectangle.__init__`;
+    The mesh-generation logic now lives in :class:`FramedCurveMeshRectangle.__init__`;
     this function is a thin shim so existing callers keep working.  See
-    :class:`CoilMeshRectangle` for the full parameter documentation.
+    :class:`FramedCurveMeshRectangle` for the full parameter documentation.
 
     Returns
     -------
-    CoilMeshRectangle
+    FramedCurveMeshRectangle
     """
-    return CoilMeshRectangle(
+    return FramedCurveMeshRectangle(
         framed_curve, w1, w2,
         n_grid_1=n_grid_1, n_grid_2=n_grid_2,
         aspect_ratio=aspect_ratio, mesh_type=mesh_type,
     )
 
 
-class CoilMesh(JAXFEMMesh, abc.ABC):
+class FramedCurveMesh(JAXFEMMesh, abc.ABC):
     """Abstract base for coil volume meshes with quality metrics.
 
-    Concrete subclasses (:class:`CoilMeshRectangle`, :class:`CoilMeshDisk`) own
+    Concrete subclasses (:class:`FramedCurveMeshRectangle`, :class:`FramedCurveMeshDisk`) own
     their cross-section metadata and implement :meth:`mesh_points_from_dofs`, the
     differentiable regeneration of mesh node positions from curve DOFs.  Build
     one via :meth:`from_options` (dispatch on ``mesh_options['shape']``) or the
@@ -511,7 +511,7 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
 
     Notes
     -----
-    ``CoilMesh`` is not a registered JAX pytree.  It is a mutable container
+    ``FramedCurveMesh`` is not a registered JAX pytree.  It is a mutable container
     that holds static topology data alongside a ``framed_curve`` with the
     initial DOFs; it is always accessed by closure and never passed as a JAX
     argument.  Only the traced ``dofs`` flowing through
@@ -580,11 +580,11 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
 
         Returns
         -------
-        CoilMeshRectangle or CoilMeshDisk
+        FramedCurveMeshRectangle or FramedCurveMeshDisk
         """
         shape = opt['shape']
         if shape == 'rect':
-            return CoilMeshRectangle(
+            return FramedCurveMeshRectangle(
                 framed_curve, opt['w1'], opt['w2'],
                 n_grid_1=opt.get('n_grid_1'),
                 n_grid_2=opt.get('n_grid_2'),
@@ -592,7 +592,7 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
                 mesh_type=mesh_type,
             )
         elif shape == 'disk':
-            return CoilMeshDisk(
+            return FramedCurveMeshDisk(
                 framed_curve, opt['radius'],
                 n_center=opt.get('n_center'),
                 n_radial=opt.get('n_radial'),
@@ -678,7 +678,7 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
     def _compute_uv_quad(self, corners_np, sv_np, is_tet10):
         """Cross-section ``(u, v)`` at quadrature points; ``None`` by default.
 
-        Overridden by shapes (e.g. :class:`CoilMeshRectangle`) that carry a
+        Overridden by shapes (e.g. :class:`FramedCurveMeshRectangle`) that carry a
         rectangular ``(u, v)`` parametrisation.
         """
         return None
@@ -689,7 +689,7 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
 
         JAX-FEM uses ``"TET4"`` / ``"TET10"`` etc., while meshio expects
         ``"tetra"`` / ``"tetra10"`` etc.  Use this property whenever
-        constructing a :class:`meshio.Mesh` from a :class:`CoilMesh`::
+        constructing a :class:`meshio.Mesh` from a :class:`FramedCurveMesh`::
 
             meshio.Mesh(
                 points=np.asarray(mesh.points),
@@ -751,7 +751,7 @@ class CoilMesh(JAXFEMMesh, abc.ABC):
 # Concrete cross-section meshes
 # ============================================================================
 
-class CoilMeshRectangle(CoilMesh):
+class FramedCurveMeshRectangle(FramedCurveMesh):
     """Rectangular cross-section swept along a framed curve.
 
     Sweeps a structured ``(n_grid_1 + 1) x (n_grid_2 + 1)`` cross-section grid
@@ -858,7 +858,7 @@ class CoilMeshRectangle(CoilMesh):
         return jnp.asarray(uv_quad_np)   # (n_cells, n_quads, 2)
 
 
-class CoilMeshDisk(CoilMesh):
+class FramedCurveMeshDisk(FramedCurveMesh):
     """Circular cross-section via a 5-block structured O-grid, swept along a curve.
 
     Uses ``framed_curve.gamma()`` for centerline positions and
@@ -866,7 +866,7 @@ class CoilMeshDisk(CoilMesh):
     quadrature points.  Currently ``'TET4'`` only.
 
     .. note::
-        As with :class:`CoilMeshRectangle`, the Lorentz-force pipeline assumes
+        As with :class:`FramedCurveMeshRectangle`, the Lorentz-force pipeline assumes
         cross-sections perpendicular to the centerline.
 
     Parameters
@@ -892,7 +892,7 @@ class CoilMeshDisk(CoilMesh):
         n_center=None, n_radial=None, aspect_ratio=1.0, mesh_type="TET4",
     ):
         if mesh_type != "TET4":
-            raise NotImplementedError("CoilMeshDisk currently supports TET4 only")
+            raise NotImplementedError("FramedCurveMeshDisk currently supports TET4 only")
 
         if n_center is None or n_radial is None:
             ds = framed_curve.curve.incremental_arclength()
