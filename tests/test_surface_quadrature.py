@@ -21,7 +21,7 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)
 
 from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
-from coil_fem.meshing import CoilMesh
+from coil_fem.meshing import FramedCurveMesh
 from coil_fem.pipelines import ElasticPipeline
 from coil_fem.coupling import SupportBeams
 
@@ -49,7 +49,7 @@ def _make_pipeline(
     """Build a minimal ElasticPipeline with a Winkler surface."""
     curve = _make_circle(N=n_phi, R=R)
     fc    = make_framed_curve(curve, 'rmf')
-    mesh  = CoilMesh.from_options(
+    mesh  = FramedCurveMesh.from_options(
         fc,
         {'shape': 'rect', 'w1': w1, 'w2': w2,
          'n_grid_1': n_grid, 'n_grid_2': n_grid},

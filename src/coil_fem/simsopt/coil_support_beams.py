@@ -15,7 +15,8 @@ from jax.flatten_util import ravel_pytree
 from jax.tree_util import tree_map
 
 from ..presets import cross_section_fns
-from ..utils import estimate_k, curve_center
+from ..utils import estimate_k
+from ..geo import CurveXYZFourierJAX
 from ..coupling import SupportBeams
 from .coil_support import (
     CoilSupport,
@@ -355,7 +356,9 @@ class CoilSupportBeams(CoilSupport):
         if 'k_attachment' not in beam_options:
             eps_attachment = beam_options.get('eps_attachment', 1e-3)
             E_beams = beam_options['E']
-            centers_zero = curve_center(base_coils[0].curve)
+            centers_zero = CurveXYZFourierJAX.from_simsopt(
+                base_coils[0].curve
+            ).curve_center()
             estimated_R = jnp.sqrt(centers_zero[0]**2 + centers_zero[1]**2)
             displacements = estimated_R * jnp.pi * 2 / nfp / len(base_coils)
             if stellsym:

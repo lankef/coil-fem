@@ -13,7 +13,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
-from coil_fem.meshing import CoilMesh
+from coil_fem.meshing import FramedCurveMesh
 from coil_fem.pipelines import ElasticPipeline, ThermoElasticPipeline
 from coil_fem.coupling import Support
 from coil_fem.coil_fem import CoilFEM
@@ -38,7 +38,7 @@ def _make_tiny_pipeline(R: float = 1.0) -> ElasticPipeline:
     """Build the smallest possible ElasticPipeline (4 phi × 1×1 rect mesh)."""
     curve = _make_circle(N=4, R=R)
     fc    = make_framed_curve(curve, 'rmf')
-    mesh  = CoilMesh.from_options(
+    mesh  = FramedCurveMesh.from_options(
         fc,
         {'shape': 'rect', 'w1': 0.01, 'w2': 0.01, 'n_grid_1': 1, 'n_grid_2': 1},
         'TET4',
@@ -211,7 +211,7 @@ def test_thermo_elastic_pipeline_solve_raises():
     """ThermoElasticPipeline.solve raises NotImplementedError (stub)."""
     curve = _make_circle(N=4, R=1.0)
     fc    = make_framed_curve(curve, 'rmf')
-    mesh  = CoilMesh.from_options(
+    mesh  = FramedCurveMesh.from_options(
         fc,
         {'shape': 'rect', 'w1': 0.01, 'w2': 0.01, 'n_grid_1': 1, 'n_grid_2': 1},
         'TET4',

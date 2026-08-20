@@ -25,7 +25,6 @@ jax.config.update("jax_enable_x64", True)
 
 from coil_fem.coupling import SupportBeams
 from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
-from coil_fem.meshing import CoilMesh
 
 _HAS_SPINEAX = importlib.util.find_spec("spineax") is not None
 _HAS_GPU = any(d.platform == "gpu" for d in jax.devices())

@@ -80,7 +80,7 @@ These determine everything below; each was verified against the installed
    DOFs, `problem.I/J/V_jax`, and BC metadata looping over all `fes`. Any
    `DeviceProblem` with symmetric tangent works unmodified.
 
-7. **`CoilMesh` already owns the reference-coordinate fields**
+7. **`FramedCurveMesh` already owns the reference-coordinate fields**
    (`phi_quad`, `uv_quad`, populated by `attach_ref_coords`) that a spatial
    material parametrization naturally wants.
 
@@ -114,7 +114,7 @@ Uniform materials become the broadcast special case (`jnp.full`), so a single
 code path serves both; the memory cost of `(n_cells, n_quads)` scalars is
 negligible next to `shape_grads`.
 
-### Where the field lives — `CoilMesh` vs the pipeline
+### Where the field lives — `FramedCurveMesh` vs the pipeline
 
 The **core Q1 change** is making constitutive kernels and `set_params` accept
 per-quad `(n_cells, n_quads)` arrays; uniform material is the broadcast
@@ -129,10 +129,10 @@ material_fn(x_quad, phi_quad, uv_quad, dofs) -> {'lam': ..., 'mu': ..., 'eps_th'
 
 Use this only when material parameters are DOFs. Reasons: (a) the field must be
 re-evaluated inside the JAX trace whenever geometry or material DOFs change; (b)
-`CoilMesh` already exposes everything the callable needs (`phi_quad`, `uv_quad`,
+`FramedCurveMesh` already exposes everything the callable needs (`phi_quad`, `uv_quad`,
 physical quad points via `recompute_fe_geometry`). For static spatial fields,
 pass pre-built per-quad arrays directly — no callable needed. A convenience
-`CoilMesh.eval_field(fn)` for forward-only diagnostics is fine.
+`FramedCurveMesh.eval_field(fn)` for forward-only diagnostics is fine.
 
 ### Ripple effects
 
@@ -279,7 +279,7 @@ plug in.
 The pipeline is the natural home for *all* per-coil state, eliminating the
 parallel `n_base`-length lists `CoilFEM` currently indexes by `coil_idx`
 (`self.meshes`, `self._problems`, `self._fwd_preds`,
-`self._surface_node_indices`). In particular the coil's `CoilMesh` becomes a
+`self._surface_node_indices`). In particular the coil's `FramedCurveMesh` becomes a
 **pipeline attribute**, not a `CoilFEM` list, for two reasons:
 
 - The `LinearElasticity3D` is *built from* the mesh and cross-linked via
@@ -292,10 +292,10 @@ parallel `n_base`-length lists `CoilFEM` currently indexes by `coil_idx`
 
 Ownership boundary:
 
-- **`CoilFEM` builds** the mesh (`CoilMesh.from_options(fc, opt, mesh_type)`,
+- **`CoilFEM` builds** the mesh (`FramedCurveMesh.from_options(fc, opt, mesh_type)`,
   which needs facade-level inputs: the framed curve and `mesh_options`) and
   hands the built mesh to the pipeline constructor. Mesh *construction* stays
-  out of the pipeline so `CoilMesh` remains standalone and physics-agnostic.
+  out of the pipeline so `FramedCurveMesh` remains standalone and physics-agnostic.
 - **The pipeline holds** the mesh as the single source of truth and exposes it
   (plus `mesh_points_from_dofs`, `surface_node_indices`) for read.
 - **`CoilFEM` reads** `pipeline.mesh` where its cross-coil physics needs coil
@@ -532,7 +532,7 @@ what each one wraps**; the assembler objects (pipelines, supports, their
 meshes and `Problem`s) are identical in both.
 
 Legend: a `Solver` owns a factorization; an `ElasticPipeline` owns one coil's
-`CoilMesh` + `LinearElasticity3D`; a `Support` owns its own discretization and
+`FramedCurveMesh` + `LinearElasticity3D`; a `Support` owns its own discretization and
 `Problem`(s).
 
 **Monolithic ("homogeneous") case — one `Solver` wraps everything (one
@@ -545,11 +545,11 @@ flowchart TD
     Solver --> P2[ElasticPipeline coil 1]
     Solver --> P3[ElasticPipeline coil 2]
     Solver --> BN[BeamNetworkSupport]
-    P1 --> M1[CoilMesh]
+    P1 --> M1[FramedCurveMesh]
     P1 --> L1[LinearElasticity3D]
-    P2 --> M2[CoilMesh]
+    P2 --> M2[FramedCurveMesh]
     P2 --> L2[LinearElasticity3D]
-    P3 --> M3[CoilMesh]
+    P3 --> M3[FramedCurveMesh]
     P3 --> L3[LinearElasticity3D]
 ```
 
@@ -568,11 +568,11 @@ flowchart TD
     Driver --> S2["Solver"] --> P2[ElasticPipeline coil 1]
     Driver --> S3["Solver"] --> P3[ElasticPipeline coil 2]
     Driver --> S4["Solver"] --> BN[BeamNetworkSupport]
-    P1 --> M1[CoilMesh]
+    P1 --> M1[FramedCurveMesh]
     P1 --> L1[LinearElasticity3D]
-    P2 --> M2[CoilMesh]
+    P2 --> M2[FramedCurveMesh]
     P2 --> L2[LinearElasticity3D]
-    P3 --> M3[CoilMesh]
+    P3 --> M3[FramedCurveMesh]
     P3 --> L3[LinearElasticity3D]
 ```
 
@@ -605,7 +605,7 @@ src/coil_fem/
         cudss.py                  # unchanged for Design C; later: mtype plumb-through,
                                   #   spineax solve-only phase (highest-leverage upstream item)
     pipelines.py                  # Q2/Q3: NEW ElasticPipeline, ThermoElasticPipeline
-                                  #   (own CoilMesh + Problem(s) + fwd_pred via build_fwd_pred)
+                                  #   (own FramedCurveMesh + Problem(s) + fwd_pred via build_fwd_pred)
     coupling/                     # Q4: NEW
         supports.py               #   Support ABC; FixedSupport, BeamNetworkSupport, DensityFieldSupport
         drivers.py                #   solve_staggered() (custom_root fixed-point adjoint);

@@ -17,7 +17,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 from coil_fem.geo import CurveXYZFourierJAX, make_framed_curve
-from coil_fem.meshing import CoilMeshRectangle
+from coil_fem.meshing import FramedCurveMeshRectangle
 from coil_fem.coupling import SupportBeams
 
 
@@ -1165,7 +1165,7 @@ def test_L_eff_rect_radial_beam():
     curves = [_make_circle(N=N, R=1.0), _make_circle(N=N, R=2.0)]
     w = 0.2
     meshes = [
-        CoilMeshRectangle(make_framed_curve(c, 'centroid'), w, w, n_grid_1=2, n_grid_2=2)
+        FramedCurveMeshRectangle(make_framed_curve(c, 'centroid'), w, w, n_grid_1=2, n_grid_2=2)
         for c in curves
     ]
     # Only the coil-0 → coil-1 group; leave the wrap group empty.
@@ -1192,7 +1192,7 @@ def test_free_segment_xi_grid_endpoints():
     curves = [_make_circle(N=N, R=1.0), _make_circle(N=N, R=2.0)]
     w = 0.2
     meshes = [
-        CoilMeshRectangle(make_framed_curve(c, 'centroid'), w, w, n_grid_1=2, n_grid_2=2)
+        FramedCurveMeshRectangle(make_framed_curve(c, 'centroid'), w, w, n_grid_1=2, n_grid_2=2)
         for c in curves
     ]
     n_cc = [1, 0]
@@ -1221,7 +1221,7 @@ def test_L_eff_grad_phis_finite():
     curves = [_make_circle(N=N, R=1.0), _make_circle(N=N, R=2.0)]
     w = 0.15
     meshes = [
-        CoilMeshRectangle(make_framed_curve(c, 'centroid'), w, w, n_grid_1=2, n_grid_2=2)
+        FramedCurveMeshRectangle(make_framed_curve(c, 'centroid'), w, w, n_grid_1=2, n_grid_2=2)
         for c in curves
     ]
     n_cc = [1, 0]

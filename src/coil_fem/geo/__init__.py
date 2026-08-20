@@ -1,6 +1,11 @@
 """JAX implementations of geometry objects, such as curves, moving frame and symmetry/field-period helpers."""
 
-from .curve_jax import CurveXYZFourierJAX
+from .curve_jax import (
+    CurveJAX,
+    CurveXYZFourierJAX,
+    CurveRZFourierJAX,
+    curve_jax_from_simsopt,
+)
 from .framed_curve_jax import (
     FramedCurveJAX,
     FramedCurveCentroidJAX,
@@ -20,7 +25,10 @@ from .symmetries import (
 )
 
 __all__ = [
+    "CurveJAX",
     "CurveXYZFourierJAX",
+    "CurveRZFourierJAX",
+    "curve_jax_from_simsopt",
     "FramedCurveJAX",
     "FramedCurveCentroidJAX",
     "FramedCurveRMFJAX",

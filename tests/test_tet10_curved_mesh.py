@@ -11,12 +11,12 @@ Properties checked
    ``gamma_eval((m + 0.5)/M)`` to machine precision -- not the chord
    midpoint between the adjacent corner nodes.
 2. **Init / forward-pass parity.**  The init-time mesh from
-   ``CoilMeshRectangle`` and the forward-pass mesh from
-   ``CoilMeshRectangle.mesh_points_from_dofs`` (which calls the same
+   ``FramedCurveMeshRectangle`` and the forward-pass mesh from
+   ``FramedCurveMeshRectangle.mesh_points_from_dofs`` (which calls the same
    ``_rect_sweep_points`` helper) produce identical points.
 3. **Topology unchanged.**  The connectivity returned by the new
    ``_rect_sweep_topology`` matches the legacy node ordering enough that
-   ``CoilMesh.attach_ref_coords`` continues to work
+   ``FramedCurveMesh.attach_ref_coords`` continues to work
    (i.e. corners obey ``index = m * (N*O) + n * O + o``).
 4. **AD through ``curve.dofs``.**  Gradients of a mesh-based scalar flow
    through the new pipeline.
@@ -33,7 +33,7 @@ from coil_fem.geo import CurveXYZFourierJAX
 from coil_fem.geo import make_centroid_frame, make_rmf_frame
 from coil_fem.meshing import (
     rectangle_sweep,
-    CoilMeshRectangle,
+    FramedCurveMeshRectangle,
     _rect_sweep_topology,
     _rect_sweep_points,
 )
@@ -132,8 +132,8 @@ class TestCurvedMidsides:
 # ---------------------------------------------------------------------------
 
 class TestInitForwardParity:
-    """The init-time ``CoilMeshRectangle`` and the forward-pass
-    ``CoilMeshRectangle.mesh_points_from_dofs`` both delegate to
+    """The init-time ``FramedCurveMeshRectangle`` and the forward-pass
+    ``FramedCurveMeshRectangle.mesh_points_from_dofs`` both delegate to
     ``_rect_sweep_points``; the resulting points must be bit-identical.
 
     We drive ``mesh.mesh_points_from_dofs(dofs)`` directly rather than build a
@@ -153,7 +153,7 @@ class TestInitForwardParity:
         n_g1, n_g2 = 3, 3
         w1, w2 = 0.05, 0.03
 
-        mesh = CoilMeshRectangle(
+        mesh = FramedCurveMeshRectangle(
             fc, w1, w2,
             n_grid_1=n_g1, n_grid_2=n_g2,
             mesh_type=mesh_type,
@@ -175,7 +175,7 @@ class TestInitForwardParity:
 
 class TestTopologyConvention:
     """Corner-node indexing must follow ``m * (N*O) + n * O + o`` so the
-    ``CoilMesh.attach_ref_coords`` reconstruction works unchanged."""
+    ``FramedCurveMesh.attach_ref_coords`` reconstruction works unchanged."""
 
     @pytest.mark.parametrize("mesh_type", ["TET4", "TET10"])
     def test_corner_index_layout(self, mesh_type):

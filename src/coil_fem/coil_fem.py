@@ -28,7 +28,7 @@ from .geo import (
     apply_symmetries_to_gammadashs,
     apply_symmetries_to_currents,
 )
-from .meshing import CoilMesh
+from .meshing import FramedCurveMesh
 from .magnetic import biot_savart, B_self_quadrature, lorentz_body_force
 
 from .problems import (
@@ -316,7 +316,7 @@ class CoilFEM:
             frame_type = opt.get('frame', 'rmf')
             mesh_type  = opt.get('mesh_type', 'TET4')
             fc   = make_framed_curve(curve, frame_type)
-            mesh = CoilMesh.from_options(fc, opt, mesh_type)
+            mesh = FramedCurveMesh.from_options(fc, opt, mesh_type)
 
             pipeline_cls = (
                 ThermoElasticPipeline if _physics_type == 'thermoelastic'
@@ -1186,7 +1186,7 @@ class CoilFEM:
     # ============================================================================
 
     @functools.cached_property
-    def meshes(self) -> list[CoilMesh]:
+    def meshes(self) -> list[FramedCurveMesh]:
         """Per-coil mesh objects (one per base coil).
 
         Backward-compatibility shim: delegates to ``pipeline.mesh`` so that

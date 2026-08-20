@@ -74,9 +74,9 @@ surface.
        MergedSolver -->|"assemble_coo()"| P0["ElasticPipeline (coil 0)"]
        MergedSolver -->|"assemble_coo()"| P1["ElasticPipeline (coil 1)"]
        MergedSolver -->|"coo()"| Sup[Support]
-       P0 --> M0[CoilMesh]
+       P0 --> M0[FramedCurveMesh]
        P0 --> L0[LinearElasticity3D]
-       P1 --> M1[CoilMesh]
+       P1 --> M1[FramedCurveMesh]
        P1 --> L1[LinearElasticity3D]
 
 **Key properties:**
@@ -114,9 +114,9 @@ The iteration proceeds as follows:
        Driver --> S1["Solver (coil 0)"] --> P0["ElasticPipeline (coil 0)"]
        Driver --> S2["Solver (coil 1)"] --> P1["ElasticPipeline (coil 1)"]
        Driver --> S3["Solver (support)"] --> Sup[Support]
-       P0 --> M0[CoilMesh]
+       P0 --> M0[FramedCurveMesh]
        P0 --> L0[LinearElasticity3D]
-       P1 --> M1[CoilMesh]
+       P1 --> M1[FramedCurveMesh]
        P1 --> L1[LinearElasticity3D]
        Driver -.->|"u_s → support.solve()"| Sup
        Sup -.->|"weights / coupling → Driver"| Driver
