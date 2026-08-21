@@ -12,6 +12,8 @@ support beams clear of a target surface.
 coil curves.
 :class:`BeamCurveAngle` penalises beam–coil attachments that are too nearly
 tangent.
+:class:`CSRVolume` estimates the central support ring volume as
+``w1 * w2 * L`` from the live CSR curve.
 """
 
 from __future__ import annotations
@@ -23,9 +25,10 @@ from jax import value_and_grad
 import numpy as np
 import jax.numpy as jnp
 
-from ..geo import CurveXYZFourierJAX
+from ..geo import CurveXYZFourierJAX, CurveRZFourierJAX
 from ..problems import recompute_fe_geometry
 from ..metrics import total_strain_energy
+from ..coupling import SupportBeamsCSR
 
 try:
     from simsopt._core.optimizable import Optimizable
@@ -1242,3 +1245,125 @@ class BeamCurveAngle(Optimizable):
         if not np.isfinite(smallest):
             return 0.5 * math.pi
         return smallest
+
+
+# ============================================================================
+# CSR volume
+# ============================================================================
+
+
+class CSRVolume(Optimizable):
+    r"""Estimate the central support ring volume as a rectangular prism sweep.
+
+    .. math::
+        J = w_1 \, w_2 \, L,
+        \qquad
+        L = \bigl\langle \|\gamma'(\phi)\| \bigr\rangle_{\phi}
+
+    where :math:`w_1` and :math:`w_2` are the static CSR cross-section widths
+    and :math:`L` is the full-turn length of the live CSR
+    :class:`~coil_fem.geo.CurveRZFourierJAX` (uniform quadrature over
+    ``[0, 1)``).
+
+    Parameters
+    ----------
+    coil_support : CoilSupportBeamsCSR
+        Provides the CSR curve DOFs and the underlying
+        :class:`~coil_fem.coupling.SupportBeamsCSR` (for ``w1``, ``w2``, and
+        the curve template).
+
+    Notes
+    -----
+    The CSR FEM mesh spans only one field period; this objective still uses
+    the full-turn centreline length so ``J`` is the physical ring volume.
+
+    Examples
+    --------
+    >>> Jvol = CSRVolume(coil_support)  # doctest: +SKIP
+    >>> Jvol.length()  # doctest: +SKIP
+    6.28...
+    """
+
+    def __init__(self, coil_support):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for CSRVolume.")
+
+        support = coil_support.support
+        if not isinstance(support, SupportBeamsCSR):
+            raise TypeError(
+                "CSRVolume requires coil_support.support to be a "
+                f"SupportBeamsCSR; got {type(support).__name__}."
+            )
+
+        self._coil_support = coil_support
+        self._support = support
+        self._w1 = float(support._csr_a)
+        self._w2 = float(support._csr_b)
+        self._tmpl = support._csr_curve_template
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=0))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _csr_curve(self, sdofs):
+        """Rebuild the live CSR curve from ``sdofs['csr_curve_dofs']``."""
+        tmpl = self._tmpl
+        return CurveRZFourierJAX(
+            tmpl.quadpoints, sdofs['csr_curve_dofs'],
+            tmpl.order, tmpl.nfp, tmpl.stellsym,
+        )
+
+    def _J_pure(self, sdofs):
+        """Rectangular-section CSR volume estimate (traced scalar)."""
+        L = jnp.mean(self._csr_curve(sdofs).incremental_arclength())
+        return self._w1 * self._w2 * L
+
+    def _compute(self):
+        """Evaluate J and its support gradient from ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        sdofs = self._coil_support.support_dofs
+        J_val, grad_sdofs = self._jit_vg(sdofs)
+        self._J_cache = float(J_val)
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """Estimated CSR volume [m³]."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the support DOFs (CSR curve coefficients).
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+        return Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def length(self):
+        """Full-turn CSR centreline length [m].
+
+        Returns
+        -------
+        float
+            ``mean(||γ'||)`` over the CSR curve quadrature.
+        """
+        sdofs = self._coil_support.support_dofs
+        return float(jnp.mean(self._csr_curve(sdofs).incremental_arclength()))

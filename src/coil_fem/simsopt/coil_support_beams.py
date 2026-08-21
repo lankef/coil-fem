@@ -27,12 +27,10 @@ from .coil_support import (
     _broadcast_phis,
     _cumsum_last,
     _cumsum_last_vjp,
-    _decode_dphis,
     _diff_last,
     _encode_dphis,
     _generate_k_clamp,
     _tree_cumsum_last,
-    _vjp_dphis,
 )
 from .coil_support_fixed import CoilSupportFixed
 
@@ -693,24 +691,6 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
             dofs=dofs,
             **kwargs,
         )
-
-    @property
-    def support_dofs(self) -> dict:
-        raw = self._unravel(jnp.asarray(self.local_full_x))
-        out = _decode_dphis(raw)
-        if 'dphis_end_cc' in raw:
-            out['phis_end_cc'] = _decode_end_cc(
-                raw['dphis_end_cc'], self._sorted_stellsym,
-            )
-        return out
-
-    def flatten_grad(self, grad_dofs: dict) -> np.ndarray:
-        g = _vjp_dphis(grad_dofs)
-        if 'phis_end_cc' in grad_dofs:
-            g['dphis_end_cc'] = _vjp_end_cc(
-                grad_dofs['phis_end_cc'], self._sorted_stellsym,
-            )
-        return np.asarray(ravel_pytree(g)[0], dtype=float)
 
     def _encode_angle_dofs(self, support_dofs_jax, fixed_dof_names):
         encoded = _encode_dphis(support_dofs_jax)

@@ -5,6 +5,7 @@ from .objectives import (
     BeamCurveDistance,
     BeamCurveAngle,
     CoilFEMObjective,
+    CSRVolume,
 )
 from .coil_support import CoilSupport
 from .coil_support_fixed import (
@@ -13,6 +14,7 @@ from .coil_support_fixed import (
     CoilSupportTopBottom,
 )
 from .coil_support_beams import CoilSupportBeams, CoilSupportBeamsSorted
+from .coil_support_beams_csr import CoilSupportBeamsCSR, CoilSupportBeamsCSRSorted
 from .utils import constraint_from_optimizable
 
 __all__ = [
@@ -20,11 +22,14 @@ __all__ = [
     "BeamCurveDistance",
     "BeamCurveAngle",
     "CoilFEMObjective",
+    "CSRVolume",
     "CoilSupport",
     "CoilSupportFixed",
     "CoilSupportFixedSorted",
     "CoilSupportTopBottom",
     "CoilSupportBeams",
     "CoilSupportBeamsSorted",
+    "CoilSupportBeamsCSR",
+    "CoilSupportBeamsCSRSorted",
     "constraint_from_optimizable",
 ]

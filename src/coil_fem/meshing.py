@@ -181,7 +181,9 @@ def _build_disk_o_grid_topology_np(n_center: int, n_radial: int):
 # ============================================================================
 
 # JIT notes:
-def _rect_sweep_topology(M: int, N: int, O: int, mesh_type: str):
+def _rect_sweep_topology(
+    M: int, N: int, O: int, mesh_type: str, *, phi_span: float | None = None,
+):
     """Build rectangle-sweep mesh topology in (phi, u, v) parametric space.
 
     Returns per-node parametric coordinates and connectivity for a
@@ -192,13 +194,18 @@ def _rect_sweep_topology(M: int, N: int, O: int, mesh_type: str):
     Parameters
     ----------
     M : int
-        Number of phi slices (= ``framed_curve.curve.quadpoints.shape[0]``).
+        Closed sweep (``phi_span is None``): number of periodic phi slices
+        (= ``framed_curve.curve.quadpoints.shape[0]``).  Open sweep: number
+        of phi *cells*, so there are ``M + 1`` node slices.
     N : int
         Number of cross-section grid points in direction 1.
     O : int
         Number of cross-section grid points in direction 2.
     mesh_type : str
         ``'TET4'`` or ``'TET10'``.
+    phi_span : float or None
+        ``None`` (default) keeps the closed full-turn sweep.  A float opens
+        the sweep over ``[0, phi_span]`` with two free end faces.
 
     Returns
     -------
@@ -207,9 +214,8 @@ def _rect_sweep_topology(M: int, N: int, O: int, mesh_type: str):
     v_per_node : np.ndarray (num_nodes,)
         Parametric v-coordinate in ``[-1, 1]`` for each node.
     phi_idx : np.ndarray (num_nodes,) int32
-        Index into the phi-grid of length ``K = M*stride``, where
-        ``stride = 2`` for ``'TET10'`` (every odd index is a half-step
-        midside) and ``1`` for ``'TET4'``.
+        Index into the phi-grid.  Closed: length ``K = M*stride``.  Open:
+        length ``K = M*stride + 1`` (includes both end faces).
     cells : np.ndarray (num_cells, k) int32
         Connectivity.  ``k = 4`` (TET4) or ``k = 10`` (TET10).
     """
@@ -218,6 +224,8 @@ def _rect_sweep_topology(M: int, N: int, O: int, mesh_type: str):
             f"mesh_type must be 'TET4' or 'TET10', got {mesh_type!r}"
         )
     M = int(M); N = int(N); O = int(O)
+    closed = phi_span is None
+    n_slices = M if closed else M + 1
 
     u_grid = np.linspace(-1.0, 1.0, N)                       # (N,)
     v_grid = np.linspace(-1.0, 1.0, O)                       # (O,)
@@ -226,15 +234,17 @@ def _rect_sweep_topology(M: int, N: int, O: int, mesh_type: str):
     # ── Corner nodes ──
     # Linear index nidx(m, n, o) = m * (N*O) + n * O + o.
     mm, nn, oo = np.meshgrid(
-        np.arange(M), np.arange(N), np.arange(O), indexing='ij'
+        np.arange(n_slices), np.arange(N), np.arange(O), indexing='ij'
     )
-    u_corners = u_grid[nn].ravel()                           # (M*N*O,)
+    u_corners = u_grid[nn].ravel()                           # (n_slices*N*O,)
     v_corners = v_grid[oo].ravel()
     phi_corners = (stride * mm).ravel().astype(np.int32)
 
     # ── Hex connectivity (one hex per (m, n, o), n<N-1, o<O-1) ──
     def nidx(m, n, o):
-        return (m % M) * (N * O) + n * O + o
+        if closed:
+            return (m % M) * (N * O) + n * O + o
+        return m * (N * O) + n * O + o
 
     mh, nh, oh = np.meshgrid(
         np.arange(M), np.arange(N - 1), np.arange(O - 1), indexing='ij'
@@ -269,10 +279,9 @@ def _rect_sweep_topology(M: int, N: int, O: int, mesh_type: str):
     # For each of the 6 tet edges (VTK order) we form a canonical key from the
     # *global* (wrapped) corner-index pair and deduplicate.  Endpoint u/v come
     # straight from the corner arrays.  The phi index is the average of the two
-    # endpoints' *unwrapped* phi levels (2*m at slice m, 2*m+2 at slice m+1),
-    # taken mod 2M so the periodic seam (level 2M) wraps back to 0.  Edges that
-    # traverse phi therefore land on an odd (half-step) index, giving curved
-    # midsides in ``_rect_sweep_points``; in-slice edges stay on an even index.
+    # endpoints' *unwrapped* phi levels (2*m at slice m, 2*m+2 at slice m+1).
+    # Closed: taken mod 2M so the periodic seam (level 2M) wraps back to 0.
+    # Open: no wrap; half-steps land on odd indices in ``[0, 2M]``.
 
     # Unwrapped phi level (in stride-2 units) of each of the 8 hex corners.
     # Back face (slice m): v0, v3, v4, v7.  Front face (slice m+1): v1, v2, v5, v6.
@@ -303,23 +312,27 @@ def _rect_sweep_topology(M: int, N: int, O: int, mesh_type: str):
     v_mid = 0.5 * (v_corners[a] + v_corners[b])
 
     # Half-sum of the unwrapped phi levels, taken from a representative
-    # occurrence of each unique edge; mod 2M folds the seam (2M → 0).
+    # occurrence of each unique edge.  Closed: mod 2M folds the seam (2M → 0).
     edge_phi_half = (edge_phi[:, 0] + edge_phi[:, 1]) // 2    # (num_cells*6,)
-    phi_mid = (edge_phi_half[first_idx] % (stride * M)).astype(np.int32)
+    if closed:
+        phi_mid = (edge_phi_half[first_idx] % (stride * M)).astype(np.int32)
+    else:
+        phi_mid = edge_phi_half[first_idx].astype(np.int32)
 
     u_per_node = np.concatenate([u_corners, u_mid])
     v_per_node = np.concatenate([v_corners, v_mid])
     phi_idx = np.concatenate([phi_corners, phi_mid]).astype(np.int32)
 
-    base = M * N * O
+    base = n_slices * N * O
     mid_idx = (base + inv).reshape(-1, 6)                    # (num_cells, 6)
     cells_10 = np.concatenate([cells4, mid_idx], axis=1)     # (num_cells, 10)
     return u_per_node, v_per_node, phi_idx, cells_10.astype(np.int32)
 
 
-@partial(jax.jit, static_argnames=('mesh_type', 'N', 'O'))
+@partial(jax.jit, static_argnames=('mesh_type', 'N', 'O', 'M', 'phi_span'))
 def _rect_sweep_points(
     framed_curve, w1, w2, N: int, O: int, *, mesh_type: str,
+    M: int | None = None, phi_span: float | None = None,
 ):
     r"""Curved-edge rectangle-sweep mesh points as a pure-JAX expression.
 
@@ -334,13 +347,13 @@ def _rect_sweep_points(
 
     where :math:`\boldsymbol{\gamma}` is the centerline and
     :math:`(\mathbf{p}, \mathbf{q})` is the rotated cross-section frame.
-    Corner nodes use :math:`\varphi_i = m/M`; midside nodes on
-    phi-traversing edges use the half-step :math:`\varphi_i = (m+\tfrac12)/M`,
-    producing curved-sided TET10 elements.
+    Corner nodes use even phi-grid indices; midside nodes on
+    phi-traversing edges use the half-step, producing curved-sided TET10
+    elements.
 
-    The frame is evaluated on a single uniform phi-grid of length
-    ``K = stride*M`` via :meth:`FramedCurveJAX.rotated_frame_eval`
-    (analytic for centroid frame, fresh-grid scan for RMF).
+    The frame is evaluated on a single uniform phi-grid via
+    :meth:`FramedCurveJAX.rotated_frame_eval` (analytic for centroid frame,
+    fresh-grid scan for RMF).
 
     Parameters
     ----------
@@ -352,16 +365,36 @@ def _rect_sweep_points(
         ``n_grid_2 + 1`` in :func:`rectangle_sweep`).
     mesh_type : str (static)
         ``'TET4'`` or ``'TET10'``.
+    M : int or None (static)
+        Phi-cell count.  Defaults to ``framed_curve.curve.quadpoints.shape[0]``
+        when ``phi_span is None`` (closed).  Required when ``phi_span`` is set.
+    phi_span : float or None (static)
+        ``None`` (default) keeps the closed full-turn sweep.  A float opens
+        the sweep over ``[0, phi_span]``.
 
     Returns
     -------
     points : jax.Array, shape (num_nodes, 3)
     """
-    M = int(framed_curve.curve.quadpoints.shape[0])
-    u_np, v_np, phi_idx_np, _ = _rect_sweep_topology(M, N, O, mesh_type)
-    K = (2 * M) if mesh_type == 'TET10' else M
+    if M is None:
+        if phi_span is not None:
+            raise ValueError(
+                "_rect_sweep_points: M is required when phi_span is set."
+            )
+        M = int(framed_curve.curve.quadpoints.shape[0])
+    else:
+        M = int(M)
+    u_np, v_np, phi_idx_np, _ = _rect_sweep_topology(
+        M, N, O, mesh_type, phi_span=phi_span,
+    )
+    closed = phi_span is None
+    if closed:
+        K = (2 * M) if mesh_type == 'TET10' else M
+        phi_grid = jnp.linspace(0.0, 1.0, K, endpoint=False)
+    else:
+        K = (2 * M + 1) if mesh_type == 'TET10' else (M + 1)
+        phi_grid = jnp.linspace(0.0, float(phi_span), K, endpoint=True)
 
-    phi_grid = jnp.linspace(0.0, 1.0, K, endpoint=False)     # (K,)
     r0 = framed_curve.curve.gamma_eval(phi_grid)             # (K, 3)
     _, p, q = framed_curve.rotated_frame_eval(phi_grid)      # each (K, 3)
 
@@ -464,8 +497,10 @@ def rectangle_sweep(
     n_grid_2=None,
     aspect_ratio=1.0,
     mesh_type="TET4",
+    phi_span=None,
+    n_phi=None,
 ):
-    """Backward-compatible wrapper that builds a :class:`FramedCurveMeshRectangle`.
+    """ Backward-compatible wrapper that builds a :class:`FramedCurveMeshRectangle`.
 
     The mesh-generation logic now lives in :class:`FramedCurveMeshRectangle.__init__`;
     this function is a thin shim so existing callers keep working.  See
@@ -479,6 +514,7 @@ def rectangle_sweep(
         framed_curve, w1, w2,
         n_grid_1=n_grid_1, n_grid_2=n_grid_2,
         aspect_ratio=aspect_ratio, mesh_type=mesh_type,
+        phi_span=phi_span, n_phi=n_phi,
     )
 
 
@@ -762,6 +798,13 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
     used both here and in :meth:`mesh_points_from_dofs`, so init-time and
     forward-pass meshes are bit-identical.
 
+    By default the sweep is closed over a full turn.  Pass ``phi_span`` (and
+    ``n_phi``) for an open sector over ``[0, phi_span]`` with two free end
+    faces — used by the central support ring (CSR).  Note that
+    :meth:`attach_ref_coords` still reports ``phi_quad`` as if the sweep
+    spanned ``[0, 1]``; that field is only consumed by coil self-field
+    quadrature, which the CSR never uses.
+
     .. note::
         ``CoilFEM``'s volumetric Lorentz-force pipeline assumes cells whose
         cross-sections are **perpendicular to the coil centerline** (this matches
@@ -784,6 +827,13 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
         quadpoint (default 1.0 for roughly cubic elements).
     mesh_type : str
         ``'TET4'`` (straight) or ``'TET10'`` (curved isoparametric).
+    phi_span : float or None
+        ``None`` (default) keeps the closed full-turn sweep.  A float opens
+        the sweep over ``[0, phi_span]``; ``n_phi`` is then required.
+    n_phi : int or None
+        Number of phi *cells* for an open sweep.  Ignored when
+        ``phi_span is None`` (closed), where the cell count equals
+        ``framed_curve.curve.quadpoints.shape[0]``.
     """
 
     shape = 'rect'
@@ -791,22 +841,39 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
     def __init__(
         self, framed_curve, w1, w2, *,
         n_grid_1=None, n_grid_2=None, aspect_ratio=1.0, mesh_type="TET4",
+        phi_span=None, n_phi=None,
     ):
+        if phi_span is not None and n_phi is None:
+            raise ValueError(
+                "FramedCurveMeshRectangle: n_phi is required when phi_span is set."
+            )
+
+        ds = framed_curve.curve.incremental_arclength()
+        arclen = jnp.mean(ds)
+        if phi_span is None:
+            M = int(framed_curve.curve.quadpoints.shape[0])
+            length_per_quadpoint = arclen / M
+        else:
+            M = int(n_phi)
+            length_per_quadpoint = arclen * phi_span / M 
         if n_grid_1 is None or n_grid_2 is None:
-            ds = framed_curve.curve.incremental_arclength()
-            length_per_quadpoint = jnp.mean(ds) / ds.shape[0]
             target_size = length_per_quadpoint * aspect_ratio
             if n_grid_1 is None:
                 n_grid_1 = max(1, int(jnp.round(w1 / target_size)))
             if n_grid_2 is None:
                 n_grid_2 = max(1, int(jnp.round(w2 / target_size)))
 
-        M = int(framed_curve.curve.quadpoints.shape[0])
+
         N = n_grid_1 + 1   # node counts per cross-section direction
         O = n_grid_2 + 1
 
-        pts = _rect_sweep_points(framed_curve, w1, w2, N, O, mesh_type=mesh_type)
-        _, _, _, cells = _rect_sweep_topology(M, N, O, mesh_type)
+        pts = _rect_sweep_points(
+            framed_curve, w1, w2, N, O, mesh_type=mesh_type,
+            M=M, phi_span=phi_span,
+        )
+        u_per_node, v_per_node, phi_idx, cells = _rect_sweep_topology(
+            M, N, O, mesh_type, phi_span=phi_span,
+        )
         super().__init__(pts, cells, ele_type=mesh_type)
 
         # Rectangle-specific metadata. n_grid_1/n_grid_2 store NODE counts (N, O).
@@ -814,6 +881,12 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
         self.w2 = float(w2)
         self.n_grid_1 = int(N)
         self.n_grid_2 = int(O)
+        self.phi_span = None if phi_span is None else float(phi_span)
+        self.n_phi_cells = int(M)
+        # Parametric node coords for seam pairing (CSR open-sweep reduction).
+        self.u_per_node = np.asarray(u_per_node, dtype=np.float64)
+        self.v_per_node = np.asarray(v_per_node, dtype=np.float64)
+        self.phi_idx_per_node = np.asarray(phi_idx, dtype=np.int32)
 
         n_per_phi = (N - 1) * (O - 1) * 6   # KUHN-6 tets per phi-slice
         phi_cell_idx = np.repeat(np.arange(M, dtype=np.int32), n_per_phi)
@@ -829,6 +902,7 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
         return _rect_sweep_points(
             fc, self.w1, self.w2, self.n_grid_1, self.n_grid_2,
             mesh_type=self.ele_type,
+            M=self.n_phi_cells, phi_span=self.phi_span,
         )
 
     def _compute_uv_quad(self, corners_np, sv_np, is_tet10):

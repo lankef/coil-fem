@@ -34,6 +34,8 @@ _DPHI_TO_PHI = {
     'dphis_start_cc': 'phis_start_cc',
     'dphis_end_cc': 'phis_end_cc',
     'dphis_start_cf': 'phis_start_cf',
+    'dphis_start_cr': 'phis_start_cr',
+    'dphis_end_cr': 'phis_end_cr',
 }
 _PHI_TO_DPHI = {v: k for k, v in _DPHI_TO_PHI.items()}
 _ANGLE_UNIT_KEYS = frozenset(_DPHI_TO_PHI) | frozenset(_PHI_TO_DPHI)
@@ -100,14 +102,35 @@ def _vjp_dphis(grad_phi_dofs: dict) -> dict:
 
 
 class _SortedDphisMixin:
-    """Decode stored ``dphis*`` for the FEM; pull grads back in ``flatten_grad``."""
+    """Decode stored ``dphis*`` for the FEM; pull grads back in ``flatten_grad``.
+
+    When ``dphis_end_cc`` is present, the two stellsym wrap groups use
+    ``phis_end = 1 - cumsum(dphis_end)`` (see
+    :func:`~coil_fem.simsopt.coil_support_beams._decode_end_cc`).  Subclasses
+    that use that key must set ``_sorted_stellsym`` before the first
+    ``support_dofs`` / ``flatten_grad`` call.
+    """
 
     @property
     def support_dofs(self) -> dict:
-        return _decode_dphis(self._unravel(jnp.asarray(self.local_full_x)))
+        raw = self._unravel(jnp.asarray(self.local_full_x))
+        out = _decode_dphis(raw)
+        if 'dphis_end_cc' in raw:
+            # Lazy import avoids a circular dependency with coil_support_beams.
+            from .coil_support_beams import _decode_end_cc
+            out['phis_end_cc'] = _decode_end_cc(
+                raw['dphis_end_cc'], self._sorted_stellsym,
+            )
+        return out
 
     def flatten_grad(self, grad_dofs: dict) -> np.ndarray:
-        return np.asarray(ravel_pytree(_vjp_dphis(grad_dofs))[0], dtype=float)
+        g = _vjp_dphis(grad_dofs)
+        if 'phis_end_cc' in grad_dofs:
+            from .coil_support_beams import _vjp_end_cc
+            g['dphis_end_cc'] = _vjp_end_cc(
+                grad_dofs['phis_end_cc'], self._sorted_stellsym,
+            )
+        return np.asarray(ravel_pytree(g)[0], dtype=float)
 
 
 # ============================================================================
