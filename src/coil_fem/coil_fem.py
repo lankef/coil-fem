@@ -1225,6 +1225,8 @@ class CoilFEM:
         ``{prefix}_beams.vtu`` when ``base_support_dofs`` is provided — one
         line per beam on the free span ``[ξ_start, ξ_end]`` with cell field
         ``beam_length`` equal to ``L_eff``.
+        :class:`~coil_fem.coupling.SupportBeamsCSR` additionally writes
+        ``{prefix}_csr.vtu`` with the same weight point fields on the ring.
 
         Parameters
         ----------
@@ -1313,6 +1315,51 @@ class CoilFEM:
                 },
             ).write(beam_path)
             written.append(beam_path)
+        else:
+            geom = None
+
+        if base_support_dofs is not None and hasattr(self.support, 'csr_mesh'):
+            csr_mesh = self.support.csr_mesh
+            csr_pts = onp.asarray(
+                csr_mesh.mesh_points_from_dofs(
+                    base_support_dofs['csr_curve_dofs']
+                ),
+                dtype=onp.float64,
+            )
+            pt_data = {}
+            if hasattr(self.support, 'csr_attachment_weights'):
+                if geom is None:
+                    geom = self.support.beam_geometry(
+                        curves_jax, base_support_dofs,
+                    )
+                surf_idx = onp.asarray(
+                    self.support._csr_pipeline.surface_node_indices,
+                    dtype=onp.int32,
+                )
+                w_g, w_a = self.support.csr_attachment_weights(
+                    geom, base_support_dofs,
+                )
+                n_nodes = csr_pts.shape[0]
+                w_g_full = onp.zeros(n_nodes, dtype=onp.float64)
+                w_a_full = onp.zeros(n_nodes, dtype=onp.float64)
+                w_g_full[surf_idx] = onp.asarray(w_g, dtype=onp.float64)
+                w_a_full[surf_idx] = onp.asarray(w_a, dtype=onp.float64)
+                pt_data = {
+                    "w_clamp": w_g_full,
+                    "w_attach": w_a_full,
+                    "k_clamp_Npm3": w_g_full * k_clamp,
+                    "k_attach_Npm3": w_a_full * k_attach,
+                }
+            csr_path = os.path.join(out_dir, f"{prefix}_csr.vtu")
+            meshio.Mesh(
+                points=csr_pts,
+                cells=[(
+                    csr_mesh.meshio_cell_type,
+                    onp.asarray(csr_mesh.cells, dtype=onp.int32),
+                )],
+                point_data=pt_data,
+            ).write(csr_path)
+            written.append(csr_path)
 
         return written
 
@@ -1708,6 +1755,7 @@ class CoilFEM:
             written.append(mesh_path)
 
         # ── Beam free-span displacement (SupportBeams only) ───────────────────
+        geom = None
         if (base_support_dofs is not None and result['u_s'] is not None
                 and hasattr(self.support, 'beam_displacement')
                 and self.support.n_beams_total > 0):
@@ -1750,5 +1798,53 @@ class CoilFEM:
                 },
             ).write(beam_path)
             written.append(beam_path)
+
+        if (base_support_dofs is not None and result['u_s'] is not None
+                and hasattr(self.support, 'csr_displacement')):
+            csr_mesh = self.support.csr_mesh
+            csr_pts = onp.asarray(
+                csr_mesh.mesh_points_from_dofs(
+                    base_support_dofs['csr_curve_dofs']
+                ),
+                dtype=onp.float64,
+            )
+            csr_disp = onp.asarray(
+                self.support.csr_displacement(result['u_s']),
+                dtype=onp.float64,
+            )
+            pt_data = {"displacement_m": csr_disp}
+            if hasattr(self.support, 'csr_attachment_weights'):
+                if geom is None:
+                    geom = self.support.beam_geometry(
+                        curves_jax, base_support_dofs,
+                    )
+                surf_idx = onp.asarray(
+                    self.support._csr_pipeline.surface_node_indices,
+                    dtype=onp.int32,
+                )
+                w_g, w_a = self.support.csr_attachment_weights(
+                    geom, base_support_dofs,
+                )
+                n_nodes = csr_pts.shape[0]
+                w_g_full = onp.zeros(n_nodes, dtype=onp.float64)
+                w_a_full = onp.zeros(n_nodes, dtype=onp.float64)
+                w_g_full[surf_idx] = onp.asarray(w_g, dtype=onp.float64)
+                w_a_full[surf_idx] = onp.asarray(w_a, dtype=onp.float64)
+                pt_data.update({
+                    "w_clamp": w_g_full,
+                    "w_attach": w_a_full,
+                    "k_clamp_Npm3": w_g_full * k_clamp,
+                    "k_attach_Npm3": w_a_full * k_attach,
+                })
+            csr_path = os.path.join(out_dir, f"{prefix}_csr.vtu")
+            meshio.Mesh(
+                points=csr_pts,
+                cells=[(
+                    csr_mesh.meshio_cell_type,
+                    onp.asarray(csr_mesh.cells, dtype=onp.int32),
+                )],
+                point_data=pt_data,
+            ).write(csr_path)
+            written.append(csr_path)
 
         return written

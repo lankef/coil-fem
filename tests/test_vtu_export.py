@@ -180,6 +180,115 @@ def test_save_run_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
     )
 
 
+# ============================================================================
+# save_run_vtu CSR file (SupportBeamsCSR)
+# ============================================================================
+
+def _section_fn_with_cr(sdofs):
+    """Ragged cross-section including CR beams."""
+    phi_cc = sdofs['phis_start_cc']
+    phi_cf = sdofs['phis_start_cf']
+    phi_cr = sdofs.get('phis_start_cr', [jnp.zeros(0)] * len(phi_cc))
+    A, Iy, Iz, J = [], [], [], []
+    for g in range(len(phi_cc)):
+        n_cf = phi_cf[g].shape[0] if g < len(phi_cf) else 0
+        n_cr = phi_cr[g].shape[0] if g < len(phi_cr) else 0
+        n_per = phi_cc[g].shape[0] + n_cf + n_cr
+        A.append(jnp.full((n_per,), 1e-4))
+        Iy.append(jnp.full((n_per,), 1e-8))
+        Iz.append(jnp.full((n_per,), 1e-8))
+        J.append(jnp.full((n_per,), 2e-8))
+    return A, Iy, Iz, J
+
+
+def _make_coilfem_with_csr() -> tuple[CoilFEM, CurveXYZFourierJAX, dict]:
+    """Single coil + one CR beam + CSR ring (CPU / umfpack)."""
+    from coil_fem.coupling import SupportBeamsCSR
+
+    quadpoints = jnp.linspace(0.0, 1.0, 8, endpoint=False)
+    dofs = jnp.array([0.0, 1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2])
+    curve = CurveXYZFourierJAX(quadpoints, dofs, order=1)
+
+    support = SupportBeamsCSR(
+        nfp=2,
+        stellsym=False,
+        beam_options={
+            'n_beam_cc': 0, 'n_beam_cf': 0, 'n_beam_cr': 1,
+            'E': 200e9, 'nu': 0.3, 'k_attachment': 1e8,
+        },
+        n_base=1,
+        cross_section_fn=_section_fn_with_cr,
+        attachment_fn=_uniform_clamp_fn,
+        csr_options={
+            'order': 1, 'w1': 0.08, 'w2': 0.08, 'n_phi': 4,
+            'n_grid_1': 1, 'n_grid_2': 1, 'E': 200e9, 'nu': 0.3,
+        },
+        problem_options={'solver': 'umfpack'},
+    )
+    fem = CoilFEM(
+        base_curves_jax=[curve],
+        base_currents_jax=jnp.array([1.0]),
+        nfp=2,
+        stellsym=False,
+        mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
+                      'n_grid_1': 1, 'n_grid_2': 1},
+        support=support,
+        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        problem_options={'solver': 'umfpack'},
+        coupling='staggered',
+    )
+    csr_dofs = jnp.zeros(support._csr_curve_template.dofs.shape)
+    csr_dofs = csr_dofs.at[0].set(1.0)
+    sdofs = {
+        'phis_start_cc': [jnp.zeros(0)],
+        'phis_end_cc': [jnp.zeros(0)],
+        'phis_start_cf': [jnp.zeros(0)],
+        'x_foundation': [jnp.zeros((0, 3))],
+        'thetas_orientation_cc': [jnp.zeros(0)],
+        'thetas_orientation_cf': [jnp.zeros(0)],
+        'phis_start_cr': [jnp.array([0.25])],
+        'phis_end_cr': [jnp.array([0.1])],
+        'v_end_cr': [jnp.array([0.0])],
+        'thetas_orientation_cr': [jnp.array([0.0])],
+        'csr_curve_dofs': csr_dofs,
+    }
+    return fem, curve, sdofs
+
+
+def test_save_run_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
+    """save_run_vtu writes {prefix}_csr.vtu with w_attach and displacement."""
+    fem, curve, sdofs = _make_coilfem_with_csr()
+    support = fem.support
+
+    pipeline = fem.pipelines[0]
+    n_quads = pipeline.problem.fes[0].num_quads
+    n_cells = pipeline.problem.num_cells
+    pts = fem.meshes[0].mesh_points_from_dofs(curve.dofs)
+    n_nodes = pts.shape[0]
+    u_s = jnp.zeros(support.n_support_dofs)
+
+    fake_result = {
+        'mesh_points': [pts],
+        'displacements': [jnp.zeros((n_nodes, 3))],
+        'von_mises': [jnp.zeros((n_cells, n_quads))],
+        'f_vol': [jnp.zeros((n_cells, n_quads, 3))],
+        'B_self': [jnp.zeros((n_cells, n_quads, 3))],
+        'B_ext': [jnp.zeros((n_cells, n_quads, 3))],
+        'u_s': u_s,
+    }
+    monkeypatch.setattr(fem, 'run', lambda **kwargs: fake_result)
+
+    written = fem.save_run_vtu(str(tmp_path), base_support_dofs=sdofs)
+    csr_path = next(p for p in written if p.endswith('_csr.vtu'))
+    mesh = meshio.read(csr_path)
+    for key in (
+        'displacement_m',
+        'w_clamp', 'w_attach', 'k_clamp_Npm3', 'k_attach_Npm3',
+    ):
+        assert key in mesh.point_data, f"missing CSR VTU point field {key!r}"
+    assert float(np.max(mesh.point_data['w_attach'])) > 0.0
+
+
 if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as d:
