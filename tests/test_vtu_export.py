@@ -265,7 +265,11 @@ def test_save_run_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
     n_cells = pipeline.problem.num_cells
     pts = fem.meshes[0].mesh_points_from_dofs(curve.dofs)
     n_nodes = pts.shape[0]
+    rng = np.random.default_rng(0)
     u_s = jnp.zeros(support.n_support_dofs)
+    u_s = u_s.at[support._csr_dof_offset:].set(
+        jnp.asarray(1e-4 * rng.normal(size=(support._n_csr_dofs,)))
+    )
 
     fake_result = {
         'mesh_points': [pts],
@@ -275,6 +279,7 @@ def test_save_run_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
         'B_self': [jnp.zeros((n_cells, n_quads, 3))],
         'B_ext': [jnp.zeros((n_cells, n_quads, 3))],
         'u_s': u_s,
+        'support_continuum': [],
     }
     monkeypatch.setattr(fem, 'run', lambda **kwargs: fake_result)
 
@@ -287,6 +292,48 @@ def test_save_run_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
     ):
         assert key in mesh.point_data, f"missing CSR VTU point field {key!r}"
     assert float(np.max(mesh.point_data['w_attach'])) > 0.0
+
+
+def test_save_run_vtu_writes_csr_von_mises(tmp_path, monkeypatch):
+    """save_run_vtu includes von_mises_MPa cell data on the CSR mesh."""
+    fem, curve, sdofs = _make_coilfem_with_csr()
+    support = fem.support
+
+    pipeline = fem.pipelines[0]
+    n_quads = pipeline.problem.fes[0].num_quads
+    n_cells = pipeline.problem.num_cells
+    pts = fem.meshes[0].mesh_points_from_dofs(curve.dofs)
+    n_nodes = pts.shape[0]
+    rng = np.random.default_rng(0)
+    u_s = jnp.zeros(support.n_support_dofs)
+    u_s = u_s.at[support._csr_dof_offset:].set(
+        jnp.asarray(1e-4 * rng.normal(size=(support._n_csr_dofs,)))
+    )
+
+    fake_result = {
+        'mesh_points': [pts],
+        'displacements': [jnp.zeros((n_nodes, 3))],
+        'von_mises': [jnp.zeros((n_cells, n_quads))],
+        'f_vol': [jnp.zeros((n_cells, n_quads, 3))],
+        'B_self': [jnp.zeros((n_cells, n_quads, 3))],
+        'B_ext': [jnp.zeros((n_cells, n_quads, 3))],
+        'u_s': u_s,
+        'support_continuum': [],
+    }
+    monkeypatch.setattr(fem, 'run', lambda **kwargs: fake_result)
+
+    written = fem.save_run_vtu(str(tmp_path), base_support_dofs=sdofs)
+    csr_path = next(p for p in written if p.endswith('_csr.vtu'))
+    mesh = meshio.read(csr_path)
+    assert 'von_mises_MPa' in mesh.cell_data
+    assert float(np.max(mesh.cell_data['von_mises_MPa'][0])) > 0.0
+
+
+def test_continuum_members_empty_for_base_and_beams():
+    """Support and SupportBeams publish no continuum members."""
+    assert Support(k_clamp=1.0).continuum_members == ()
+    fem, _curve, _sdofs = _make_coilfem_with_beams()
+    assert fem.support.continuum_members == ()
 
 
 if __name__ == "__main__":

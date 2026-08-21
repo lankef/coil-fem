@@ -75,7 +75,7 @@ def _v_end_cr_linspace(n_beam_cr):
     return out
 
 
-def _min_R_phi_window_list(base_coils, n_beam_cr, width=0.25):
+def _min_R_phi_window_list(base_coils, n_beam_cr, width=0.1):
     """``phis_start_cr`` in a width-``width`` window around min cylindrical R.
 
     For each coil, sample ``gamma`` on its quadpoints, take

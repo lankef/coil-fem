@@ -10,10 +10,50 @@ extend the model with inter-coil coupling.
 
 from __future__ import annotations
 
-from typing import Callable
+import dataclasses
+from typing import TYPE_CHECKING, Callable
 
 import jax
 import jax.numpy as jnp
+
+if TYPE_CHECKING:
+    from ..pipelines import ElasticPipeline
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class ContinuumMember:
+    """Support-side continuum FEM domain (e.g. a central support ring).
+
+    Published by :attr:`Support.continuum_members` so
+    :class:`~coil_fem.CoilFEM` can include the member in structural metrics
+    and VTU export without knowing the subclass.
+
+    Parameters
+    ----------
+    name : str
+        Short identifier used in VTU filenames (e.g. ``"csr"``).
+    pipeline : ElasticPipeline
+        Own mesh / problem / Lamé parameters.
+    sym_weight : float
+        Multiplier for extensive metrics (``l2_von_mises``, ``strain_energy``,
+        …) so a one-period mesh represents the full symmetric structure.
+        Peak metrics ignore this weight.
+    mesh_points : callable
+        ``mesh_points(support_dofs) -> (n_nodes, 3)``.
+    solution : callable
+        ``solution(u_s, support_dofs) -> sol_list`` with ``sol_list[0]`` of
+        shape ``(n_nodes, 3)``.
+    vtu_point_data : callable
+        ``vtu_point_data(curves_jax, support_dofs, u_s) -> dict`` of
+        numpy point-data arrays for VTU (may ignore ``u_s``).
+    """
+
+    name: str
+    pipeline: ElasticPipeline
+    sym_weight: float
+    mesh_points: Callable
+    solution: Callable
+    vtu_point_data: Callable
 
 
 class Support:
@@ -77,6 +117,16 @@ class Support:
     def is_coupled(self) -> bool:
         """``False`` — no DOFs couple to the coil in the grounded-support case."""
         return False
+
+    @property
+    def continuum_members(self) -> tuple[ContinuumMember, ...]:
+        """Support-side continuum FEM domains for metrics and VTU.
+
+        Empty for the grounded base support and for beam-only subclasses.
+        Coupled subclasses that own a volumetric mesh (e.g.
+        :class:`~coil_fem.coupling.SupportBeamsCSR`) override this.
+        """
+        return ()
 
     @property
     def matrix_symmetry(self) -> str:

@@ -852,17 +852,15 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
         arclen = jnp.mean(ds)
         if phi_span is None:
             M = int(framed_curve.curve.quadpoints.shape[0])
-            length_per_quadpoint = arclen / M
         else:
             M = int(n_phi)
-            length_per_quadpoint = arclen * phi_span / M 
+        length_per_quadpoint = arclen / M 
         if n_grid_1 is None or n_grid_2 is None:
             target_size = length_per_quadpoint * aspect_ratio
             if n_grid_1 is None:
                 n_grid_1 = max(1, int(jnp.round(w1 / target_size)))
             if n_grid_2 is None:
                 n_grid_2 = max(1, int(jnp.round(w2 / target_size)))
-
 
         N = n_grid_1 + 1   # node counts per cross-section direction
         O = n_grid_2 + 1

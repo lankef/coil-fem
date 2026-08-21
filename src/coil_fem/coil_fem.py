@@ -914,6 +914,10 @@ class CoilFEM:
           per-node ``(translation, rotation)`` breakdown, or evaluate
           ``self.support.beam_displacement(geom, result['u_s'], xi)`` for the
           closed-form displacement along each beam.
+        * ``'support_continuum'`` -- list of dicts, one per
+          :attr:`~coil_fem.coupling.Support.continuum_members` entry (empty
+          when the support has none).  Each dict has keys ``'name'``,
+          ``'sol_list'``, ``'von_mises'``, and ``'mesh_points'``.
         """
         n_base = len(self.base_curves_jax)
         if base_curves_dofs is None:
@@ -937,6 +941,19 @@ class CoilFEM:
             for i in range(n_base)
         ]
 
+        support_continuum = []
+        u_s = solved['u_s']
+        if u_s is not None and base_support_dofs is not None:
+            for member in self.support.continuum_members:
+                sol_m = member.solution(u_s, base_support_dofs)
+                pts_m = member.mesh_points(base_support_dofs)
+                support_continuum.append({
+                    'name': member.name,
+                    'sol_list': sol_m,
+                    'von_mises': member.pipeline.problem.von_mises_stress(sol_m),
+                    'mesh_points': pts_m,
+                })
+
         sol_list = solved['sol_list_by_coil']
         return {
             'solutions':       sol_list,                     # list[list[array(n_nodes, 3)]]
@@ -948,6 +965,7 @@ class CoilFEM:
             'B_self':          solved['B_self_by_coil'],     # list of (n_cells, n_quads, 3) [T]
             'B_ext':           solved['B_ext_by_coil'],      # list of (n_cells, n_quads, 3) [T]
             'u_s':             solved['u_s'],                # (n_support_dofs,) or None
+            'support_continuum': support_continuum,
         }
 
     def compute_strain_tensors(
@@ -1132,6 +1150,28 @@ class CoilFEM:
                 else:
                     totals[m] = totals[m] + val_i
 
+        # ── Support continuum members (e.g. CSR ring) ─────────────────────────
+        u_s = solved['u_s']
+        if u_s is not None and base_support_dofs is not None:
+            sdofs = base_support_dofs
+            for member in self.support.continuum_members:
+                pts_m = member.mesh_points(sdofs)
+                prob_m = member.pipeline.problem
+                sg_m, jxw_m, _, _ = recompute_fe_geometry(
+                    pts_m, prob_m._cells_jnp, prob_m._sg_ref,
+                    prob_m._sv, prob_m._qw,
+                )
+                sol_m = member.solution(u_s, sdofs)
+                for m, fn in zip(metrics, metric_fns):
+                    val_m = fn(
+                        prob_m, sol_m, member.pipeline.lam, member.pipeline.mu,
+                        shape_grads=sg_m, JxW=jxw_m,
+                    )
+                    if m in _METRIC_REGISTRY_MAX:
+                        totals[m] = jnp.maximum(totals[m], val_m)
+                    else:
+                        totals[m] = totals[m] + member.sym_weight * val_m
+
         return totals
 
     # ============================================================================
@@ -1225,8 +1265,9 @@ class CoilFEM:
         ``{prefix}_beams.vtu`` when ``base_support_dofs`` is provided — one
         line per beam on the free span ``[ξ_start, ξ_end]`` with cell field
         ``beam_length`` equal to ``L_eff``.
-        :class:`~coil_fem.coupling.SupportBeamsCSR` additionally writes
-        ``{prefix}_csr.vtu`` with the same weight point fields on the ring.
+        Each :attr:`~coil_fem.coupling.Support.continuum_members` entry
+        additionally writes ``{prefix}_{name}.vtu`` with the same weight
+        point fields on that mesh.
 
         Parameters
         ----------
@@ -1315,51 +1356,26 @@ class CoilFEM:
                 },
             ).write(beam_path)
             written.append(beam_path)
-        else:
-            geom = None
 
-        if base_support_dofs is not None and hasattr(self.support, 'csr_mesh'):
-            csr_mesh = self.support.csr_mesh
-            csr_pts = onp.asarray(
-                csr_mesh.mesh_points_from_dofs(
-                    base_support_dofs['csr_curve_dofs']
-                ),
-                dtype=onp.float64,
-            )
-            pt_data = {}
-            if hasattr(self.support, 'csr_attachment_weights'):
-                if geom is None:
-                    geom = self.support.beam_geometry(
-                        curves_jax, base_support_dofs,
-                    )
-                surf_idx = onp.asarray(
-                    self.support._csr_pipeline.surface_node_indices,
-                    dtype=onp.int32,
+        if base_support_dofs is not None:
+            for member in self.support.continuum_members:
+                mesh = member.pipeline.mesh
+                pts_np = onp.asarray(
+                    member.mesh_points(base_support_dofs), dtype=onp.float64,
                 )
-                w_g, w_a = self.support.csr_attachment_weights(
-                    geom, base_support_dofs,
+                pt_data = member.vtu_point_data(
+                    curves_jax, base_support_dofs, None,
                 )
-                n_nodes = csr_pts.shape[0]
-                w_g_full = onp.zeros(n_nodes, dtype=onp.float64)
-                w_a_full = onp.zeros(n_nodes, dtype=onp.float64)
-                w_g_full[surf_idx] = onp.asarray(w_g, dtype=onp.float64)
-                w_a_full[surf_idx] = onp.asarray(w_a, dtype=onp.float64)
-                pt_data = {
-                    "w_clamp": w_g_full,
-                    "w_attach": w_a_full,
-                    "k_clamp_Npm3": w_g_full * k_clamp,
-                    "k_attach_Npm3": w_a_full * k_attach,
-                }
-            csr_path = os.path.join(out_dir, f"{prefix}_csr.vtu")
-            meshio.Mesh(
-                points=csr_pts,
-                cells=[(
-                    csr_mesh.meshio_cell_type,
-                    onp.asarray(csr_mesh.cells, dtype=onp.int32),
-                )],
-                point_data=pt_data,
-            ).write(csr_path)
-            written.append(csr_path)
+                member_path = os.path.join(out_dir, f"{prefix}_{member.name}.vtu")
+                meshio.Mesh(
+                    points=pts_np,
+                    cells=[(
+                        mesh.meshio_cell_type,
+                        onp.asarray(mesh.cells, dtype=onp.int32),
+                    )],
+                    point_data=pt_data,
+                ).write(member_path)
+                written.append(member_path)
 
         return written
 
@@ -1755,7 +1771,6 @@ class CoilFEM:
             written.append(mesh_path)
 
         # ── Beam free-span displacement (SupportBeams only) ───────────────────
-        geom = None
         if (base_support_dofs is not None and result['u_s'] is not None
                 and hasattr(self.support, 'beam_displacement')
                 and self.support.n_beams_total > 0):
@@ -1799,52 +1814,38 @@ class CoilFEM:
             ).write(beam_path)
             written.append(beam_path)
 
-        if (base_support_dofs is not None and result['u_s'] is not None
-                and hasattr(self.support, 'csr_displacement')):
-            csr_mesh = self.support.csr_mesh
-            csr_pts = onp.asarray(
-                csr_mesh.mesh_points_from_dofs(
-                    base_support_dofs['csr_curve_dofs']
-                ),
-                dtype=onp.float64,
-            )
-            csr_disp = onp.asarray(
-                self.support.csr_displacement(result['u_s']),
-                dtype=onp.float64,
-            )
-            pt_data = {"displacement_m": csr_disp}
-            if hasattr(self.support, 'csr_attachment_weights'):
-                if geom is None:
-                    geom = self.support.beam_geometry(
-                        curves_jax, base_support_dofs,
-                    )
-                surf_idx = onp.asarray(
-                    self.support._csr_pipeline.surface_node_indices,
-                    dtype=onp.int32,
+        # ── Support continuum members (e.g. CSR ring) ─────────────────────────
+        if base_support_dofs is not None and result['u_s'] is not None:
+            for member in self.support.continuum_members:
+                mesh = member.pipeline.mesh
+                pts_np = onp.asarray(
+                    member.mesh_points(base_support_dofs), dtype=onp.float64,
                 )
-                w_g, w_a = self.support.csr_attachment_weights(
-                    geom, base_support_dofs,
+                sol_m = member.solution(result['u_s'], base_support_dofs)
+                disp = onp.asarray(sol_m[0], dtype=onp.float64)
+                vm_mpa = onp.asarray(
+                    jnp.mean(
+                        member.pipeline.problem.von_mises_stress(sol_m),
+                        axis=-1,
+                    ) / 1e6,
+                    dtype=onp.float64,
                 )
-                n_nodes = csr_pts.shape[0]
-                w_g_full = onp.zeros(n_nodes, dtype=onp.float64)
-                w_a_full = onp.zeros(n_nodes, dtype=onp.float64)
-                w_g_full[surf_idx] = onp.asarray(w_g, dtype=onp.float64)
-                w_a_full[surf_idx] = onp.asarray(w_a, dtype=onp.float64)
-                pt_data.update({
-                    "w_clamp": w_g_full,
-                    "w_attach": w_a_full,
-                    "k_clamp_Npm3": w_g_full * k_clamp,
-                    "k_attach_Npm3": w_a_full * k_attach,
-                })
-            csr_path = os.path.join(out_dir, f"{prefix}_csr.vtu")
-            meshio.Mesh(
-                points=csr_pts,
-                cells=[(
-                    csr_mesh.meshio_cell_type,
-                    onp.asarray(csr_mesh.cells, dtype=onp.int32),
-                )],
-                point_data=pt_data,
-            ).write(csr_path)
-            written.append(csr_path)
+                pt_data = {
+                    "displacement_m": disp,
+                    **member.vtu_point_data(
+                        curves_jax, base_support_dofs, result['u_s'],
+                    ),
+                }
+                member_path = os.path.join(out_dir, f"{prefix}_{member.name}.vtu")
+                meshio.Mesh(
+                    points=pts_np,
+                    cells=[(
+                        mesh.meshio_cell_type,
+                        onp.asarray(mesh.cells, dtype=onp.int32),
+                    )],
+                    point_data=pt_data,
+                    cell_data={"von_mises_MPa": [vm_mpa]},
+                ).write(member_path)
+                written.append(member_path)
 
         return written
