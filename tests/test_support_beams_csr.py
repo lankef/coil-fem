@@ -423,13 +423,14 @@ def test_taylor_objective_v_end_cr_and_csr_curve_dofs():
 # ============================================================================
 
 def test_csr_displacement_enforces_periodic_tie():
-    """``csr_displacement`` always expands slaves as ``Q @ u_near``."""
+    """``continuum_members[0].solution`` always expands slaves as ``Q @ u_near``."""
     sb = _make_csr(nfp=2, n_beam_cr=0, n_phi=4)
     rng = np.random.default_rng(0)
     u_s = jnp.zeros(sb.n_support_dofs)
     u_red = jnp.asarray(rng.normal(size=(sb._n_csr_dofs,)))
     u_s = u_s.at[sb._csr_dof_offset:].set(u_red)
-    u = np.asarray(sb.csr_displacement(u_s))
+    member = sb.continuum_members[0]
+    u = np.asarray(member.solution(u_s, {})[0])
     phi_idx = sb.csr_mesh.phi_idx_per_node
     near = np.where(phi_idx == 0)[0]
     far = np.where(phi_idx == phi_idx.max())[0]
@@ -565,7 +566,8 @@ def test_monolithic_csr_forward_finite_and_seam():
         raise
 
     assert jnp.all(jnp.isfinite(out['u_s']))
-    u = np.asarray(support.csr_displacement(out['u_s']))
+    member = support.continuum_members[0]
+    u = np.asarray(member.solution(out['u_s'], sd)[0])
     phi_idx = support.csr_mesh.phi_idx_per_node
     near = np.where(phi_idx == 0)[0]
     far = np.where(phi_idx == phi_idx.max())[0]
@@ -578,6 +580,10 @@ def test_monolithic_csr_forward_finite_and_seam():
         err = max(err, float(np.linalg.norm(u[i_far] - Q @ u[masters[0]])))
     u_scale = max(float(np.max(np.abs(u))), 1e-12)
     assert err / u_scale < 1e-6, f"seam err={err}, scale={u_scale}"
+
+    assert len(out['support_continuum']) == 1
+    assert out['support_continuum'][0]['name'] == 'csr'
+    assert out['support_continuum'][0]['von_mises'].shape[0] > 0
 
     static = fem.monolithic_static
     inertia = getattr(static, 'inertia', None)
@@ -609,3 +615,83 @@ def test_open_phi_span_mesh_has_free_ends():
     near = np.sum(sb.csr_mesh.phi_idx_per_node == 0)
     far = np.sum(sb.csr_mesh.phi_idx_per_node == 5)
     assert near == far > 0
+
+
+# ============================================================================
+# Continuum members
+# ============================================================================
+
+def test_continuum_members_shape():
+    """SupportBeamsCSR publishes one CSR continuum member."""
+    sb = _make_csr(nfp=2, stellsym=True, n_beam_cr=1)
+    members = sb.continuum_members
+    assert len(members) == 1
+    m = members[0]
+    assert m.name == 'csr'
+    assert m.pipeline is sb._csr_pipeline
+    assert m.sym_weight == pytest.approx(2 * (1 + 1))
+
+
+def test_continuum_members_empty_for_base_support():
+    """Grounded Support and beam-only SupportBeams expose no continuum."""
+    from coil_fem.coupling import Support, SupportBeams
+
+    assert Support(k_clamp=1.0).continuum_members == ()
+
+    beams = SupportBeams(
+        nfp=2,
+        stellsym=False,
+        beam_options={
+            'n_beam_cc': 0, 'n_beam_cf': 1,
+            'E': 200e9, 'nu': 0.3, 'k_attachment': 1e8,
+        },
+        n_base=1,
+        cross_section_fn=lambda sd: (
+            [jnp.full((1,), 1e-4)],
+            [jnp.full((1,), 1e-8)],
+            [jnp.full((1,), 1e-8)],
+            [jnp.full((1,), 2e-8)],
+        ),
+        attachment_fn=_uniform_clamp,
+        fixed_clamp_options={'k_clamp': 1e8},
+    )
+    assert beams.continuum_members == ()
+
+
+def test_csr_l2_von_mises_taylor_csr_dofs():
+    """∂(sym_weight · l2_von_mises)/∂R_csr is finite via continuum_members."""
+    from coil_fem.metrics import l2_von_mises
+    from coil_fem.problems import recompute_fe_geometry
+
+    sb = _make_csr(nfp=2, stellsym=False, n_beam_cr=1, n_phi=4)
+    member = sb.continuum_members[0]
+    sd0 = _support_dofs_cr(sb, phi_start=0.3, phi_end=0.12, v_end=0.0, R_csr=1.0)
+
+    rng = np.random.default_rng(1)
+    u_s = jnp.zeros(sb.n_support_dofs)
+    u_s = u_s.at[sb._csr_dof_offset:].set(
+        jnp.asarray(1e-4 * rng.normal(size=(sb._n_csr_dofs,)))
+    )
+
+    def J_of(R):
+        sd = {**sd0, 'csr_curve_dofs': _csr_curve_dofs(sb, R=R)}
+        pts = member.mesh_points(sd)
+        sol = member.solution(u_s, sd)
+        prob = member.pipeline.problem
+        sg, jxw, _, _ = recompute_fe_geometry(
+            pts, prob._cells_jnp, prob._sg_ref, prob._sv, prob._qw,
+        )
+        val = l2_von_mises(
+            prob, sol, member.pipeline.lam, member.pipeline.mu,
+            shape_grads=sg, JxW=jxw,
+        )
+        return member.sym_weight * val
+
+    R0 = 1.0
+    g = float(jax.grad(J_of)(R0))
+    eps = 1e-5
+    fd = (float(J_of(R0 + eps)) - float(J_of(R0 - eps))) / (2 * eps)
+    assert np.isfinite(g) and np.isfinite(fd)
+    assert abs(g) > 0.0 or abs(fd) > 0.0
+    scale = max(abs(g), abs(fd), 1.0)
+    assert abs(g - fd) / scale < 5e-2, f"analytic={g!r}, fd={fd!r}"

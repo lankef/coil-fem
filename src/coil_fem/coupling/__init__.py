@@ -8,12 +8,13 @@ functions :func:`~coil_fem.coupling.drivers.solve_staggered` and
 factory :func:`~coil_fem.coupling.drivers.make_merged_solve`.
 """
 
-from .supports import Support
+from .supports import ContinuumMember, Support
 from .beam_network import SupportBeams
 from .beam_network_csr import SupportBeamsCSR
 from .drivers import solve_uncoupled, solve_staggered, solve_monolithic, MonolithicStatic, make_merged_solve
 
 __all__ = [
+    'ContinuumMember',
     'Support',
     'SupportBeams',
     'SupportBeamsCSR',

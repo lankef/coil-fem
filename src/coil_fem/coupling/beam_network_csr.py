@@ -19,6 +19,7 @@ from ..geo import CurveRZFourierJAX, make_centroid_frame
 from ..meshing import FramedCurveMeshRectangle
 from ..pipelines import ElasticPipeline
 from .beam_network import EndpointResult, EndpointSpec, SupportBeams, _rodrigues, _skew
+from .supports import ContinuumMember
 
 
 class SupportBeamsCSR(SupportBeams):
@@ -985,7 +986,7 @@ class SupportBeamsCSR(SupportBeams):
         return jnp.concatenate(V_parts)
 
     # ========================================================================
-    # Displacement accessors
+    # Continuum member (CSR ring for metrics / VTU)
     # ========================================================================
 
     def endpoint_state(self, u_s: jax.Array) -> jax.Array:
@@ -998,51 +999,67 @@ class SupportBeamsCSR(SupportBeams):
             self, geom, u_s[: 12 * self.n_beams_total], xi,
         )
 
-    def csr_displacement(self, u_s: jax.Array) -> jax.Array:
-        """Full-sector nodal CSR displacement from the reduced solve vector.
-
-        Parameters
-        ----------
-        u_s : jax.Array, shape ``(n_support_dofs,)``
-
-        Returns
-        -------
-        jax.Array, shape ``(n_csr_nodes, 3)``
-        """
+    def _csr_solution(self, u_s: jax.Array, support_dofs: dict) -> list[jax.Array]:
+        """Full-sector nodal CSR displacement from the reduced solve vector."""
+        del support_dofs  # geometry is encoded in the reduced DOFs of u_s
         u_red = u_s[self._csr_dof_offset:].reshape(-1, 3)
-        return jnp.einsum(
+        u = jnp.einsum(
             'nij,nj->ni',
             jnp.asarray(self._csr_node_Q),
             u_red[self._csr_red_node],
         )
+        return [u]
 
-    def csr_attachment_weights(
-        self, geom: dict, support_dofs: dict,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Ring-side grounded / attachment weights on CSR surface nodes.
+    def _csr_mesh_points(self, support_dofs: dict) -> jax.Array:
+        """CSR mesh node positions at the current curve DOFs."""
+        return self.csr_mesh.mesh_points_from_dofs(support_dofs['csr_curve_dofs'])
 
-        Same CR endpoint loop as :meth:`support_values`, evaluated on surface
-        **nodes** (for VTU visualisation) rather than surface quads.
-
-        Parameters
-        ----------
-        geom : dict
-            Output of :meth:`beam_geometry` (must contain ``csr_points``).
-        support_dofs : dict
-            Support DOF pytree (attachment angles, ``v_end_cr``, etc.).
-
-        Returns
-        -------
-        w_g, w_a : jax.Array, shape ``(n_csr_surface_nodes,)``
-            ``w_g`` is zeros; ``w_a`` sums CR endpoint attachment weights.
-        """
-        surf_idx = self._csr_pipeline.surface_node_indices
+    def _csr_vtu_point_data(
+        self,
+        curves_jax: list,
+        support_dofs: dict,
+        u_s: jax.Array | None,
+    ) -> dict:
+        """Ring-side attachment weights scattered onto full CSR mesh nodes."""
+        del u_s
+        geom = self.beam_geometry(curves_jax, support_dofs)
+        surf_idx = np.asarray(
+            self._csr_pipeline.surface_node_indices, dtype=np.int32,
+        )
         csr_surf = geom['csr_points'][surf_idx]
         w_a = jnp.zeros(csr_surf.shape[0])
         for spec in self._csr_endpoint_specs(geom):
             w_k, _ = self._clamp_weights_for_spec(spec, csr_surf, support_dofs)
             w_a = w_a + w_k
-        return jnp.zeros_like(w_a), w_a
+        w_g = jnp.zeros_like(w_a)
+
+        n_nodes = int(geom['csr_points'].shape[0])
+        w_g_full = onp.zeros(n_nodes, dtype=onp.float64)
+        w_a_full = onp.zeros(n_nodes, dtype=onp.float64)
+        w_g_full[surf_idx] = onp.asarray(w_g, dtype=onp.float64)
+        w_a_full[surf_idx] = onp.asarray(w_a, dtype=onp.float64)
+        k_clamp = float(self.k_clamp)
+        k_attach = float(self.k_attachment)
+        return {
+            "w_clamp": w_g_full,
+            "w_attach": w_a_full,
+            "k_clamp_Npm3": w_g_full * k_clamp,
+            "k_attach_Npm3": w_a_full * k_attach,
+        }
+
+    @property
+    def continuum_members(self) -> tuple[ContinuumMember, ...]:
+        """One continuum member for the one-field-period CSR ring."""
+        return (
+            ContinuumMember(
+                name='csr',
+                pipeline=self._csr_pipeline,
+                sym_weight=float(self._nfp * (1 + int(self._stellsym))),
+                mesh_points=self._csr_mesh_points,
+                solution=self._csr_solution,
+                vtu_point_data=self._csr_vtu_point_data,
+            ),
+        )
 
     def beam_labels(self) -> tuple:
         """Per-beam coil index and type (``0``=CC, ``1``=CF, ``2``=CR)."""
