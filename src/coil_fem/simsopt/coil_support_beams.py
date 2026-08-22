@@ -19,20 +19,12 @@ from ..utils import estimate_k
 from ..geo import CurveXYZFourierJAX
 from ..coupling import SupportBeams
 from .coil_support import (
-    CoilSupport,
-    _ANGLE_UNIT_KEYS,
-    _DPHI_TO_PHI,
-    _PHI_TO_DPHI,
-    _SortedDphisMixin,
-    _apply_sorted_dphi_bounds,
-    _broadcast_phis,
-    _cumsum_last,
-    _cumsum_last_vjp,
-    _diff_last,
-    _encode_dphis,
-    _fold_first_dphis,
-    _generate_k_clamp,
-    _tree_cumsum_last,
+    CoilSupport, _broadcast_phis, _generate_k_clamp,
+)
+from .sorted_dphis import (
+    _ANGLE_UNIT_KEYS, _DPHI_TO_PHI, _PHI_TO_DPHI, _SortedDphisMixin,
+    _apply_sorted_dphi_bounds, _decode_dphis, _decode_end_cc,
+    _encode_dphis, _encode_end_cc, _fold_first_dphis,
 )
 from .coil_support_fixed import CoilSupportFixed
 
@@ -84,62 +76,6 @@ def _uniform_list(counts, cc_stellsym=False, cc_end=False):
         else:
             phi = jnp.linspace(0.0, 1.0, c, endpoint=False) + 0.5 / c
         out.append(phi)
-    return out
-
-
-# ============================================================================
-# Stellsym wrap-end dphis codec (backward walk from phi = 1)
-# ============================================================================
-
-def _wrap_end_groups(n_groups, stellsym):
-    """Indices of CC groups whose ends walk backward under stellsym.
-
-    Returns the empty set when ``stellsym`` is false or there are fewer than
-    two groups.  Otherwise returns ``{n_groups - 2, n_groups - 1}`` — the
-    ``flip_half`` and ``flip`` wrap groups.
-    """
-    if not stellsym or n_groups < 2:
-        return frozenset()
-    return frozenset({n_groups - 2, n_groups - 1})
-
-
-def _decode_end_cc(d_list, stellsym):
-    """Decode ``dphis_end_cc`` → ``phis_end_cc`` (wrap groups: ``1 - cumsum``)."""
-    wrap = _wrap_end_groups(len(d_list), stellsym)
-    out = []
-    for g, d in enumerate(d_list):
-        d = jnp.asarray(d, dtype=float)
-        if g in wrap:
-            out.append(1.0 - _cumsum_last(d))
-        else:
-            out.append(_cumsum_last(d))
-    return out
-
-
-def _encode_end_cc(phi_list, stellsym):
-    """Encode ``phis_end_cc`` → ``dphis_end_cc`` (wrap: ``diff(1 - phi)``)."""
-    wrap = _wrap_end_groups(len(phi_list), stellsym)
-    out = []
-    for g, phi in enumerate(phi_list):
-        phi = jnp.asarray(phi, dtype=float)
-        if g in wrap:
-            # diff_last(1 - phi), not -diff_last(phi): they differ at j=0.
-            out.append(_diff_last(1.0 - phi))
-        else:
-            out.append(_diff_last(phi))
-    return out
-
-
-def _vjp_end_cc(g_list, stellsym):
-    """VJP of :func:`_decode_end_cc` (wrap groups: negated reverse-cumsum)."""
-    wrap = _wrap_end_groups(len(g_list), stellsym)
-    out = []
-    for g, g_phi in enumerate(g_list):
-        g_phi = jnp.asarray(g_phi, dtype=float)
-        if g in wrap:
-            out.append(-_cumsum_last_vjp(g_phi))
-        else:
-            out.append(_cumsum_last_vjp(g_phi))
     return out
 
 
@@ -675,7 +611,7 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
             stellsym,
             beam_options=beam_options,
             phis_start_cc=(
-                _tree_cumsum_last(dphis_start_cc)
+                _decode_dphis({'dphis_start_cc': dphis_start_cc})['phis_start_cc']
                 if dphis_start_cc is not None else None
             ),
             phis_end_cc=(
@@ -683,7 +619,7 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
                 if dphis_end_cc is not None else None
             ),
             phis_start_cf=(
-                _tree_cumsum_last(dphis_start_cf)
+                _decode_dphis({'dphis_start_cf': dphis_start_cf})['phis_start_cf']
                 if dphis_start_cf is not None else None
             ),
             x_foundation=x_foundation,
@@ -691,7 +627,7 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
             thetas_orientation_cf=thetas_orientation_cf,
             fixed_clamp_options=fixed_clamp_options,
             phis=(
-                _cumsum_last(jnp.asarray(dphis, dtype=float))
+                _decode_dphis({'dphis': jnp.asarray(dphis, dtype=float)})['phis']
                 if dphis is not None else None
             ),
             fixed_dof_names=fixed_dof_names,

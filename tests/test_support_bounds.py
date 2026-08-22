@@ -4,8 +4,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
-from coil_fem.simsopt.coil_support import (
-    CoilSupport,
+from coil_fem.simsopt.coil_support import CoilSupport
+from coil_fem.simsopt.sorted_dphis import (
     _apply_sorted_dphi_bounds,
     _fold_first_dphis,
     _fold_into_interval,
@@ -73,16 +73,21 @@ def test_fold_first_dphis_only_first_entry():
     s = _sector_width(nfp, stellsym)
     tree = {
         'dphis_start_cc': [jnp.array([0.85, 0.1])],
-        'dphis_end_cr': [jnp.array([0.3, 0.02])],
+        'dphis_end_cr': jnp.array([[0.3, 0.02], [0.01, 0.02]]),
         'dphis': jnp.array([0.85, 0.1]),
         'r_beam': [jnp.array([0.01])],
     }
     out = _fold_first_dphis(tree, nfp, stellsym)
     np.testing.assert_allclose(out['dphis_start_cc'][0], [-0.15, 0.1])
+    # CR-end folds coil 0 (row 0), all beams; later coils unchanged.
     np.testing.assert_allclose(
         out['dphis_end_cr'][0],
-        [_fold_into_interval(0.3, -0.5 * s, 0.5 * s), 0.02],
+        [
+            _fold_into_interval(0.3, -0.5 * s, 0.5 * s),
+            _fold_into_interval(0.02, -0.5 * s, 0.5 * s),
+        ],
     )
+    np.testing.assert_allclose(out['dphis_end_cr'][1], [0.01, 0.02])
     # Clamp dphis is not folded.
     np.testing.assert_allclose(out['dphis'], [0.85, 0.1])
     np.testing.assert_allclose(out['r_beam'][0], [0.01])
@@ -96,8 +101,8 @@ def test_apply_sorted_dphi_bounds_first_and_rest():
         'dphis_end_cc': [jnp.array([0.1, 0.2, 0.3])],
         'dphis_start_cf': [jnp.array([0.05])],
         'dphis_start_cr': [jnp.array([0.4, 0.05])],
-        'dphis_end_cr': [jnp.array([0.01, 0.02, 0.03])],
-        'v_end_cr': [jnp.array([-1.0, 1.0])],
+        'dphis_end_cr': jnp.array([[0.01, 0.02], [0.03, 0.04]]),
+        'v_end_cr': jnp.array([[-1.0, 1.0]]),
         'r_beam': [jnp.array([0.01])],
     }
     unit_keys = tuple(k for k in tree if k.startswith('dphis'))
@@ -119,8 +124,9 @@ def test_apply_sorted_dphi_bounds_first_and_rest():
         'dphis_start_cr(0,0)': (-0.5, 0.5),
         'dphis_start_cr(0,1)': (0.0, 1.0),
         'dphis_end_cr(0,0)': (-0.5 * s, 0.5 * s),
-        'dphis_end_cr(0,1)': (0.0, s),
-        'dphis_end_cr(0,2)': (0.0, s),
+        'dphis_end_cr(0,1)': (-0.5 * s, 0.5 * s),
+        'dphis_end_cr(1,0)': (0.0, s),
+        'dphis_end_cr(1,1)': (0.0, s),
     }
     for name, lo, hi in zip(names, lb, ub):
         key = name.split('(', 1)[0]

@@ -6,22 +6,23 @@ import numpy as np
 import pytest
 from jax.flatten_util import ravel_pytree
 
-from coil_fem.simsopt.coil_support import (
-    CoilSupport,
+from coil_fem.simsopt.coil_support import CoilSupport
+from coil_fem.simsopt.sorted_dphis import (
     _SortedDphisMixin,
     _cumsum_last_vjp,
     _decode_dphis,
+    _decode_end_cc,
+    _decode_end_cr,
     _encode_dphis,
+    _encode_end_cc,
+    _encode_end_cr,
     _fold_into_interval,
     _sector_width,
     _vjp_dphis,
-)
-from coil_fem.simsopt.coil_support_beams import (
-    _decode_end_cc,
-    _encode_end_cc,
-    _uniform_list,
     _vjp_end_cc,
+    _vjp_end_cr,
 )
+from coil_fem.simsopt.coil_support_beams import _uniform_list
 
 
 def _make_names(tree):
@@ -419,19 +420,19 @@ def test_csr_sorted_defaults_inside_box_bounds():
 
     sd = cs.support_dofs
     assert 'phis_start_cr' in sd and 'phis_end_cr' in sd
-    for ps, pe in zip(sd['phis_start_cr'], sd['phis_end_cr']):
-        ps = np.asarray(ps)
-        pe = np.asarray(pe)
-        # First increment may be negative after fold; later ones stay >= 0.
-        if ps.size:
-            assert -0.5 - 1e-14 <= ps[0] <= 0.5 + 1e-14
-        if ps.size > 1:
-            assert np.all(np.diff(ps) >= -1e-15)
-        s = 1.0 / nfp / 2.0
-        if pe.size:
-            assert -0.5 * s - 1e-14 <= pe[0] <= 0.5 * s + 1e-14
-        if pe.size > 1:
-            assert np.all(np.diff(pe) >= -1e-15)
+    ps = np.asarray(sd['phis_start_cr'])
+    pe = np.asarray(sd['phis_end_cr'])
+    # Start: first beam of each coil may be negative after fold; later beams >= 0.
+    if ps.size:
+        assert np.all((-0.5 - 1e-14 <= ps[:, 0]) & (ps[:, 0] <= 0.5 + 1e-14))
+    if ps.shape[1] > 1:
+        assert np.all(np.diff(ps, axis=1) >= -1e-15)
+    # End: coil 0 (all beams) in the first-increment box; later coils ascend.
+    s = 1.0 / nfp / 2.0
+    if pe.size:
+        assert np.all((-0.5 * s - 1e-14 <= pe[0]) & (pe[0] <= 0.5 * s + 1e-14))
+    if pe.shape[0] > 1:
+        assert np.all(np.diff(pe, axis=0) >= -1e-15)
 
 
 def test_csr_default_phis_end_cr_at_coil_center():
@@ -441,7 +442,7 @@ def test_csr_default_phis_end_cr_at_coil_center():
     from simsopt.geo import create_equally_spaced_curves
     from coil_fem.geo import CurveXYZFourierJAX
     from coil_fem.simsopt import CoilSupportBeamsCSRSorted
-    from coil_fem.simsopt.coil_support import _encode_dphis
+    from coil_fem.simsopt.sorted_dphis import _encode_dphis
 
     n_base, nfp, n_cr = 2, 2, 2
     curves = create_equally_spaced_curves(
@@ -453,6 +454,7 @@ def test_csr_default_phis_end_cr_at_coil_center():
         c = CurveXYZFourierJAX.from_simsopt(coil.curve).curve_center()
         phi_i = float((np.arctan2(c[1], c[0]) / (2.0 * np.pi)) % 1.0)
         expected.append(np.full((n_cr,), phi_i))
+    expected = np.stack(expected, axis=0)
 
     # Sorted constructs via base CoilSupportBeamsCSR defaults, then encodes.
     cs = CoilSupportBeamsCSRSorted(
@@ -466,18 +468,17 @@ def test_csr_default_phis_end_cr_at_coil_center():
     )
     s = _sector_width(nfp, False)
     sd = cs.support_dofs
-    for pe, exp in zip(sd['phis_end_cr'], expected):
-        folded = float(_fold_into_interval(exp[0], -0.5 * s, 0.5 * s))
-        np.testing.assert_allclose(
-            np.asarray(pe), np.full_like(exp, folded), atol=1e-12,
-        )
+    pe = np.asarray(sd['phis_end_cr'])
+    folded0 = float(_fold_into_interval(expected[0, 0], -0.5 * s, 0.5 * s))
+    expected_phi = folded0 + (expected - expected[0])
+    np.testing.assert_allclose(pe, expected_phi, atol=1e-12)
 
     encoded = _encode_dphis({'phis_end_cr': sd['phis_end_cr']})
-    for d, exp in zip(encoded['dphis_end_cr'], expected):
-        folded = float(_fold_into_interval(exp[0], -0.5 * s, 0.5 * s))
-        np.testing.assert_allclose(
-            np.asarray(d), np.array([folded, 0.0]), atol=1e-12,
-        )
+    d = np.asarray(encoded['dphis_end_cr'])
+    expected_d = np.diff(
+        expected_phi, axis=0, prepend=np.zeros_like(expected_phi[:1]),
+    )
+    np.testing.assert_allclose(d, expected_d, atol=1e-12)
 
 
 def test_csr_default_phis_start_cr_min_R_window_and_v_end():
@@ -487,7 +488,7 @@ def test_csr_default_phis_start_cr_min_R_window_and_v_end():
     from simsopt.geo import create_equally_spaced_curves
     from coil_fem.geo import CurveXYZFourierJAX
     from coil_fem.simsopt import CoilSupportBeamsCSRSorted
-    from coil_fem.simsopt.coil_support import _encode_dphis
+    from coil_fem.simsopt.sorted_dphis import _encode_dphis
 
     n_base, nfp, n_cr = 1, 2, 3
     curves = create_equally_spaced_curves(
@@ -568,8 +569,8 @@ def test_csr_sorted_dphis_cr_flatten_grad_fd():
         cs.local_full_x = np.asarray(x_full, dtype=float)
         sd = cs.support_dofs
         return float(
-            sum(jnp.sum(p ** 2) for p in sd['phis_start_cr'])
-            + sum(jnp.sum(p ** 2) for p in sd['phis_end_cr'])
+            jnp.sum(sd['phis_start_cr'] ** 2)
+            + jnp.sum(sd['phis_end_cr'] ** 2)
         )
 
     j0 = J_from_full(flat0)
@@ -577,8 +578,8 @@ def test_csr_sorted_dphis_cr_flatten_grad_fd():
 
     sd = cs.support_dofs
     g_full = {k: jax.tree_util.tree_map(jnp.zeros_like, v) for k, v in sd.items()}
-    g_full['phis_start_cr'] = [2.0 * p for p in sd['phis_start_cr']]
-    g_full['phis_end_cr'] = [2.0 * p for p in sd['phis_end_cr']]
+    g_full['phis_start_cr'] = 2.0 * sd['phis_start_cr']
+    g_full['phis_end_cr'] = 2.0 * sd['phis_end_cr']
     g_flat = cs.flatten_grad(g_full)
 
     for idx in (idx_start, idx_end):
@@ -588,3 +589,26 @@ def test_csr_sorted_dphis_cr_flatten_grad_fd():
         fd = (j1 - j0) / eps
         cs.local_full_x = flat0
         assert abs(fd - g_flat[idx]) < 1e-4, (fd, g_flat[idx], names[idx])
+
+
+def test_encode_decode_end_cr_roundtrip():
+    """Cross-coil CR-end codec inverts on a (n_coil, n_beam) array."""
+    phi = jnp.array([[0.01, 0.02], [0.04, 0.06], [0.09, 0.11]])
+    d = _encode_end_cr(phi)
+    np.testing.assert_allclose(d[0], phi[0])
+    np.testing.assert_allclose(d[1], phi[1] - phi[0])
+    np.testing.assert_allclose(d[2], phi[2] - phi[1])
+    np.testing.assert_allclose(_decode_end_cr(d), phi, atol=1e-12)
+
+
+def test_vjp_end_cr_matches_decode():
+    """Analytic VJP of coil-axis decode matches reverse-mode AD."""
+    d = jnp.array([[0.1, 0.2], [0.05, 0.1], [0.02, 0.03]])
+
+    def J(d_arr):
+        return jnp.sum(_decode_end_cr(d_arr) ** 2)
+
+    g_ad = jax.grad(J)(d)
+    phi = _decode_end_cr(d)
+    g_manual = _vjp_end_cr(2.0 * phi)
+    np.testing.assert_allclose(g_manual, g_ad, atol=1e-12)

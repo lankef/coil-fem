@@ -38,7 +38,7 @@ class SupportBeamsCSR(SupportBeams):
     ----------
     nfp, stellsym, beam_options, n_base, cross_section_fn, attachment_fn
         Forwarded to :class:`SupportBeams`.  ``beam_options`` must also contain
-        ``n_beam_cr`` (int or length-``n_base`` sequence).
+        ``n_beam_cr`` (scalar int; same CR count on every coil).
     csr_options : dict
         CSR mesh / material options.  Required keys: ``order``, ``w1``, ``w2``,
         ``n_phi``, ``E``, ``nu``.  Optional: ``n_grid_1``, ``n_grid_2``,
@@ -53,7 +53,7 @@ class SupportBeamsCSR(SupportBeams):
     Notes
     -----
     ``cross_section_fn`` must return per-group lists whose entry ``i < n_base``
-    has shape ``(n_beam_cc[i] + n_beam_cf[i] + n_beam_cr[i],)`` (wrap group
+    has shape ``(n_beam_cc[i] + n_beam_cf[i] + n_beam_cr,)`` (wrap group
     unchanged).  Beam assembly order is coil-major ``CC → CF → CR``, then the
     stellsym wrap group.
     """
@@ -86,16 +86,25 @@ class SupportBeamsCSR(SupportBeams):
             fixed_clamp_options=fixed_clamp_options,
         )
 
-        self._n_beam_cr = self._check_beam_counts(
-            beam_options['n_beam_cr'], n_base, 'n_beam_cr'
-        )
+        n_cr = beam_options['n_beam_cr']
+        if np.ndim(n_cr) != 0:
+            raise ValueError(
+                "beam_options['n_beam_cr'] must be a scalar int "
+                "(equal CR count on every coil)."
+            )
+        self._n_beam_cr = int(n_cr)
+        if self._n_beam_cr < 0:
+            raise ValueError(
+                f"beam_options['n_beam_cr'] must be >= 0; "
+                f"got {self._n_beam_cr}."
+            )
         self._w_sym = 1.0 / (1 + int(stellsym))
         self._csr_options = dict(csr_options)
         self._problem_options = dict(problem_options)
 
         # Rebuild beam offsets: coil-major CC → CF → CR, then wrap.
         _per_coil = [
-            self._n_beam_cc[i] + self._n_beam_cf[i] + self._n_beam_cr[i]
+            self._n_beam_cc[i] + self._n_beam_cf[i] + self._n_beam_cr
             for i in range(n_base)
         ]
         self._beam_offsets = tuple(int(sum(_per_coil[:i])) for i in range(n_base))
@@ -350,7 +359,7 @@ class SupportBeamsCSR(SupportBeams):
             J_parts.append(cols_br.reshape(-1).copy())
 
         for i in range(self.n_base):
-            for j in range(self._n_beam_cr[i]):
+            for j in range(self._n_beam_cr):
                 b = (
                     self._beam_offsets[i]
                     + self.n_beam_cc[i]
@@ -372,7 +381,7 @@ class SupportBeamsCSR(SupportBeams):
             self._csr_beam_spring_I = np.concatenate(I_parts).astype(np.int32)
             self._csr_beam_spring_J = np.concatenate(J_parts).astype(np.int32)
             self._n_csr_beam_spring_endpoints = (
-                sum(self._n_beam_cr) * (2 if self.stellsym else 1)
+                self._n_beam_cr * self.n_base * (2 if self.stellsym else 1)
             )
 
     # ========================================================================
@@ -381,13 +390,13 @@ class SupportBeamsCSR(SupportBeams):
 
     @property
     def n_beam_cr(self):
-        """Per-coil coil-to-CSR beam counts, length-``n_base`` tuple of int."""
+        """Coil-to-CSR beam count (same integer on every coil)."""
         return self._n_beam_cr
 
     @property
     def n_beams_per_coil(self):
         return tuple(
-            self._n_beam_cc[i] + self._n_beam_cf[i] + self._n_beam_cr[i]
+            self._n_beam_cc[i] + self._n_beam_cf[i] + self._n_beam_cr
             for i in range(self.n_base)
         )
 
@@ -470,7 +479,7 @@ class SupportBeamsCSR(SupportBeams):
                 t_coil_start_list.append(t_cs_cf)
                 t_coil_end_list.append(jnp.zeros((n_cf_i, 3)))
 
-            n_cr_i = self._n_beam_cr[i]
+            n_cr_i = self._n_beam_cr
             if n_cr_i > 0:
                 phi_s = phis_start_cr[i]
                 phi_e = phis_end_cr[i]
@@ -513,7 +522,7 @@ class SupportBeamsCSR(SupportBeams):
                 theta_parts.append(theta_cc[i])
             if self.n_beam_cf[i] > 0:
                 theta_parts.append(theta_cf[i])
-            if self._n_beam_cr[i] > 0:
+            if self._n_beam_cr > 0:
                 theta_parts.append(theta_cr[i])
         if self.stellsym and self.n_beam_cc[self.n_base] > 0:
             theta_parts.append(theta_cc[self.n_base])
@@ -620,7 +629,7 @@ class SupportBeamsCSR(SupportBeams):
                 xi_e_list.append(jnp.ones(n_cf))
                 b0 += n_cf
 
-            n_cr = self._n_beam_cr[i]
+            n_cr = self._n_beam_cr
             if n_cr > 0:
                 sl = slice(b0, b0 + n_cr)
                 d = x_end[sl] - x_start[sl]
@@ -686,7 +695,7 @@ class SupportBeamsCSR(SupportBeams):
                     sign_x=True, tfm='none',
                 ))
                 b += 1
-            for j in range(self._n_beam_cr[i]):
+            for j in range(self._n_beam_cr):
                 j_local = self.n_beam_cc[i] + self.n_beam_cf[i] + j
                 specs.append(EndpointSpec(
                     b=b, coil_origin=i, j_local=j_local,
@@ -709,7 +718,7 @@ class SupportBeamsCSR(SupportBeams):
         gamma3 = geom['gamma3']
         specs: list[EndpointSpec] = []
         for i in range(self.n_base):
-            for j in range(self._n_beam_cr[i]):
+            for j in range(self._n_beam_cr):
                 b = (
                     self._beam_offsets[i]
                     + self.n_beam_cc[i]
@@ -826,7 +835,7 @@ class SupportBeamsCSR(SupportBeams):
             for _j in range(self.n_beam_cf[i]):
                 _add_endpoint(b, 0, i)
                 b += 1
-            for _j in range(self._n_beam_cr[i]):
+            for _j in range(self._n_beam_cr):
                 _add_endpoint(b, 0, i)
                 b += 1
 
@@ -1067,7 +1076,7 @@ class SupportBeamsCSR(SupportBeams):
         parts_coil, parts_type = [], []
         for i in range(n_base):
             n_cc, n_cf, n_cr = (
-                self.n_beam_cc[i], self.n_beam_cf[i], self._n_beam_cr[i],
+                self.n_beam_cc[i], self.n_beam_cf[i], self._n_beam_cr,
             )
             parts_coil.append(onp.full(n_cc + n_cf + n_cr, i, dtype=onp.int32))
             parts_type.append(onp.concatenate([

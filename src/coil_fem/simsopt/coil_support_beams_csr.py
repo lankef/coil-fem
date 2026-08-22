@@ -19,18 +19,12 @@ from ..utils import estimate_k
 from ..geo import CurveXYZFourierJAX
 from ..coupling import SupportBeamsCSR
 from .coil_support import (
-    CoilSupport,
-    _ANGLE_UNIT_KEYS,
-    _DPHI_TO_PHI,
-    _PHI_TO_DPHI,
-    _SortedDphisMixin,
-    _apply_sorted_dphi_bounds,
-    _broadcast_phis,
-    _cumsum_last,
-    _encode_dphis,
-    _fold_first_dphis,
-    _generate_k_clamp,
-    _tree_cumsum_last,
+    CoilSupport, _broadcast_phis, _generate_k_clamp,
+)
+from .sorted_dphis import (
+    _ANGLE_UNIT_KEYS, _DPHI_TO_PHI, _PHI_TO_DPHI, _SortedDphisMixin,
+    _apply_sorted_dphi_bounds, _decode_dphis, _decode_end_cc,
+    _encode_dphis, _encode_end_cc, _fold_first_dphis,
 )
 from .coil_support_fixed import CoilSupportFixed
 from .coil_support_beams import (
@@ -39,8 +33,6 @@ from .coil_support_beams import (
     _uniform_list,
     _zeros_list,
     _check_ragged_shape,
-    _decode_end_cc,
-    _encode_end_cc,
 )
 
 
@@ -48,37 +40,46 @@ _REQUIRED_CSR_OPTIONS = ('order', 'w1', 'w2', 'n_phi', 'E', 'nu')
 _OPTIONAL_CSR_OPTIONS = ('n_grid_1', 'n_grid_2', 'mesh_type', 'n_quad')
 
 
-def _coil_center_phi_list(base_coils, n_beam_cr):
-    """Per-coil ``phis_end_cr`` seed at each coil's cylindrical angle.
+def _check_rect_shape(value, shape, name):
+    """Validate and cast a user-supplied rectangular DOF array.
 
-    Entry ``i`` has shape ``(n_beam_cr[i],)`` with all values equal to
-    ``atan2(y_c, x_c) / (2π) mod 1`` where ``(x_c, y_c, z_c)`` is the
-    coil's ``curve_center``.
+    Returns ``None`` when ``value`` is ``None``.
     """
-    out = []
-    for i, coil in enumerate(base_coils):
+    if value is None:
+        return None
+    arr = jnp.asarray(value, dtype=float)
+    expected = tuple(int(s) for s in shape)
+    if arr.shape != expected:
+        raise ValueError(
+            f"{name} must have shape {expected}; got {arr.shape}."
+        )
+    return arr
+
+
+def _coil_center_phi_array(base_coils, n_beam_cr):
+    """``phis_end_cr`` seed, shape ``(n_coil, n_beam_cr)``.
+
+    Row ``i`` is the coil's cylindrical angle
+    ``atan2(y_c, x_c) / (2π) mod 1`` repeated ``n_beam_cr`` times.
+    """
+    n = int(n_beam_cr)
+    rows = []
+    for coil in base_coils:
         c = CurveXYZFourierJAX.from_simsopt(coil.curve).curve_center()
         phi_i = (jnp.arctan2(c[1], c[0]) / (2.0 * jnp.pi)) % 1.0
-        out.append(jnp.full((int(n_beam_cr[i]),), phi_i))
-    return out
+        rows.append(jnp.full((n,), phi_i))
+    return jnp.stack(rows, axis=0) if rows else jnp.zeros((0, n))
 
 
-def _v_end_cr_linspace(n_beam_cr):
-    """Per-coil ``v_end_cr`` from -1 to 1 (``n=1`` → 0)."""
-    out = []
-    for n in n_beam_cr:
-        n = int(n)
-        if n == 0:
-            out.append(jnp.zeros(0))
-        elif n == 1:
-            out.append(jnp.zeros(1))
-        else:
-            out.append(jnp.linspace(-1.0, 1.0, n))
-    return out
+def _v_end_cr_array(n_coil, n_beam_cr):
+    """``v_end_cr`` of shape ``(n_coil, n_beam_cr)``; ``n=1`` → 0."""
+    n = int(n_beam_cr)
+    row = jnp.zeros(1) if n == 1 else jnp.linspace(-1.0, 1.0, n)
+    return jnp.broadcast_to(row, (int(n_coil), n))
 
 
-def _min_R_phi_window_list(base_coils, n_beam_cr, width=0.1):
-    """``phis_start_cr`` in a width-``width`` window around min cylindrical R.
+def _min_R_phi_window_array(base_coils, n_beam_cr, width=0.1):
+    """``phis_start_cr`` of shape ``(n_coil, n_beam_cr)``.
 
     For each coil, sample ``gamma`` on its quadpoints, take
     ``phi0 = argmin sqrt(x^2+y^2)``, place ``n`` points with
@@ -88,23 +89,23 @@ def _min_R_phi_window_list(base_coils, n_beam_cr, width=0.1):
     ponytail: sorting after ``% 1`` can reorder beam indices when the window
     wraps across 0; upgrade path is a wrap-aware Sorted codec.
     """
+    n = int(n_beam_cr)
+    n_coil = len(base_coils)
+    if n == 0:
+        return jnp.zeros((n_coil, 0))
     half = 0.5 * float(width)
-    out = []
-    for i, coil in enumerate(base_coils):
-        n = int(n_beam_cr[i])
-        if n == 0:
-            out.append(jnp.zeros(0))
-            continue
+    rows = []
+    for coil in base_coils:
         curve = CurveXYZFourierJAX.from_simsopt(coil.curve)
         gamma = curve.gamma()
         R = jnp.sqrt(gamma[:, 0] ** 2 + gamma[:, 1] ** 2)
         phi0 = curve.quadpoints[jnp.argmin(R)]
         if n == 1:
-            out.append(jnp.array([phi0 % 1.0]))
+            rows.append(jnp.array([phi0 % 1.0]))
         else:
             phis = jnp.linspace(phi0 - half, phi0 + half, n) % 1.0
-            out.append(jnp.sort(phis))
-    return out
+            rows.append(jnp.sort(phis))
+    return jnp.stack(rows, axis=0) if rows else jnp.zeros((0, n))
 
 
 class CoilSupportBeamsCSR(CoilSupport):
@@ -120,7 +121,8 @@ class CoilSupportBeamsCSR(CoilSupport):
     base_coils, nfp, stellsym
         Same as :class:`CoilSupportBeams`.
     beam_options : dict
-        Same as :class:`CoilSupportBeams`, plus required ``n_beam_cr``.
+        Same as :class:`CoilSupportBeams`, plus required ``n_beam_cr``
+        (scalar int; same CR count on every coil).
     csr_options : dict
         Forwarded to :class:`~coil_fem.coupling.SupportBeamsCSR`.  Required
         keys: ``order``, ``w1``, ``w2``, ``n_phi``, ``E``, ``nu``.
@@ -131,7 +133,7 @@ class CoilSupportBeamsCSR(CoilSupport):
     thetas_orientation_cc, thetas_orientation_cf
         Same as :class:`CoilSupportBeams`.
     phis_start_cr, phis_end_cr, v_end_cr, thetas_orientation_cr
-        Per-coil ragged CR DOFs; entry ``i`` has shape ``(n_beam_cr[i],)``.
+        Rectangular CR DOFs of shape ``(n_base, n_beam_cr)``.
     csr_curve_dofs : array-like or None
         Initial CSR :class:`~coil_fem.geo.CurveRZFourierJAX` DOFs.  Default
         is a unit circle (``rc_0 = 1``).
@@ -317,21 +319,22 @@ class CoilSupportBeamsCSR(CoilSupport):
         _phis_start_cf = _check_ragged_shape(
             phis_start_cf, n_beam_cf, 'phis_start_cf',
         )
-        _phis_start_cr = _check_ragged_shape(
-            phis_start_cr, n_beam_cr, 'phis_start_cr',
+        _shape_cr = (n_base, n_beam_cr)
+        _phis_start_cr = _check_rect_shape(
+            phis_start_cr, _shape_cr, 'phis_start_cr',
         )
-        _phis_end_cr = _check_ragged_shape(
-            phis_end_cr, n_beam_cr, 'phis_end_cr',
+        _phis_end_cr = _check_rect_shape(
+            phis_end_cr, _shape_cr, 'phis_end_cr',
         )
-        _v_end_cr = _check_ragged_shape(v_end_cr, n_beam_cr, 'v_end_cr')
+        _v_end_cr = _check_rect_shape(v_end_cr, _shape_cr, 'v_end_cr')
         _theta_cc = _check_ragged_shape(
             thetas_orientation_cc, n_beam_cc, 'thetas_orientation_cc',
         )
         _theta_cf = _check_ragged_shape(
             thetas_orientation_cf, n_beam_cf, 'thetas_orientation_cf',
         )
-        _theta_cr = _check_ragged_shape(
-            thetas_orientation_cr, n_beam_cr, 'thetas_orientation_cr',
+        _theta_cr = _check_rect_shape(
+            thetas_orientation_cr, _shape_cr, 'thetas_orientation_cr',
         )
         _x_foundation = _check_ragged_shape(
             x_foundation, n_beam_cf, 'x_foundation', trailing=(3,),
@@ -368,15 +371,15 @@ class CoilSupportBeamsCSR(CoilSupport):
             ),
             'phis_start_cr': (
                 _phis_start_cr if _phis_start_cr is not None
-                else _min_R_phi_window_list(base_coils, n_beam_cr)
+                else _min_R_phi_window_array(base_coils, n_beam_cr)
             ),
             'phis_end_cr': (
                 _phis_end_cr if _phis_end_cr is not None
-                else _coil_center_phi_list(base_coils, n_beam_cr)
+                else _coil_center_phi_array(base_coils, n_beam_cr)
             ),
             'v_end_cr': (
                 _v_end_cr if _v_end_cr is not None
-                else _v_end_cr_linspace(n_beam_cr)
+                else _v_end_cr_array(n_base, n_beam_cr)
             ),
             'thetas_orientation_cc': (
                 _theta_cc if _theta_cc is not None
@@ -388,7 +391,7 @@ class CoilSupportBeamsCSR(CoilSupport):
             ),
             'thetas_orientation_cr': (
                 _theta_cr if _theta_cr is not None
-                else _zeros_list(n_beam_cr)
+                else jnp.zeros((n_base, n_beam_cr))
             ),
             'x_foundation': (
                 _x_foundation if _x_foundation is not None
@@ -403,7 +406,7 @@ class CoilSupportBeamsCSR(CoilSupport):
         _cs_counts = [
             n_beam_cc[i]
             + (n_beam_cf[i] if i < n_base else 0)
-            + (n_beam_cr[i] if i < n_base else 0)
+            + (n_beam_cr if i < n_base else 0)
             for i in range(n_groups_cc)
         ]
         for k in kwargs:
@@ -458,7 +461,7 @@ class CoilSupportBeamsCSR(CoilSupport):
             fixed_dof_names += [
                 'phis_start_cf', 'x_foundation', 'thetas_orientation_cf',
             ]
-        if sum(n_beam_cr) == 0:
+        if n_beam_cr == 0:
             fixed_dof_names += [
                 'phis_start_cr', 'phis_end_cr', 'v_end_cr',
                 'thetas_orientation_cr',
@@ -559,16 +562,19 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
     """:class:`CoilSupportBeamsCSR` with incremental ``dphis*`` angle DOFs.
 
     Simsopt stores ``dphis_start_cc``, ``dphis_end_cc``, ``dphis_start_cf``,
-    ``dphis_start_cr``, ``dphis_end_cr`` (and optional clamp ``dphis``) with
-    absolute angles recovered by ``cumsum`` along the last axis — except for
-    the two stellsym wrap groups, where ``phis_end_cc`` is recovered as
-    ``1 - cumsum(dphis_end_cc)``.  CR ends use a plain cumsum (no wrap-back).
-    First increments of ``dphis_start_cc`` / ``dphis_end_cc`` /
-    ``dphis_start_cf`` / ``dphis_start_cr`` are boxed to ``[-0.5, 0.5]``.
+    ``dphis_start_cr``, ``dphis_end_cr`` (and optional clamp ``dphis``).
+    Absolute coil-side angles are recovered by ``cumsum`` along the last
+    (beam) axis — except for the two stellsym wrap groups, where
+    ``phis_end_cc`` is recovered as ``1 - cumsum(dphis_end_cc)``.
+    ``dphis_end_cr`` increments run along the coil axis of the
+    ``(n_coil, n_beam_cr)`` array: ``phis_end_cr[i, j] =
+    sum_{k<=i} dphis_end_cr[k, j]``.  First increments of
+    ``dphis_start_cc`` / ``dphis_end_cc`` / ``dphis_start_cf`` /
+    ``dphis_start_cr`` (beam index 0) are boxed to ``[-0.5, 0.5]``.
     ``dphis_end_cr`` uses sector ``s = 1/nfp`` (or ``1/(2 nfp)`` under
-    stellsym): first increment in ``[-0.5 s, 0.5 s]``, later increments
-    in ``[0, s]``.  Default first increments are folded into those
-    intervals.  :attr:`support_dofs` exposes ``phis*`` for the FEM;
+    stellsym): coil 0 in ``[-0.5 s, 0.5 s]``, later coils in ``[0, s]``.
+    Default first increments are folded into those intervals.
+    :attr:`support_dofs` exposes ``phis*`` for the FEM;
     :meth:`flatten_grad` applies the matching VJP.
 
     Parameters
@@ -581,11 +587,10 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
         (see below).  ``fixed_dof_names`` may use either ``phis*`` or
         ``dphis*`` key spellings.
     dphis_start_cc, dphis_end_cc, dphis_start_cf,
-    dphis_start_cr, dphis_end_cr : sequence of array-like or None
-        Initial increments for CC/CF/CR attachment angles (same ragged shapes
-        as the corresponding ``phis_*`` arguments of
-        :class:`CoilSupportBeamsCSR`).  For stellsym wrap groups,
-        ``dphis_end_cc`` steps backward from 1.
+    dphis_start_cr, dphis_end_cr : array-like or None
+        Initial increments.  CC/CF keys keep the ragged per-group shapes of
+        :class:`CoilSupportBeamsCSR`; CR keys are ``(n_base, n_beam_cr)``.
+        For stellsym wrap groups, ``dphis_end_cc`` steps backward from 1.
     dphis : array-like or None
         Initial increments for optional fixed-sphere clamps.
     """
@@ -628,6 +633,18 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
         self._dphis = dphis
         if fixed_dof_names is not None:
             fixed_dof_names = [_DPHI_TO_PHI.get(k, k) for k in fixed_dof_names]
+        seeds = {}
+        if dphis_start_cc is not None:
+            seeds['dphis_start_cc'] = dphis_start_cc
+        if dphis_start_cf is not None:
+            seeds['dphis_start_cf'] = dphis_start_cf
+        if dphis_start_cr is not None:
+            seeds['dphis_start_cr'] = dphis_start_cr
+        if dphis_end_cr is not None:
+            seeds['dphis_end_cr'] = dphis_end_cr
+        if dphis is not None:
+            seeds['dphis'] = jnp.asarray(dphis, dtype=float)
+        decoded = _decode_dphis(seeds) if seeds else {}
         super().__init__(
             base_coils,
             nfp,
@@ -635,26 +652,14 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
             beam_options=beam_options,
             csr_options=csr_options,
             problem_options=problem_options,
-            phis_start_cc=(
-                _tree_cumsum_last(dphis_start_cc)
-                if dphis_start_cc is not None else None
-            ),
+            phis_start_cc=decoded.get('phis_start_cc'),
             phis_end_cc=(
                 _decode_end_cc(list(dphis_end_cc), stellsym)
                 if dphis_end_cc is not None else None
             ),
-            phis_start_cf=(
-                _tree_cumsum_last(dphis_start_cf)
-                if dphis_start_cf is not None else None
-            ),
-            phis_start_cr=(
-                _tree_cumsum_last(dphis_start_cr)
-                if dphis_start_cr is not None else None
-            ),
-            phis_end_cr=(
-                _tree_cumsum_last(dphis_end_cr)
-                if dphis_end_cr is not None else None
-            ),
+            phis_start_cf=decoded.get('phis_start_cf'),
+            phis_start_cr=decoded.get('phis_start_cr'),
+            phis_end_cr=decoded.get('phis_end_cr'),
             v_end_cr=v_end_cr,
             x_foundation=x_foundation,
             thetas_orientation_cc=thetas_orientation_cc,
@@ -662,10 +667,7 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
             thetas_orientation_cr=thetas_orientation_cr,
             csr_curve_dofs=csr_curve_dofs,
             fixed_clamp_options=fixed_clamp_options,
-            phis=(
-                _cumsum_last(jnp.asarray(dphis, dtype=float))
-                if dphis is not None else None
-            ),
+            phis=decoded.get('phis'),
             fixed_dof_names=fixed_dof_names,
             names=names,
             dofs=dofs,
