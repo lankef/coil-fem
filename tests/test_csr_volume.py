@@ -37,7 +37,7 @@ def _make_coil_support(*, R: float = R0, fix_csr: bool = False):
         'thetas_orientation_cr',
         'phis_start_cc', 'phis_end_cc',
         'phis_start_cf', 'x_foundation',
-        'phis_start_cr', 'phis_end_cr', 'v_end_cr',
+            'phis_start_cr', 'phis_end_cr',
         'r_beam',
     ]
     if fix_csr:

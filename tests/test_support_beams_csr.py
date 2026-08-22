@@ -1,7 +1,7 @@
 """Tests for SupportBeamsCSR (central support ring + CR beams).
 
 Covers the seam-reduction projection, the nfp-periodic rigid nullspace,
-zero body-force RHS, Taylor tests on ``v_end_cr`` / ``csr_curve_dofs``, and
+zero body-force RHS, Taylor tests on ``csr_curve_dofs``, and
 a stellsym seam-symmetry canary (GPU-gated when a full solve is required).
 """
 
@@ -145,7 +145,6 @@ def _support_dofs_cr(
     *,
     phi_start: float = 0.25,
     phi_end: float = 0.1,
-    v_end: float = 0.0,
     R_csr: float = 1.0,
 ):
     n_base = sb.n_base
@@ -153,7 +152,6 @@ def _support_dofs_cr(
     n_cr = sb.n_beam_cr
     sd['phis_start_cr'] = jnp.full((n_base, n_cr), phi_start)
     sd['phis_end_cr'] = jnp.full((n_base, n_cr), phi_end)
-    sd['v_end_cr'] = jnp.full((n_base, n_cr), v_end)
     sd['thetas_orientation_cr'] = jnp.zeros((n_base, n_cr))
     sd['csr_curve_dofs'] = _csr_curve_dofs(sb, R=R_csr)
     return sd
@@ -309,16 +307,15 @@ def test_csr_assemble_coo_zero_body_force_rhs():
 # 4. Taylor tests (CPU: energy through support_values; GPU: objective)
 # ============================================================================
 
-def test_taylor_v_end_cr_and_csr_curve_dofs_via_support_energy():
-    """Analytic ∂J/∂v_end_cr and ∂J/∂R_csr match centered FD on Σ V²."""
+def test_taylor_csr_curve_dofs_via_support_energy():
+    """Analytic ∂J/∂R_csr matches centered FD on Σ V²."""
     sb = _make_csr(nfp=2, stellsym=False, n_beam_cr=1, n_beam_cc=0, n_beam_cf=0)
     curves, surf, jxw, _, _, _ = _bind_one_coil(sb, R=1.2)
-    sd0 = _support_dofs_cr(sb, phi_start=0.3, phi_end=0.12, v_end=0.1, R_csr=1.0)
+    sd0 = _support_dofs_cr(sb, phi_start=0.3, phi_end=0.12, R_csr=1.0)
 
-    def J_of(v_end, R_csr):
+    def J_of(R_csr):
         sd = {
             **sd0,
-            'v_end_cr': jnp.array([[v_end]]),
             'csr_curve_dofs': _csr_curve_dofs(sb, R=R_csr),
         }
         geom = sb.beam_geometry(curves, sd)
@@ -327,23 +324,21 @@ def test_taylor_v_end_cr_and_csr_curve_dofs_via_support_energy():
         )
         return jnp.sum(V * V)
 
-    v0 = float(sd0['v_end_cr'][0][0])
     R0 = float(sd0['csr_curve_dofs'][0])
 
-    g_v, g_R = jax.grad(J_of, argnums=(0, 1))(v0, R0)
+    g_R = jax.grad(J_of)(R0)
     eps = 1e-5
-    fd_v = (float(J_of(v0 + eps, R0)) - float(J_of(v0 - eps, R0))) / (2 * eps)
-    fd_R = (float(J_of(v0, R0 + eps)) - float(J_of(v0, R0 - eps))) / (2 * eps)
+    fd_R = (float(J_of(R0 + eps)) - float(J_of(R0 - eps))) / (2 * eps)
 
-    for name, analytic, fd in (('v_end', float(g_v), fd_v), ('R', float(g_R), fd_R)):
-        scale = max(abs(fd), abs(analytic), 1.0)
-        assert abs(analytic - fd) / scale < 5e-2, (
-            f"{name}: analytic={analytic!r}, fd={fd!r}"
-        )
+    analytic, fd = float(g_R), fd_R
+    scale = max(abs(fd), abs(analytic), 1.0)
+    assert abs(analytic - fd) / scale < 5e-2, (
+        f"R: analytic={analytic!r}, fd={fd!r}"
+    )
 
 
 @pytest.mark.skipif(not (_HAS_SPINEAX and _HAS_GPU), reason=_GPU_REASON)
-def test_taylor_objective_v_end_cr_and_csr_curve_dofs():
+def test_taylor_objective_csr_curve_dofs():
     """Full CoilFEM objective gradients vs FD (monolithic / cuDSS).
 
     Skips on GPU OOM; the CPU energy Taylor above covers the same DOFs.
@@ -383,37 +378,34 @@ def test_taylor_objective_v_end_cr_and_csr_curve_dofs():
             coupling='monolithic',
         )
         sd0 = _support_dofs_cr(
-            support, phi_start=0.3, phi_end=0.12, v_end=0.05, R_csr=0.9,
+            support, phi_start=0.3, phi_end=0.12, R_csr=0.9,
         )
         cdofs = [c.dofs for c in curves]
         idofs = jnp.ones(n_base)
 
-        def J_of(v_end, R_csr):
+        def J_of(R_csr):
             sd = {
                 **sd0,
-                'v_end_cr': jnp.array([[v_end]]),
                 'csr_curve_dofs': _csr_curve_dofs(support, R=R_csr),
             }
             out = fem.objective(cdofs, idofs, sd, metrics=('l2_von_mises',))
             return out['l2_von_mises']
 
-        v0 = float(sd0['v_end_cr'][0][0])
         R0 = float(sd0['csr_curve_dofs'][0])
-        g_v, g_R = jax.grad(J_of, argnums=(0, 1))(v0, R0)
+        g_R = jax.grad(J_of)(R0)
         eps = 1e-5
-        fd_v = (float(J_of(v0 + eps, R0)) - float(J_of(v0 - eps, R0))) / (2 * eps)
-        fd_R = (float(J_of(v0, R0 + eps)) - float(J_of(v0, R0 - eps))) / (2 * eps)
+        fd_R = (float(J_of(R0 + eps)) - float(J_of(R0 - eps))) / (2 * eps)
     except Exception as exc:  # noqa: BLE001
         if 'OUT_OF_MEMORY' in str(exc) or 'RESOURCE_EXHAUSTED' in str(exc):
             pytest.skip(f"GPU OOM during CSR objective Taylor: {exc}")
         raise
 
-    for name, analytic, fd in (('v_end', float(g_v), fd_v), ('R', float(g_R), fd_R)):
-        assert np.isfinite(analytic) and np.isfinite(fd)
-        scale = max(abs(fd), abs(analytic), 1.0)
-        assert abs(analytic - fd) / scale < 5e-2, (
-            f"{name}: analytic={analytic!r}, fd={fd!r}"
-        )
+    analytic, fd = float(g_R), fd_R
+    assert np.isfinite(analytic) and np.isfinite(fd)
+    scale = max(abs(fd), abs(analytic), 1.0)
+    assert abs(analytic - fd) / scale < 5e-2, (
+        f"R: analytic={analytic!r}, fd={fd!r}"
+    )
 
 
 # ============================================================================
@@ -663,7 +655,7 @@ def test_csr_l2_von_mises_taylor_csr_dofs():
 
     sb = _make_csr(nfp=2, stellsym=False, n_beam_cr=1, n_phi=4)
     member = sb.continuum_members[0]
-    sd0 = _support_dofs_cr(sb, phi_start=0.3, phi_end=0.12, v_end=0.0, R_csr=1.0)
+    sd0 = _support_dofs_cr(sb, phi_start=0.3, phi_end=0.12, R_csr=1.0)
 
     rng = np.random.default_rng(1)
     u_s = jnp.zeros(sb.n_support_dofs)

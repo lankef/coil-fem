@@ -248,7 +248,6 @@ def _make_coilfem_with_csr() -> tuple[CoilFEM, CurveXYZFourierJAX, dict]:
         'thetas_orientation_cf': [jnp.zeros(0)],
         'phis_start_cr': [jnp.array([0.25])],
         'phis_end_cr': [jnp.array([0.1])],
-        'v_end_cr': [jnp.array([0.0])],
         'thetas_orientation_cr': [jnp.array([0.0])],
         'csr_curve_dofs': csr_dofs,
     }
@@ -292,6 +291,10 @@ def test_save_run_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
     ):
         assert key in mesh.point_data, f"missing CSR VTU point field {key!r}"
     assert float(np.max(mesh.point_data['w_attach'])) > 0.0
+    phi_idx = support.csr_mesh.phi_idx_per_node
+    end_nodes = (phi_idx == 0) | (phi_idx == int(phi_idx.max()))
+    for key in ('w_clamp', 'w_attach', 'k_clamp_Npm3', 'k_attach_Npm3'):
+        assert np.all(np.asarray(mesh.point_data[key])[end_nodes] == 0.0), key
 
 
 def test_save_run_vtu_writes_csr_von_mises(tmp_path, monkeypatch):

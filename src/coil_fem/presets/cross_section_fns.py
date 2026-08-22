@@ -8,9 +8,10 @@ attribute of :class:`~coil_fem.simsopt.CoilSupportBeams` and
 
     A, Iy, Iz, J = fn(support_dofs)  # each a per-group list of arrays
 
-``support_dofs`` values are ragged: a Python list with one entry per CC/CF
-group, each entry an array of per-beam values for that group (see
-:class:`~coil_fem.coupling.SupportBeams`).  These lists are valid JAX
+``support_dofs`` section keys (e.g. ``r_beam``) are ragged: a Python list
+with one entry per CC group, each entry an array of per-beam values for
+that group (CC + CF, plus CR when using
+:class:`~coil_fem.coupling.SupportBeamsCSR`).  These lists are valid JAX
 pytrees, so each function below maps its elementwise formula across groups
 via ``jax.tree_util.tree_map`` (see ``_map_groups``) rather than operating
 on a flat array directly.

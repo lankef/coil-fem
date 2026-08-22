@@ -16,6 +16,8 @@ tangent.
 ``w1 * w2 * L`` from the live CSR curve.
 :class:`CSRCurveDistance` hinges CSR–coil centreline clearance
 (coil–coil pairs are omitted).
+:class:`CSRSurfaceDistance` hinges CSR–surface clearance on one
+field period (half period if stellsym).
 """
 
 from __future__ import annotations
@@ -1579,3 +1581,138 @@ class CSRCurveDistance(Optimizable):
             )
             best = min(best, float(np.min(dists)))
         return best
+
+
+class CSRSurfaceDistance(Optimizable):
+    r"""Penalise a CSR centreline that comes closer than ``minimum_distance``
+    to a surface.
+
+    The hinge matches :class:`simsopt.geo.CurveSurfaceDistance`, but the
+    CSR is sampled only on the first field period, or the first half
+    period when the CSR is stellarator-symmetric.
+
+    .. math::
+        J = \bigl\langle
+            \|\gamma'_{\mathrm{csr}}(\varphi_i)\|\,\|\mathbf{n}_s(j)\|
+            \max\bigl(0,\, d_{\min} - \|\gamma_{\mathrm{csr}}(\varphi_i)
+            - s_j\|\bigr)^2
+        \bigr\rangle_{i,j}
+
+    Parameters
+    ----------
+    coil_support : CoilSupportBeamsCSR
+        Provides the CSR curve DOFs.
+    surface : simsopt.geo.Surface
+        Target surface.  It is *not* a DOF parent.
+    minimum_distance : float
+        Desired minimum CSR–surface clearance [m].
+    """
+
+    def __init__(self, coil_support, surface, minimum_distance: float):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for CSRSurfaceDistance.")
+
+        support = coil_support.support
+        if not isinstance(support, SupportBeamsCSR):
+            raise TypeError(
+                "CSRSurfaceDistance requires coil_support.support to be a "
+                f"SupportBeamsCSR; got {type(support).__name__}."
+            )
+        minimum_distance = float(minimum_distance)
+        if minimum_distance < 0.0:
+            raise ValueError(
+                f"minimum_distance must be >= 0; got {minimum_distance}."
+            )
+
+        self._coil_support = coil_support
+        self._support = support
+        self._tmpl = support._csr_curve_template
+        self.surface = surface
+        self.minimum_distance = minimum_distance
+
+        phi_max = 1.0 / float(self._tmpl.nfp) / (
+            2.0 if self._tmpl.stellsym else 1.0
+        )
+        qp = np.asarray(self._tmpl.quadpoints)
+        self._qp_sector = jnp.asarray(qp[qp < phi_max])
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=0))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _csr_curve(self, sdofs):
+        """Rebuild the live CSR curve from ``sdofs['csr_curve_dofs']``."""
+        tmpl = self._tmpl
+        return CurveRZFourierJAX(
+            tmpl.quadpoints, sdofs['csr_curve_dofs'],
+            tmpl.order, tmpl.nfp, tmpl.stellsym,
+        )
+
+    def _surface_arrays(self):
+        """Surface quadrature points and unnormalised normals, both ``(M, 3)``."""
+        return (
+            jnp.asarray(self.surface.gamma().reshape((-1, 3))),
+            jnp.asarray(self.surface.normal().reshape((-1, 3))),
+        )
+
+    def _J_pure(self, sdofs, gammas, ns):
+        """CSR–surface hinge penalty on the fundamental-domain samples."""
+        csr = self._csr_curve(sdofs)
+        qp = self._qp_sector
+        gammac = csr.gamma_eval(qp)
+        lc = csr.gamma_eval(qp, 1)
+        dists = jnp.sqrt(jnp.sum(
+            (gammac[:, None, :] - gammas[None, :, :]) ** 2, axis=2,
+        ))
+        integralweight = (
+            jnp.linalg.norm(lc, axis=1)[:, None]
+            * jnp.linalg.norm(ns, axis=1)[None, :]
+        )
+        return jnp.mean(
+            integralweight
+            * jnp.maximum(self.minimum_distance - dists, 0) ** 2
+        )
+
+    def _compute(self):
+        """Evaluate J and its support gradient from ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        sdofs = self._coil_support.support_dofs
+        gammas, ns = self._surface_arrays()
+        J_val, grad_sdofs = self._jit_vg(sdofs, gammas, ns)
+        self._J_cache = float(J_val)
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """CSR–surface hinge penalty (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the support DOFs."""
+        self._compute()
+        return Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def shortest_distance(self):
+        """Smallest sampled CSR–surface point distance [m]."""
+        sdofs = self._coil_support.support_dofs
+        g_csr = np.asarray(self._csr_curve(sdofs).gamma_eval(self._qp_sector))
+        gammas = np.asarray(self.surface.gamma().reshape((-1, 3)))
+        return float(np.min(np.linalg.norm(
+            g_csr[:, None, :] - gammas[None, :, :], axis=-1,
+        )))
