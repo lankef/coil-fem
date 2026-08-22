@@ -117,6 +117,12 @@ def _make_csr(
     )
 
 
+def test_n_beam_cr_must_be_scalar():
+    """Unequal / sequence n_beam_cr is rejected (must be a scalar int)."""
+    with pytest.raises(ValueError, match="n_beam_cr"):
+        _make_csr(nfp=2, n_base=2, n_beam_cr=[1, 2])
+
+
 def _csr_curve_dofs(sb: SupportBeamsCSR, R: float = 1.0) -> jax.Array:
     dofs = jnp.zeros(sb._csr_curve_template.dofs.shape)
     return dofs.at[0].set(R)
@@ -144,19 +150,11 @@ def _support_dofs_cr(
 ):
     n_base = sb.n_base
     sd = _empty_cc_cf(n_base)
-    n_cr = sb._n_beam_cr
-    sd['phis_start_cr'] = [
-        jnp.full((n_cr[i],), phi_start) for i in range(n_base)
-    ]
-    sd['phis_end_cr'] = [
-        jnp.full((n_cr[i],), phi_end) for i in range(n_base)
-    ]
-    sd['v_end_cr'] = [
-        jnp.full((n_cr[i],), v_end) for i in range(n_base)
-    ]
-    sd['thetas_orientation_cr'] = [
-        jnp.zeros((n_cr[i],)) for i in range(n_base)
-    ]
+    n_cr = sb.n_beam_cr
+    sd['phis_start_cr'] = jnp.full((n_base, n_cr), phi_start)
+    sd['phis_end_cr'] = jnp.full((n_base, n_cr), phi_end)
+    sd['v_end_cr'] = jnp.full((n_base, n_cr), v_end)
+    sd['thetas_orientation_cr'] = jnp.zeros((n_base, n_cr))
     sd['csr_curve_dofs'] = _csr_curve_dofs(sb, R=R_csr)
     return sd
 
@@ -320,7 +318,7 @@ def test_taylor_v_end_cr_and_csr_curve_dofs_via_support_energy():
     def J_of(v_end, R_csr):
         sd = {
             **sd0,
-            'v_end_cr': [jnp.array([v_end])],
+            'v_end_cr': jnp.array([[v_end]]),
             'csr_curve_dofs': _csr_curve_dofs(sb, R=R_csr),
         }
         geom = sb.beam_geometry(curves, sd)
@@ -393,7 +391,7 @@ def test_taylor_objective_v_end_cr_and_csr_curve_dofs():
         def J_of(v_end, R_csr):
             sd = {
                 **sd0,
-                'v_end_cr': [jnp.array([v_end])],
+                'v_end_cr': jnp.array([[v_end]]),
                 'csr_curve_dofs': _csr_curve_dofs(support, R=R_csr),
             }
             out = fem.objective(cdofs, idofs, sd, metrics=('l2_von_mises',))

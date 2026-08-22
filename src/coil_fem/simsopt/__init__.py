@@ -6,6 +6,7 @@ from .objectives import (
     BeamCurveAngle,
     CoilFEMObjective,
     CSRVolume,
+    CSRCurveDistance,
 )
 from .coil_support import CoilSupport
 from .coil_support_fixed import (
@@ -23,6 +24,7 @@ __all__ = [
     "BeamCurveAngle",
     "CoilFEMObjective",
     "CSRVolume",
+    "CSRCurveDistance",
     "CoilSupport",
     "CoilSupportFixed",
     "CoilSupportFixedSorted",

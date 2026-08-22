@@ -14,6 +14,8 @@ coil curves.
 tangent.
 :class:`CSRVolume` estimates the central support ring volume as
 ``w1 * w2 * L`` from the live CSR curve.
+:class:`CSRCurveDistance` hinges CSR–coil centreline clearance
+(coil–coil pairs are omitted).
 """
 
 from __future__ import annotations
@@ -1367,3 +1369,213 @@ class CSRVolume(Optimizable):
         """
         sdofs = self._coil_support.support_dofs
         return float(jnp.mean(self._csr_curve(sdofs).incremental_arclength()))
+
+
+# ============================================================================
+# CSR–coil curve distance
+# ============================================================================
+
+
+def _csr_curve_distance_pure(
+    gamma_csr, dash_csr, gammas, dashes, minimum_distance, downsample,
+):
+    r"""Simsopt ``cc_distance_pure`` summed over CSR–coil pairs only.
+
+    .. math::
+        J = \sum_c \frac{1}{N_{\mathrm{csr}} N_c}
+            \sum_{i,j} \|\gamma'_{\mathrm{csr}}(i)\|\,\|\gamma'_c(j)\|
+            \max(0,\, d_{\min} - \|\gamma_{\mathrm{csr}}(i)-\gamma_c(j)\|)^2
+    """
+    gamma_csr = gamma_csr[::downsample, :]
+    dash_csr = dash_csr[::downsample, :]
+    n_csr = gamma_csr.shape[0]
+    alen_csr = jnp.linalg.norm(dash_csr, axis=1)
+    J = jnp.array(0.0)
+    for gamma_c, dash_c in zip(gammas, dashes):
+        gamma_c = gamma_c[::downsample, :]
+        dash_c = dash_c[::downsample, :]
+        dists = jnp.sqrt(jnp.sum(
+            (gamma_csr[:, None, :] - gamma_c[None, :, :]) ** 2, axis=2,
+        ))
+        alen = alen_csr[:, None] * jnp.linalg.norm(dash_c, axis=1)[None, :]
+        J = J + jnp.sum(
+            alen * jnp.maximum(minimum_distance - dists, 0.0) ** 2,
+        ) / (n_csr * gamma_c.shape[0])
+    return J
+
+
+class CSRCurveDistance(Optimizable):
+    r"""Penalise a CSR centreline that comes closer than ``minimum_distance``
+    to any base coil.
+
+    The hinge matches :class:`simsopt.geo.CurveCurveDistance`, but the only
+    pairs are CSR–coil.  Coil–coil pairs are omitted.  Live CSR geometry is
+    rebuilt from ``support_dofs['csr_curve_dofs']``; coils come from
+    :attr:`~coil_fem.simsopt.CoilSupport.base_curves`.
+
+    .. math::
+        J = \sum_{c \in \mathrm{base}}
+            \frac{1}{N_{\mathrm{csr}} N_c}
+            \sum_{i,j}
+            \|\gamma'_{\mathrm{csr}}(i)\|\,\|\gamma'_c(j)\|
+            \max\bigl(0,\, d_{\min} - \|\gamma_{\mathrm{csr}}(i)-\gamma_c(j)\|\bigr)^2
+
+    Parameters
+    ----------
+    coil_support : CoilSupportBeamsCSR
+        Provides the CSR curve DOFs and the base coil curves.
+    minimum_distance : float
+        Desired minimum CSR–coil centreline clearance [m].
+    downsample : int
+        Quadrature stride, as in :class:`simsopt.geo.CurveCurveDistance`.
+
+    Notes
+    -----
+    Only the base coils are used; stellarator-mirrored partners and
+    field-period rotations are not replicated.
+
+    Examples
+    --------
+    >>> Jcc = CSRCurveDistance(coil_support, minimum_distance=0.3)  # doctest: +SKIP
+    >>> Jcc.shortest_distance()  # doctest: +SKIP
+    0.41...
+    """
+
+    def __init__(
+        self,
+        coil_support,
+        minimum_distance: float,
+        downsample: int = 1,
+    ):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for CSRCurveDistance.")
+
+        support = coil_support.support
+        if not isinstance(support, SupportBeamsCSR):
+            raise TypeError(
+                "CSRCurveDistance requires coil_support.support to be a "
+                f"SupportBeamsCSR; got {type(support).__name__}."
+            )
+        minimum_distance = float(minimum_distance)
+        if minimum_distance < 0.0:
+            raise ValueError(
+                f"minimum_distance must be >= 0; got {minimum_distance}."
+            )
+        downsample = int(downsample)
+        if downsample < 1:
+            raise ValueError(f"downsample must be >= 1; got {downsample}.")
+
+        self._coil_support = coil_support
+        self._support = support
+        self._tmpl = support._csr_curve_template
+        self.minimum_distance = minimum_distance
+        self.downsample = downsample
+
+        self._base_curves_jax = [
+            CurveXYZFourierJAX.from_simsopt(c)
+            for c in coil_support.base_curves
+        ]
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=(0, 1)))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_curves: list | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _read_dofs(self):
+        """Read coil / support DOFs live from the simsopt graph."""
+        base_curves_dofs = [
+            jnp.asarray(c.get_dofs())
+            for c in self._coil_support.base_curves
+        ]
+        return base_curves_dofs, self._coil_support.support_dofs
+
+    def _csr_curve(self, sdofs):
+        """Rebuild the live CSR curve from ``sdofs['csr_curve_dofs']``."""
+        tmpl = self._tmpl
+        return CurveRZFourierJAX(
+            tmpl.quadpoints, sdofs['csr_curve_dofs'],
+            tmpl.order, tmpl.nfp, tmpl.stellsym,
+        )
+
+    def _curves_jax(self, cdofs):
+        """Rebuild traced coil curves from live DOFs."""
+        return [
+            CurveXYZFourierJAX(ref.quadpoints, d, ref.order)
+            for ref, d in zip(self._base_curves_jax, cdofs)
+        ]
+
+    def _J_pure(self, cdofs, sdofs):
+        """CSR–coil centreline hinge penalty (traced scalar)."""
+        csr = self._csr_curve(sdofs)
+        curves = self._curves_jax(cdofs)
+        return _csr_curve_distance_pure(
+            csr.gamma(), csr.gammadash(),
+            [c.gamma() for c in curves],
+            [c.gammadash() for c in curves],
+            self.minimum_distance,
+            self.downsample,
+        )
+
+    def _compute(self):
+        """Evaluate J and its gradients from the single ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        cdofs, sdofs = self._read_dofs()
+        J_val, (grad_cdofs, grad_sdofs) = self._jit_vg(cdofs, sdofs)
+        self._J_cache = float(J_val)
+        self._grad_curves = [np.asarray(g) for g in grad_cdofs]
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """CSR–coil centreline hinge penalty (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the coil and support DOFs.
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+
+        d = Derivative({})
+        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+            d = d + Derivative({curve: g})
+        return d + Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def shortest_distance(self):
+        """Smallest CSR–coil centreline point distance [m].
+
+        Returns
+        -------
+        float
+            Minimum over base coils of the sampled CSR–coil point distance.
+            If there are no base coils, returns ``inf``.
+        """
+        cdofs, sdofs = self._read_dofs()
+        g_csr = np.asarray(self._csr_curve(sdofs).gamma())[::self.downsample]
+        best = np.inf
+        for curve in self._curves_jax(cdofs):
+            g_c = np.asarray(curve.gamma())[::self.downsample]
+            dists = np.linalg.norm(
+                g_csr[:, None, :] - g_c[None, :, :], axis=-1,
+            )
+            best = min(best, float(np.min(dists)))
+        return best
