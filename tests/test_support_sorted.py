@@ -12,6 +12,8 @@ from coil_fem.simsopt.coil_support import (
     _cumsum_last_vjp,
     _decode_dphis,
     _encode_dphis,
+    _fold_into_interval,
+    _sector_width,
     _vjp_dphis,
 )
 from coil_fem.simsopt.coil_support_beams import (
@@ -418,8 +420,18 @@ def test_csr_sorted_defaults_inside_box_bounds():
     sd = cs.support_dofs
     assert 'phis_start_cr' in sd and 'phis_end_cr' in sd
     for ps, pe in zip(sd['phis_start_cr'], sd['phis_end_cr']):
-        assert np.all(np.diff(np.asarray(ps), prepend=0.0) >= -1e-15)
-        assert np.all(np.diff(np.asarray(pe), prepend=0.0) >= -1e-15)
+        ps = np.asarray(ps)
+        pe = np.asarray(pe)
+        # First increment may be negative after fold; later ones stay >= 0.
+        if ps.size:
+            assert -0.5 - 1e-14 <= ps[0] <= 0.5 + 1e-14
+        if ps.size > 1:
+            assert np.all(np.diff(ps) >= -1e-15)
+        s = 1.0 / nfp / 2.0
+        if pe.size:
+            assert -0.5 * s - 1e-14 <= pe[0] <= 0.5 * s + 1e-14
+        if pe.size > 1:
+            assert np.all(np.diff(pe) >= -1e-15)
 
 
 def test_csr_default_phis_end_cr_at_coil_center():
@@ -452,14 +464,19 @@ def test_csr_default_phis_end_cr_at_coil_center():
         problem_options={'solver': 'umfpack'},
         r_beam=0.05,
     )
+    s = _sector_width(nfp, False)
     sd = cs.support_dofs
     for pe, exp in zip(sd['phis_end_cr'], expected):
-        np.testing.assert_allclose(np.asarray(pe), exp, atol=1e-12)
+        folded = float(_fold_into_interval(exp[0], -0.5 * s, 0.5 * s))
+        np.testing.assert_allclose(
+            np.asarray(pe), np.full_like(exp, folded), atol=1e-12,
+        )
 
     encoded = _encode_dphis({'phis_end_cr': sd['phis_end_cr']})
     for d, exp in zip(encoded['dphis_end_cr'], expected):
+        folded = float(_fold_into_interval(exp[0], -0.5 * s, 0.5 * s))
         np.testing.assert_allclose(
-            np.asarray(d), np.array([exp[0], 0.0]), atol=1e-12,
+            np.asarray(d), np.array([folded, 0.0]), atol=1e-12,
         )
 
 
@@ -503,11 +520,12 @@ def test_csr_default_phis_start_cr_min_R_window_and_v_end():
     dcirc = np.minimum(np.abs(ps - phi0) % 1.0, 1.0 - (np.abs(ps - phi0) % 1.0))
     assert np.all(dcirc <= half + 1e-9), (ps, phi0, dcirc)
 
-    # Ascending in [0, 1) after sort; Sorted dphis ≥ 0.
+    # Remaining increments stay non-negative; first may be folded into [-0.5, 0.5].
     assert np.all(np.diff(ps) >= -1e-15)
     encoded = _encode_dphis({'phis_start_cr': sd['phis_start_cr']})
     dphis = np.asarray(encoded['dphis_start_cr'][0])
-    assert np.all(dphis >= -1e-15)
+    assert -0.5 - 1e-14 <= dphis[0] <= 0.5 + 1e-14
+    assert np.all(dphis[1:] >= -1e-15)
     np.testing.assert_allclose(np.cumsum(dphis), ps, atol=1e-12)
 
 
