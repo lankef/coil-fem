@@ -71,13 +71,6 @@ def _coil_center_phi_array(base_coils, n_beam_cr):
     return jnp.stack(rows, axis=0) if rows else jnp.zeros((0, n))
 
 
-def _v_end_cr_array(n_coil, n_beam_cr):
-    """``v_end_cr`` of shape ``(n_coil, n_beam_cr)``; ``n=1`` → 0."""
-    n = int(n_beam_cr)
-    row = jnp.zeros(1) if n == 1 else jnp.linspace(-1.0, 1.0, n)
-    return jnp.broadcast_to(row, (int(n_coil), n))
-
-
 def _min_R_phi_window_array(base_coils, n_beam_cr, width=0.1):
     """``phis_start_cr`` of shape ``(n_coil, n_beam_cr)``.
 
@@ -113,8 +106,8 @@ class CoilSupportBeamsCSR(CoilSupport):
 
     Wraps :class:`~coil_fem.coupling.SupportBeamsCSR`.  In addition to the
     CC/CF DOFs of :class:`CoilSupportBeams`, exposes CR attachment angles
-    (``phis_start_cr``, ``phis_end_cr``), the cross-section offset
-    ``v_end_cr``, CR orientations, and ``csr_curve_dofs``.
+    (``phis_start_cr``, ``phis_end_cr``), CR orientations, and
+    ``csr_curve_dofs``.  CR ends sit on the CSR centerline.
 
     Parameters
     ----------
@@ -132,7 +125,7 @@ class CoilSupportBeamsCSR(CoilSupport):
     phis_start_cc, phis_end_cc, phis_start_cf, x_foundation,
     thetas_orientation_cc, thetas_orientation_cf
         Same as :class:`CoilSupportBeams`.
-    phis_start_cr, phis_end_cr, v_end_cr, thetas_orientation_cr
+    phis_start_cr, phis_end_cr, thetas_orientation_cr
         Rectangular CR DOFs of shape ``(n_base, n_beam_cr)``.
     csr_curve_dofs : array-like or None
         Initial CSR :class:`~coil_fem.geo.CurveRZFourierJAX` DOFs.  Default
@@ -154,7 +147,6 @@ class CoilSupportBeamsCSR(CoilSupport):
         phis_start_cf=None,
         phis_start_cr=None,
         phis_end_cr=None,
-        v_end_cr=None,
         x_foundation=None,
         thetas_orientation_cc=None,
         thetas_orientation_cf=None,
@@ -174,7 +166,6 @@ class CoilSupportBeamsCSR(CoilSupport):
         self._phis_start_cf = phis_start_cf
         self._phis_start_cr = phis_start_cr
         self._phis_end_cr = phis_end_cr
-        self._v_end_cr = v_end_cr
         self._x_foundation = x_foundation
         self._thetas_orientation_cc = thetas_orientation_cc
         self._thetas_orientation_cf = thetas_orientation_cf
@@ -326,7 +317,6 @@ class CoilSupportBeamsCSR(CoilSupport):
         _phis_end_cr = _check_rect_shape(
             phis_end_cr, _shape_cr, 'phis_end_cr',
         )
-        _v_end_cr = _check_rect_shape(v_end_cr, _shape_cr, 'v_end_cr')
         _theta_cc = _check_ragged_shape(
             thetas_orientation_cc, n_beam_cc, 'thetas_orientation_cc',
         )
@@ -376,10 +366,6 @@ class CoilSupportBeamsCSR(CoilSupport):
             'phis_end_cr': (
                 _phis_end_cr if _phis_end_cr is not None
                 else _coil_center_phi_array(base_coils, n_beam_cr)
-            ),
-            'v_end_cr': (
-                _v_end_cr if _v_end_cr is not None
-                else _v_end_cr_array(n_base, n_beam_cr)
             ),
             'thetas_orientation_cc': (
                 _theta_cc if _theta_cc is not None
@@ -463,7 +449,7 @@ class CoilSupportBeamsCSR(CoilSupport):
             ]
         if n_beam_cr == 0:
             fixed_dof_names += [
-                'phis_start_cr', 'phis_end_cr', 'v_end_cr',
+                'phis_start_cr', 'phis_end_cr',
                 'thetas_orientation_cr',
             ]
 
@@ -519,21 +505,6 @@ class CoilSupportBeamsCSR(CoilSupport):
         lb, ub = _apply_sorted_dphi_bounds(
             lb, ub, support_dofs_jax, nfp, stellsym,
         )
-        # v_end_cr ∈ [-1, 1]
-        v_probe = {
-            k: tree_map(
-                lambda leaf, kk=k: np.full(
-                    np.shape(leaf), kk == 'v_end_cr', dtype=bool,
-                ),
-                v,
-            )
-            for k, v in support_dofs_jax.items()
-        }
-        v_mask, _ = ravel_pytree(v_probe)
-        lb = np.asarray(lb, dtype=float)
-        ub = np.asarray(ub, dtype=float)
-        lb = np.where(v_mask, -1.0, lb)
-        ub = np.where(v_mask, 1.0, ub)
 
         super().__init__(
             base_coils,
@@ -580,7 +551,7 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
     Parameters
     ----------
     base_coils, nfp, stellsym, beam_options, csr_options, problem_options,
-    v_end_cr, x_foundation, thetas_orientation_cc, thetas_orientation_cf,
+    x_foundation, thetas_orientation_cc, thetas_orientation_cf,
     thetas_orientation_cr, csr_curve_dofs, fixed_clamp_options,
     fixed_dof_names, names, dofs, **kwargs
         Same as :class:`CoilSupportBeamsCSR`, except angle seeds use ``dphis*``
@@ -608,7 +579,6 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
         dphis_start_cf=None,
         dphis_start_cr=None,
         dphis_end_cr=None,
-        v_end_cr=None,
         x_foundation=None,
         thetas_orientation_cc=None,
         thetas_orientation_cf=None,
@@ -660,7 +630,6 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
             phis_start_cf=decoded.get('phis_start_cf'),
             phis_start_cr=decoded.get('phis_start_cr'),
             phis_end_cr=decoded.get('phis_end_cr'),
-            v_end_cr=v_end_cr,
             x_foundation=x_foundation,
             thetas_orientation_cc=thetas_orientation_cc,
             thetas_orientation_cf=thetas_orientation_cf,

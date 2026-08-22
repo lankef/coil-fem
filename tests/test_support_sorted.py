@@ -436,7 +436,7 @@ def test_csr_sorted_defaults_inside_box_bounds():
 
 
 def test_csr_default_phis_end_cr_at_coil_center():
-    """Default phis_end_cr seeds at each coil's cylindrical angle."""
+    """Default phis_end_cr is each coil's cylindrical angle, cumsummed over coils."""
     pytest.importorskip("simsopt")
     from simsopt.field import Coil, Current
     from simsopt.geo import create_equally_spaced_curves
@@ -481,8 +481,8 @@ def test_csr_default_phis_end_cr_at_coil_center():
     np.testing.assert_allclose(d, expected_d, atol=1e-12)
 
 
-def test_csr_default_phis_start_cr_min_R_window_and_v_end():
-    """phis_start_cr in width-1/4 min-R window; v_end_cr = linspace(-1, 1)."""
+def test_csr_default_phis_start_cr_min_R_window():
+    """phis_start_cr in the default min-R window."""
     pytest.importorskip("simsopt")
     from simsopt.field import Coil, Current
     from simsopt.geo import create_equally_spaced_curves
@@ -510,10 +510,6 @@ def test_csr_default_phis_start_cr_min_R_window_and_v_end():
         r_beam=0.05,
     )
     sd = cs.support_dofs
-    np.testing.assert_allclose(
-        np.asarray(sd['v_end_cr'][0]), [-1.0, 0.0, 1.0], atol=1e-12,
-    )
-
     ps = np.asarray(sd['phis_start_cr'][0])
     assert ps.shape == (n_cr,)
     # Circular distance to phi0 ≤ half-width (+ tiny tol).

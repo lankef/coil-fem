@@ -69,17 +69,20 @@ src/coil_fem/                  # main package (Hatchling src-layout)
     curve_jax.py               # CurveXYZFourierJAX — JAX pytree, simsopt interop
     framed_curve_jax.py        # FramedCurveCentroidJAX / FramedCurveRMFJAX
     symmetries.py              # Stellarator symmetry expansion (pure JAX)
-  coupling/                    # Support structure coupling subpackage
-    __init__.py                # re-exports Support, SupportBeams, solve_staggered, solve_monolithic
+    coupling/                    # Support structure coupling subpackage
+    __init__.py                # re-exports Support, SupportBeams, SupportBeamsCSR, drivers
     supports.py                # Support (concrete grounded Winkler/Robin BC)
     beam_network.py            # SupportBeams — bisymmetric beam-network support (coil-coil + coil-foundation)
+    beam_network_csr.py        # SupportBeamsCSR — central support ring + coil-to-CSR beams
     drivers.py                 # solve_staggered (BG-S + Aitken + IFT grad), solve_monolithic (cuDSS-only)
   simsopt/                     # simsopt Optimizable interop subpackage
-    __init__.py                # re-exports CoilFEMObjective, CoilSupport*, CoilSupportBeams*
-    objectives.py              # CoilFEMObjective — simsopt Optimizable wrapper
-    coil_support.py            # CoilSupport base + shared dphis / k_clamp helpers
+    __init__.py                # re-exports CoilFEMObjective, CoilSupport*, CSR* objectives
+    objectives.py              # CoilFEMObjective + beam/CSR geometric constraints
+    coil_support.py            # CoilSupport base + k_clamp helpers
+    sorted_dphis.py            # Incremental dphis* ↔ phis* codecs for Sorted classes
     coil_support_fixed.py      # CoilSupportFixed, TopBottom, FixedSorted
     coil_support_beams.py      # CoilSupportBeams, CoilSupportBeamsSorted
+    coil_support_beams_csr.py  # CoilSupportBeamsCSR, CoilSupportBeamsCSRSorted
   solvers/                     # Optional GPU solver subpackage
     __init__.py
     cudss.py                   # GPU sparse direct solver (spineax + NVIDIA cuDSS)
@@ -261,6 +264,15 @@ Optimisable quantities live in `support_dofs` (passed at solve time, never store
 - `x_foundation` — foundation anchor positions for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i], 3)`.
 - `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam as a fraction of a turn in ``[0, 1]`` (same per-group / per-coil list layout as the attachment angles); applied as ``2π · θ`` in Rodrigues.
 
+### `SupportBeamsCSR` (`coupling/beam_network_csr.py`)
+
+`SupportBeamsCSR` extends `SupportBeams` with a one-field-period central support ring (CSR) and coil-to-CSR (CR) beams. The ring lives in the `K_ss` block; `CoilFEM` needs no solve-path changes.
+
+- `n_beam_cr` — scalar int (same CR count on every coil). A sequence is rejected.
+- CR attachment DOFs are rectangular arrays of shape `(n_base, n_beam_cr)`: `phis_start_cr`, `phis_end_cr`, `thetas_orientation_cr`. CR ends sit on the CSR centerline. CC/CF keys stay ragged lists.
+- `phis_end_cr` are angles around the CSR (not on the coil). Sorted encoding increments them along the **coil** axis: `phis_end_cr[i, j] = sum_{k<=i} dphis_end_cr[k, j]`. Other `phis*` still increment along the beam axis.
+- `csr_curve_dofs` — `CurveRZFourierJAX` coefficients for the ring centreline.
+
 ### Solver drivers (`coupling/drivers.py`)
 
 Two module-level driver functions replace the uncoupled per-coil loop in `CoilFEM` when `support.is_coupled=True`:
@@ -281,7 +293,9 @@ Two module-level driver functions replace the uncoupled per-coil loop in `CoilFE
 
 ### simsopt interop (`simsopt/coil_support*.py`)
 
-`CoilSupport` is the simsopt `Optimizable` base class that holds `base_coils`, `nfp`, `stellsym`, and the `Support` instance.  `CoilSupportFixed` and `CoilSupportTopBottom` are concrete subclasses.  `CoilFEMObjective` takes a single `CoilSupport` as its primary argument.
+`CoilSupport` is the simsopt `Optimizable` base class that holds `base_coils`, `nfp`, `stellsym`, and the `Support` instance.  Concrete subclasses include `CoilSupportFixed` / `TopBottom`, `CoilSupportBeams`, and `CoilSupportBeamsCSR` (plus `*Sorted` variants).  `CoilFEMObjective` takes a single `CoilSupport` as its primary argument.
+
+Sorted classes store incremental `dphis*` DOFs. The codecs live in `sorted_dphis.py`: most keys `cumsum` along the last (beam) axis; `dphis_end_cr` `cumsum`s along the coil axis of the `(n_coil, n_beam_cr)` array. First-increment box bounds follow the same axis choice (beam 0 vs coil 0).
 
 ### Adding a new `Support` subclass
 

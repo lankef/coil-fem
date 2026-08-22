@@ -102,7 +102,6 @@ def test_apply_sorted_dphi_bounds_first_and_rest():
         'dphis_start_cf': [jnp.array([0.05])],
         'dphis_start_cr': [jnp.array([0.4, 0.05])],
         'dphis_end_cr': jnp.array([[0.01, 0.02], [0.03, 0.04]]),
-        'v_end_cr': jnp.array([[-1.0, 1.0]]),
         'r_beam': [jnp.array([0.01])],
     }
     unit_keys = tuple(k for k in tree if k.startswith('dphis'))
@@ -133,9 +132,6 @@ def test_apply_sorted_dphi_bounds_first_and_rest():
         if name in expected:
             exp_lo, exp_hi = expected[name]
             assert lo == exp_lo and hi == exp_hi, (name, lo, hi, exp_lo, exp_hi)
-        elif key == 'v_end_cr':
-            # CSR constructor overlays [-1, 1] after this helper.
-            assert np.isneginf(lo) and np.isposinf(hi), name
         elif key == 'r_beam':
             assert lo == 0.0 and np.isposinf(hi), name
         else:

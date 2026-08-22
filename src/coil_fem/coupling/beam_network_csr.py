@@ -2,7 +2,7 @@
 
 :class:`SupportBeamsCSR` extends :class:`~coil_fem.coupling.SupportBeams` with
 a rectangular-section central support ring meshed over one field period and
-coil-to-CSR (CR) beams that attach with an extra ``v_end_cr`` DOF.
+coil-to-CSR (CR) beams that end on the CSR centerline.
 """
 
 from __future__ import annotations
@@ -27,9 +27,10 @@ class SupportBeamsCSR(SupportBeams):
 
     The CSR is a :class:`~coil_fem.meshing.FramedCurveMeshRectangle` swept over
     ``phi ∈ [0, 1/nfp]`` with an exact periodic DOF tie at the seam.  Coil-to-
-    CSR (CR) beams attach like CF beams topologically (one entry per base coil)
-    but place their free end on the CSR surface with DOFs
-    ``(phi_end_cr, v_end_cr)``.
+    CSR (CR) beams attach one group per base coil, all with the same
+    ``n_beam_cr`` count.  Attachment DOFs are rectangular arrays of shape
+    ``(n_base, n_beam_cr)``; the free end sits on the CSR centerline at
+    ``phi_end_cr``.
 
     The ring lives entirely inside the support ``K_ss`` block, so
     :class:`~coil_fem.CoilFEM` needs no solve-path changes.
@@ -395,6 +396,10 @@ class SupportBeamsCSR(SupportBeams):
 
     @property
     def n_beams_per_coil(self):
+        """Per-coil totals ``n_beam_cc[i] + n_beam_cf[i] + n_beam_cr``.
+
+        Excludes the stellsym wrap group (group ``n_base``).
+        """
         return tuple(
             self._n_beam_cc[i] + self._n_beam_cf[i] + self._n_beam_cr
             for i in range(self.n_base)
@@ -414,21 +419,24 @@ class SupportBeamsCSR(SupportBeams):
     # ========================================================================
 
     def beam_geometry(self, curves_jax: list, support_dofs: dict) -> dict:
-        """Per-beam geometry including CR beams and CSR mesh points."""
+        """Per-beam geometry including CR beams and CSR mesh points.
+
+        CR keys (``phis_start_cr``, ``phis_end_cr``,
+        ``thetas_orientation_cr``) are ``(n_base, n_beam_cr)`` arrays;
+        row ``i`` is coil ``i``.
+        """
         phis_start_cc = support_dofs['phis_start_cc']
         phis_end_cc = support_dofs['phis_end_cc']
         phis_start_cf = support_dofs['phis_start_cf']
         x_foundation = support_dofs['x_foundation']
         phis_start_cr = support_dofs['phis_start_cr']
         phis_end_cr = support_dofs['phis_end_cr']
-        v_end_cr = support_dofs['v_end_cr']
 
         csr_dofs = support_dofs['csr_curve_dofs']
         tmpl = self._csr_curve_template
         csr_curve = CurveRZFourierJAX(
             tmpl.quadpoints, csr_dofs, tmpl.order, tmpl.nfp, tmpl.stellsym,
         )
-        csr_fc = self._csr_framed_template.with_dofs(csr_dofs)
         csr_points = self.csr_mesh.mesh_points_from_dofs(csr_dofs)
 
         x_start_list, x_end_list = [], []
@@ -483,15 +491,12 @@ class SupportBeamsCSR(SupportBeams):
             if n_cr_i > 0:
                 phi_s = phis_start_cr[i]
                 phi_e = phis_end_cr[i]
-                v_e = v_end_cr[i]
                 x_s = curve_i.gamma_eval(phi_s)
                 t_cs_raw = curve_i.gamma_eval(phi_s, diff_order=1)
                 t_cs = t_cs_raw / (
                     jnp.linalg.norm(t_cs_raw, axis=1, keepdims=True) + 1e-300
                 )
-                gamma_e = csr_curve.gamma_eval(phi_e)
-                _, _, q_e = csr_fc.rotated_frame_eval(phi_e)
-                x_e = gamma_e + (self._csr_b / 2.0) * v_e[:, None] * q_e
+                x_e = csr_curve.gamma_eval(phi_e)
                 t_ce_raw = csr_curve.gamma_eval(phi_e, diff_order=1)
                 t_ce = t_ce_raw / (
                     jnp.linalg.norm(t_ce_raw, axis=1, keepdims=True) + 1e-300
@@ -888,7 +893,9 @@ class SupportBeamsCSR(SupportBeams):
             jxw_by_coil=jxw_by_coil, beam_endpoints=beam_endpoints,
         )
 
-        # ── Ring block ──────────────────────────────────────────────────────
+        # ============================================================================
+        # Ring block
+        # ============================================================================
         csr_pts = geom['csr_points']
         csr_surf = self._csr_pipeline.surface_quad_points(csr_pts)
         # Attachment weights on the ring surface.
@@ -917,7 +924,9 @@ class SupportBeamsCSR(SupportBeams):
         ).reshape(-1)
         V_csr = jnp.concatenate([V_plain, V_exp]) * self._w_sym
 
-        # ── Beam↔CSR off-diagonal springs ───────────────────────────────────
+        # ============================================================================
+        # Beam↔CSR off-diagonal springs
+        # ============================================================================
         V_spr = self._csr_beam_spring_values(geom, support_dofs, csr_surf)
 
         return jnp.concatenate([V_beams, V_csr, V_spr])
@@ -1047,6 +1056,10 @@ class SupportBeamsCSR(SupportBeams):
         w_a_full = onp.zeros(n_nodes, dtype=onp.float64)
         w_g_full[surf_idx] = onp.asarray(w_g, dtype=onp.float64)
         w_a_full[surf_idx] = onp.asarray(w_a, dtype=onp.float64)
+        phi_idx = self.csr_mesh.phi_idx_per_node
+        end_nodes = (phi_idx == 0) | (phi_idx == int(phi_idx.max()))
+        w_a_full[end_nodes] = 0.0
+        w_g_full[end_nodes] = 0.0
         k_clamp = float(self.k_clamp)
         k_attach = float(self.k_attachment)
         return {

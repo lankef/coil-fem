@@ -1,4 +1,4 @@
-"""Checks for the CSRCurveDistance CSR–coil centreline hinge."""
+"""Checks for the CSRSurfaceDistance CSR–surface hinge."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ import pytest
 simsopt = pytest.importorskip("simsopt")
 
 from simsopt.field import Coil, Current                       # noqa: E402
-from simsopt.geo import create_equally_spaced_curves          # noqa: E402
+from simsopt.geo import SurfaceRZFourier, create_equally_spaced_curves  # noqa: E402
 
 from coil_fem.simsopt import (                                # noqa: E402
-    CSRCurveDistance,
+    CSRSurfaceDistance,
     CoilSupportBeamsCSR,
 )
 
@@ -28,18 +28,11 @@ def _csr_dofs(R, order=1, stellsym=False):
     return dofs
 
 
-def _make_coil_support(
-    *,
-    R=3.0,
-    n_base=1,
-    coil_R0=1.2,
-    coil_R1=0.4,
-    stellsym=False,
-):
+def _make_coil_support(*, R=3.0, stellsym=False):
     """CSR support with a circular ring of radius ``R``."""
     curves = create_equally_spaced_curves(
-        n_base, NFP, stellsym=stellsym,
-        R0=coil_R0, R1=coil_R1, order=1, numquadpoints=16,
+        1, NFP, stellsym=stellsym,
+        R0=1.2, R1=0.4, order=1, numquadpoints=16,
     )
     base_coils = [Coil(c, Current(1e5)) for c in curves]
     return CoilSupportBeamsCSR(
@@ -80,6 +73,19 @@ def _make_coil_support(
     )
 
 
+def _make_surface(nphi=8, ntheta=8):
+    """A small torus well inside a large CSR ring."""
+    surf = SurfaceRZFourier(
+        nfp=NFP, stellsym=True, mpol=1, ntor=0,
+        quadpoints_phi=np.linspace(0, 1, nphi, endpoint=False),
+        quadpoints_theta=np.linspace(0, 1, ntheta, endpoint=False),
+    )
+    surf.set_rc(0, 0, 1.0)
+    surf.set_rc(1, 0, 0.15)
+    surf.set_zs(1, 0, 0.15)
+    return surf
+
+
 def _rc0_index(opt):
     """Index of ``csr_curve_dofs(0)`` (``rc_0``) in ``opt.x``."""
     for i, name in enumerate(opt.dof_names):
@@ -89,58 +95,52 @@ def _rc0_index(opt):
 
 
 def test_far_csr_is_feasible():
-    """Circular CSR well outside the coils → J == 0."""
+    """Circular CSR well outside the torus → J == 0."""
     cs = _make_coil_support(R=3.0)
-    Jcc = CSRCurveDistance(cs, DMIN)
-    assert Jcc.J() == 0.0
-    assert Jcc.shortest_distance() > DMIN
+    Jcs = CSRSurfaceDistance(cs, _make_surface(), DMIN)
+    assert Jcs.J() == 0.0
+    assert Jcs.shortest_distance() > DMIN
 
 
 def test_near_csr_is_penalised():
-    """CSR through the coils → J > 0."""
-    cs = _make_coil_support(R=0.9)
-    Jcc = CSRCurveDistance(cs, DMIN)
-    assert Jcc.J() > 0.0
-    assert Jcc.shortest_distance() < DMIN
-
-
-def test_ignores_coil_coil_pairs():
-    """Two close coils and a far CSR: J == 0 even if coil–coil < dmin."""
-    cs = _make_coil_support(
-        R=5.0, n_base=2, coil_R0=1.0, coil_R1=0.25, stellsym=False,
-    )
-    g0 = cs.base_curves[0].gamma()
-    g1 = cs.base_curves[1].gamma()
-    coil_coil = float(np.min(np.linalg.norm(
-        g0[:, None, :] - g1[None, :, :], axis=-1,
-    )))
-    dmin = coil_coil + 0.05
-    Jcc = CSRCurveDistance(cs, dmin)
-    assert coil_coil < dmin
-    assert Jcc.shortest_distance() > dmin
-    assert Jcc.J() == 0.0
+    """CSR through the torus → J > 0."""
+    cs = _make_coil_support(R=1.0)
+    Jcs = CSRSurfaceDistance(cs, _make_surface(), DMIN)
+    assert Jcs.J() > 0.0
+    assert Jcs.shortest_distance() < DMIN
 
 
 def test_taylor_dJ_d_rc0():
     """Centered FD on ``csr_curve_dofs(0)`` matches ``dJ`` while the hinge is active."""
-    cs = _make_coil_support(R=0.9)
-    Jcc = CSRCurveDistance(cs, DMIN)
-    assert Jcc.J() > 0.0
-    g = Jcc.dJ()
-    i = _rc0_index(Jcc)
+    cs = _make_coil_support(R=1.0)
+    Jcs = CSRSurfaceDistance(cs, _make_surface(), DMIN)
+    assert Jcs.J() > 0.0
+    g = Jcs.dJ()
+    i = _rc0_index(Jcs)
     eps = 1e-6
-    x0 = Jcc.x.copy()
+    x0 = Jcs.x.copy()
     x_p = x0.copy()
     x_m = x0.copy()
     x_p[i] += eps
     x_m[i] -= eps
-    Jcc.x = x_p
-    Jp = Jcc.J()
-    Jcc.x = x_m
-    Jm = Jcc.J()
-    Jcc.x = x0
+    Jcs.x = x_p
+    Jp = Jcs.J()
+    Jcs.x = x_m
+    Jm = Jcs.J()
+    Jcs.x = x0
     fd = (Jp - Jm) / (2.0 * eps)
     np.testing.assert_allclose(g[i], fd, rtol=1e-4, atol=1e-8)
+
+
+@pytest.mark.parametrize('stellsym', [False, True])
+def test_quadpoints_are_one_sector(stellsym):
+    """CSR samples stay in the first field period / stellsym half."""
+    cs = _make_coil_support(R=3.0, stellsym=stellsym)
+    Jcs = CSRSurfaceDistance(cs, _make_surface(), DMIN)
+    phi_max = 1.0 / NFP / (2.0 if stellsym else 1.0)
+    qp = np.asarray(Jcs._qp_sector)
+    assert qp.size > 0
+    assert np.max(qp) < phi_max
 
 
 def test_rejects_non_csr_support():
@@ -165,4 +165,4 @@ def test_rejects_non_csr_support():
         r_beam=0.05,
     )
     with pytest.raises(TypeError, match='SupportBeamsCSR'):
-        CSRCurveDistance(cs, DMIN)
+        CSRSurfaceDistance(cs, _make_surface(), DMIN)

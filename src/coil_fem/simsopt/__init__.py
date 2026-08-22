@@ -1,4 +1,9 @@
-"""Simsopt integration."""
+"""Simsopt Optimizable wrappers for coil-fem supports and objectives.
+
+Re-exports :class:`CoilSupport` and its Fixed / Beams / CSR subclasses
+(including Sorted variants), plus :class:`CoilFEMObjective` and the
+beam / CSR geometric constraints.
+"""
 
 from .objectives import (
     BeamSurfaceDistance,
@@ -7,6 +12,7 @@ from .objectives import (
     CoilFEMObjective,
     CSRVolume,
     CSRCurveDistance,
+    CSRSurfaceDistance,
 )
 from .coil_support import CoilSupport
 from .coil_support_fixed import (
@@ -25,6 +31,7 @@ __all__ = [
     "CoilFEMObjective",
     "CSRVolume",
     "CSRCurveDistance",
+    "CSRSurfaceDistance",
     "CoilSupport",
     "CoilSupportFixed",
     "CoilSupportFixedSorted",
