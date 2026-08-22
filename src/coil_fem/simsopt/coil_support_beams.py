@@ -24,11 +24,13 @@ from .coil_support import (
     _DPHI_TO_PHI,
     _PHI_TO_DPHI,
     _SortedDphisMixin,
+    _apply_sorted_dphi_bounds,
     _broadcast_phis,
     _cumsum_last,
     _cumsum_last_vjp,
     _diff_last,
     _encode_dphis,
+    _fold_first_dphis,
     _generate_k_clamp,
     _tree_cumsum_last,
 )
@@ -580,6 +582,9 @@ class CoilSupportBeams(CoilSupport):
             unit_interval_keys=unit_interval_keys,
             nonnegative_keys=tuple(cross_section_dof_keys),
         )
+        lb, ub = _apply_sorted_dphi_bounds(
+            lb, ub, support_dofs_jax, nfp, stellsym,
+        )
 
         # ── Initialize CoilSupport (calls Optimizable.__init__) ───────────────
         super().__init__(
@@ -612,10 +617,12 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
     (and optional clamp ``dphis``) with absolute angles recovered by
     ``cumsum`` along the last axis — except for the two stellsym wrap
     groups, where ``phis_end_cc`` is recovered as ``1 - cumsum(dphis_end_cc)``
-    (a positive step *backward* from ``phi = 1``).  That keeps every
-    ``dphis_*`` non-negative while preserving the geometric pairing
-    ``phi_end[j] = 1 - phi_start[j]``.  :attr:`support_dofs` exposes
-    ``phis*`` for the FEM; :meth:`flatten_grad` applies the matching VJP.
+    (a positive step *backward* from ``phi = 1``).  The first increment of
+    ``dphis_start_cc``, ``dphis_end_cc``, and ``dphis_start_cf`` is boxed
+    to ``[-0.5, 0.5]`` (later increments stay in ``[0, 1]``) and default
+    first values are folded into that interval.  :attr:`support_dofs`
+    exposes ``phis*`` for the FEM; :meth:`flatten_grad` applies the
+    matching VJP.
 
     Parameters
     ----------
@@ -653,8 +660,9 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
         **kwargs,
     ):
         # Must precede super().__init__: _encode_angle_dofs runs during
-        # CoilSupportBeams.__init__ and needs this flag.
+        # CoilSupportBeams.__init__ and needs these flags.
         self._sorted_stellsym = bool(stellsym)
+        self._sorted_nfp = int(nfp)
         self._dphis_start_cc = dphis_start_cc
         self._dphis_end_cc = dphis_end_cc
         self._dphis_start_cf = dphis_start_cf
@@ -698,5 +706,8 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
             encoded['dphis_end_cc'] = _encode_end_cc(
                 support_dofs_jax['phis_end_cc'], self._sorted_stellsym,
             )
+        encoded = _fold_first_dphis(
+            encoded, self._sorted_nfp, self._sorted_stellsym,
+        )
         renamed = [_PHI_TO_DPHI.get(k, k) for k in fixed_dof_names]
         return encoded, renamed

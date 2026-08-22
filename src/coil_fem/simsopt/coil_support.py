@@ -40,9 +40,123 @@ _DPHI_TO_PHI = {
 _PHI_TO_DPHI = {v: k for k, v in _DPHI_TO_PHI.items()}
 _ANGLE_UNIT_KEYS = frozenset(_DPHI_TO_PHI) | frozenset(_PHI_TO_DPHI)
 
+# First-increment box is [-0.5, 0.5] for these Sorted keys (period 1).
+_FIRST_DPHI_HALF_TURN_KEYS = frozenset({
+    'dphis_start_cc',
+    'dphis_end_cc',
+    'dphis_start_cf',
+    'dphis_start_cr',
+})
+
+
+def _sector_width(nfp, stellsym):
+    """CSR-end increment period: ``1/nfp``, or ``1/(2 nfp)`` under stellsym."""
+    return 1.0 / float(nfp) / (2.0 if stellsym else 1.0)
+
+
+def _fold_into_interval(x, lo, hi):
+    """Periodic reduction of ``x`` into ``[lo, hi)`` (``hi`` maps to ``lo``)."""
+    width = hi - lo
+    return jnp.mod(x - lo, width) + lo
+
+
+def _fold_first_last_axis(x, lo, hi):
+    """Fold only ``x[..., 0]`` into ``[lo, hi]``; later increments unchanged."""
+    x = jnp.asarray(x, dtype=float)
+    if x.ndim == 0 or x.shape[-1] == 0:
+        return x
+    return x.at[..., 0].set(_fold_into_interval(x[..., 0], lo, hi))
+
+
+def _fold_first_dphis(tree, nfp, stellsym):
+    """Fold first Sorted increments into their box so default ``x0`` is feasible.
+
+    Half-turn keys (CC start/end, CF start, CR start) fold into ``[-0.5, 0.5]``.
+    ``dphis_end_cr`` folds into ``[-0.5 s, 0.5 s]`` with
+    ``s = :func:`_sector_width``.  Later increments and other keys are left
+    alone.  Clamp ``dphis`` is not folded.
+    """
+    s = _sector_width(nfp, stellsym)
+    out = {}
+    for k, v in tree.items():
+        if k in _FIRST_DPHI_HALF_TURN_KEYS:
+            out[k] = tree_map(
+                lambda leaf: _fold_first_last_axis(leaf, -0.5, 0.5), v,
+            )
+        elif k == 'dphis_end_cr':
+            out[k] = tree_map(
+                lambda leaf: _fold_first_last_axis(leaf, -0.5 * s, 0.5 * s), v,
+            )
+        else:
+            out[k] = v
+    return out
+
+
+def _last_axis_first_mask(tree, keys):
+    """Boolean pytree: True on ``leaf[..., 0]`` for ``keys``."""
+    keys = set(keys)
+
+    def _leaf(leaf, key):
+        mask = np.zeros(np.shape(leaf), dtype=bool)
+        if key in keys and mask.ndim >= 1 and mask.shape[-1] > 0:
+            mask[..., 0] = True
+        return mask
+
+    return {
+        k: tree_map(lambda leaf, kk=k: _leaf(leaf, kk), v)
+        for k, v in tree.items()
+    }
+
+
+def _last_axis_rest_mask(tree, keys):
+    """Boolean pytree: True on ``leaf[..., 1:]`` for ``keys``."""
+    keys = set(keys)
+
+    def _leaf(leaf, key):
+        mask = np.zeros(np.shape(leaf), dtype=bool)
+        if key in keys and mask.ndim >= 1 and mask.shape[-1] > 1:
+            mask[..., 1:] = True
+        return mask
+
+    return {
+        k: tree_map(lambda leaf, kk=k: _leaf(leaf, kk), v)
+        for k, v in tree.items()
+    }
+
+
+def _apply_sorted_dphi_bounds(lb, ub, tree, nfp, stellsym):
+    """Overlay Sorted first/rest ``dphis*`` box bounds on flattened ``lb``/``ub``.
+
+    No-op when ``tree`` has no ``dphis*`` keys (non-Sorted ``phis*`` classes).
+
+    * first of :data:`_FIRST_DPHI_HALF_TURN_KEYS`: ``[-0.5, 0.5]``
+    * first of ``dphis_end_cr``: ``[-0.5 s, 0.5 s]``
+    * remaining ``dphis_end_cr``: upper bound ``s`` (lower stays 0)
+    """
+    if not any(k.startswith('dphis') for k in tree):
+        return lb, ub
+    s = _sector_width(nfp, stellsym)
+    first_half, _ = ravel_pytree(
+        _last_axis_first_mask(tree, _FIRST_DPHI_HALF_TURN_KEYS),
+    )
+    first_cr, _ = ravel_pytree(
+        _last_axis_first_mask(tree, ('dphis_end_cr',)),
+    )
+    rest_cr, _ = ravel_pytree(
+        _last_axis_rest_mask(tree, ('dphis_end_cr',)),
+    )
+    lb = np.asarray(lb, dtype=float).copy()
+    ub = np.asarray(ub, dtype=float).copy()
+    lb = np.where(first_half, -0.5, lb)
+    ub = np.where(first_half, 0.5, ub)
+    lb = np.where(first_cr, -0.5 * s, lb)
+    ub = np.where(first_cr, 0.5 * s, ub)
+    ub = np.where(rest_cr, s, ub)
+    return lb, ub
+
 
 def _diff_last(x):
-    """Encode absolute angles as non-negative increments along the last axis."""
+    """Encode absolute angles as increments along the last axis."""
     return jnp.diff(x, axis=-1, prepend=jnp.zeros_like(x[..., :1]))
 
 
