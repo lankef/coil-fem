@@ -18,6 +18,10 @@ tangent.
 (coil–coil pairs are omitted).
 :class:`CSRSurfaceDistance` hinges CSR–surface clearance on one
 field period (half period if stellsym).
+:class:`ClampInboard` hinges fixed clamps that sit radially outboard of
+each coil centre.
+:class:`CRBeamInboard` hinges coil-to-CSR beam starts that sit radially
+outboard of each coil centre.
 """
 
 from __future__ import annotations
@@ -1716,3 +1720,223 @@ class CSRSurfaceDistance(Optimizable):
         return float(np.min(np.linalg.norm(
             g_csr[:, None, :] - gammas[None, :, :], axis=-1,
         )))
+
+
+# ============================================================================
+# Inboard attachment hinge
+# ============================================================================
+
+
+def _inboard_hinge_pure(curves_jax, phis_per_coil):
+    r"""Sum of ``max(r - r_center, 0)^2`` over coils and attachment angles.
+
+    Parameters
+    ----------
+    curves_jax : sequence of CurveXYZFourierJAX
+        One curve per base coil.
+    phis_per_coil : sequence of jax.Array
+        Attachment angles per coil; entry ``i`` has shape ``(n_attach,)``.
+
+    Returns
+    -------
+    jax.Array, shape ()
+        Scalar hinge value.
+    """
+    J = jnp.array(0.0)
+    for curve, phis in zip(curves_jax, phis_per_coil):
+        c = curve.curve_center()
+        r_center = jnp.sqrt(c[0] ** 2 + c[1] ** 2)
+        x = curve.gamma_eval(phis)
+        r = jnp.sqrt(x[:, 0] ** 2 + x[:, 1] ** 2)
+        J = J + jnp.sum(jnp.maximum(r - r_center, 0.0) ** 2)
+    return J
+
+
+class _InboardPenalty(Optimizable):
+    r"""Shared hinge for attachment angles that sit outboard of a coil centre.
+
+    For each base coil :math:`i` with centre radius
+    :math:`r_{\mathrm{center},i} = \sqrt{x_{c0}^2 + y_{c0}^2}` and
+    attachment angles ``phis_i``,
+
+    .. math::
+        J = \sum_i \sum_j
+            \max\bigl(r_{ij} - r_{\mathrm{center},i},\, 0\bigr)^2,
+
+    where :math:`r_{ij} = \sqrt{x_{ij}^2 + y_{ij}^2}` at
+    ``gamma_eval(phis_i[j])``.
+
+    Subclasses set ``_dof_key`` to the ``support_dofs`` key that holds the
+    rectangular ``(n_coils, n_attach)`` angle array.
+
+    Parameters
+    ----------
+    coil_support : CoilSupport
+        Provides the base curves and the attachment-angle DOFs.
+    """
+
+    _dof_key: str = ''
+    _what: str = 'attachment angles'
+
+    def __init__(self, coil_support):
+        if not _HAS_SIMSOPT:
+            raise ImportError(
+                f"simsopt is required for {type(self).__name__}."
+            )
+
+        sdofs = coil_support.support_dofs
+        key = self._dof_key
+        if key not in sdofs:
+            raise TypeError(
+                f"{type(self).__name__} requires support_dofs[{key!r}] "
+                f"({self._what}); got keys {sorted(sdofs)}."
+            )
+        phis = sdofs[key]
+        if np.ndim(phis) != 2 or int(np.shape(phis)[0]) != coil_support.n_coils:
+            raise ValueError(
+                f"support_dofs[{key!r}] must have shape "
+                f"(n_coils={coil_support.n_coils}, n_attach); "
+                f"got {np.shape(phis)}."
+            )
+
+        self._coil_support = coil_support
+        self._base_curves_jax = [
+            CurveXYZFourierJAX.from_simsopt(c)
+            for c in coil_support.base_curves
+        ]
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=(0, 1)))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_curves: list | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _read_dofs(self):
+        """Read coil / support DOFs live from the simsopt graph."""
+        base_curves_dofs = [
+            jnp.asarray(c.get_dofs())
+            for c in self._coil_support.base_curves
+        ]
+        return base_curves_dofs, self._coil_support.support_dofs
+
+    def _curves_jax(self, cdofs):
+        """Rebuild traced curve pytrees from live DOFs."""
+        return [
+            CurveXYZFourierJAX(ref.quadpoints, d, ref.order)
+            for ref, d in zip(self._base_curves_jax, cdofs)
+        ]
+
+    def _J_pure(self, cdofs, sdofs):
+        """Outboard-attachment hinge (traced scalar)."""
+        return _inboard_hinge_pure(
+            self._curves_jax(cdofs), list(sdofs[self._dof_key]),
+        )
+
+    def _compute(self):
+        """Evaluate J and its gradients from the single ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        cdofs, sdofs = self._read_dofs()
+        J_val, (grad_cdofs, grad_sdofs) = self._jit_vg(cdofs, sdofs)
+        self._J_cache = float(J_val)
+        self._grad_curves = [np.asarray(g) for g in grad_cdofs]
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """Outboard-attachment hinge (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the coil and support DOFs.
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+
+        d = Derivative({})
+        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+            d = d + Derivative({curve: g})
+        return d + Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def max_overhang(self):
+        """Largest ``r - r_center`` over attachments [m].
+
+        Returns
+        -------
+        float
+            Positive when at least one attachment is outboard of its coil
+            centre; non-positive when every attachment is inboard or on the
+            centre radius.
+        """
+        cdofs, sdofs = self._read_dofs()
+        curves = self._curves_jax(cdofs)
+        phis_per_coil = list(sdofs[self._dof_key])
+        best = -jnp.inf
+        for curve, phis in zip(curves, phis_per_coil):
+            c = curve.curve_center()
+            r_center = jnp.sqrt(c[0] ** 2 + c[1] ** 2)
+            x = curve.gamma_eval(phis)
+            r = jnp.sqrt(x[:, 0] ** 2 + x[:, 1] ** 2)
+            best = jnp.maximum(best, jnp.max(r - r_center))
+        return float(best)
+
+
+class ClampInboard(_InboardPenalty):
+    r"""Penalise fixed clamps that sit radially outboard of a coil centre.
+
+    Reads ``support_dofs['phis']`` of shape ``(n_coils, n_clamp)``.
+
+    Parameters
+    ----------
+    coil_support : CoilSupport
+        Must expose fixed-clamp angles under ``support_dofs['phis']``
+        (e.g. :class:`~coil_fem.simsopt.CoilSupportFixed`).
+
+    Examples
+    --------
+    >>> Jclamp = ClampInboard(coil_support)  # doctest: +SKIP
+    >>> Jclamp.max_overhang()  # doctest: +SKIP
+    0.12...
+    """
+
+    _dof_key = 'phis'
+    _what = 'fixed-clamp angles'
+
+
+class CRBeamInboard(_InboardPenalty):
+    r"""Penalise CR beam starts that sit radially outboard of a coil centre.
+
+    Reads ``support_dofs['phis_start_cr']`` of shape
+    ``(n_base, n_beam_cr)``.
+
+    Parameters
+    ----------
+    coil_support : CoilSupportBeamsCSR
+        Must expose CR start angles under ``support_dofs['phis_start_cr']``.
+
+    Examples
+    --------
+    >>> Jcr = CRBeamInboard(coil_support)  # doctest: +SKIP
+    >>> Jcr.max_overhang()  # doctest: +SKIP
+    0.08...
+    """
+
+    _dof_key = 'phis_start_cr'
+    _what = 'CR beam start angles'
