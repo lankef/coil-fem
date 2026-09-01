@@ -16,7 +16,7 @@ from jax.tree_util import tree_map
 
 from ..presets import cross_section_fns
 from ..utils import estimate_k
-from ..geo import CurveXYZFourierJAX
+from ..geo import CurveRZFourierJAX, CurveXYZFourierJAX
 from ..coupling import SupportBeamsCSR
 from .coil_support import (
     CoilSupport, _broadcast_phis, _generate_k_clamp,
@@ -24,12 +24,13 @@ from .coil_support import (
 from .sorted_dphis import (
     _ANGLE_UNIT_KEYS, _DPHI_TO_PHI, _PHI_TO_DPHI, _SortedDphisMixin,
     _apply_sorted_dphi_bounds, _decode_dphis, _decode_end_cc,
-    _encode_dphis, _encode_end_cc, _fold_first_dphis,
+    _encode_dphis, _encode_end_cc, _fold_first_dphis, _sector_width,
 )
 from .coil_support_fixed import CoilSupportFixed
 from .coil_support_beams import (
     _REQUIRED_BEAM_OPTIONS,
     _OPTIONAL_BEAM_OPTIONS,
+    CoilSupportBeams,
     _uniform_list,
     _zeros_list,
     _check_ragged_shape,
@@ -654,3 +655,179 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
         )
         renamed = [_PHI_TO_DPHI.get(k, k) for k in fixed_dof_names]
         return encoded, renamed
+
+    @classmethod
+    def from_clamps(
+        cls,
+        source,
+        coil_csr_distance,
+        csr_options,
+        problem_options=None,
+        thetas_orientation_cr=None,
+        fixed_dof_names=None,
+        n_ring_samples=4096,
+        **kwargs,
+    ):
+        """Convert a single-clamp :class:`CoilSupportBeams` into a CSR support.
+
+        Each coil's clamp becomes the coil-side start of one CR beam
+        (``n_beam_cr = 1``).  The clamp point pushed radially away from the
+        coil centre by ``coil_csr_distance`` becomes the ring-side end; those
+        points are least-squares fit to a
+        :class:`~coil_fem.geo.CurveRZFourierJAX` with the source's ``nfp`` and
+        ``stellsym``, and ``phis_end_cr`` is recovered as the closest ring
+        parameter to each of them.  CC/CF beam counts and attachment angles
+        are copied over; the fixed-sphere clamps are dropped, since each is
+        now a CR beam.
+
+        Parameters
+        ----------
+        source : CoilSupportBeams or CoilSupportBeamsSorted
+            Beam support with fixed-sphere clamps enabled and ``n_clamp == 1``.
+        coil_csr_distance : float
+            Distance [m] to move each clamp away from its coil centre to place
+            the ring-side beam end.
+        csr_options : dict
+            Forwarded to :class:`CoilSupportBeamsCSR`; ``order`` also sets the
+            Fourier order of the ring fit.
+        problem_options : dict or None
+            Forwarded to :class:`CoilSupportBeamsCSR`.
+        thetas_orientation_cr : array-like or None
+            CR roll angles of shape ``(n_base, 1)``; ``None`` gives zeros.
+        fixed_dof_names : iterable of str or None
+            Forwarded to :class:`CoilSupportBeamsCSR`.
+        n_ring_samples : int
+            Number of ring samples used for the ``phis_end_cr`` search.
+        **kwargs
+            Cross-section DOF seeds (e.g. ``r_beam``).  Required: the source's
+            per-group values are one entry per coil short now that every coil
+            gains a CR beam, so they are not carried over.
+
+        Returns
+        -------
+        CoilSupportBeamsCSRSorted
+
+        Raises
+        ------
+        TypeError
+            When ``source`` is not a :class:`CoilSupportBeams`.
+        ValueError
+            When the source has no clamps, has ``n_clamp != 1``, or has too
+            few coils to determine a ring of the requested order.
+        """
+        if not isinstance(source, CoilSupportBeams):
+            raise TypeError(
+                "from_clamps expects a CoilSupportBeams or "
+                f"CoilSupportBeamsSorted; got {type(source).__name__}."
+            )
+        sd = source.support_dofs
+        if 'phis' not in sd:
+            raise ValueError(
+                "source has no fixed-sphere clamps to convert; construct it "
+                "with fixed_clamp_options={'enabled': True, 'n_clamp': 1, ...}."
+            )
+        phis = jnp.asarray(sd['phis'])
+        if phis.shape[1] != 1:
+            raise ValueError(
+                f"from_clamps requires n_clamp == 1; source has "
+                f"{phis.shape[1]}."
+            )
+
+        nfp, stellsym = source.nfp, source.stellsym
+        n_base = source.n_coils
+        curves = [CurveXYZFourierJAX.from_simsopt(c) for c in source.base_curves]
+        x_clamp = jnp.stack(
+            [curves[i].gamma_eval(phis[i, 0]) for i in range(n_base)]
+        )
+        centers = jnp.stack([c.curve_center() for c in curves])
+        u = x_clamp - centers
+        x_ring = np.asarray(
+            x_clamp
+            + coil_csr_distance * u / jnp.linalg.norm(u, axis=1, keepdims=True)
+        )
+
+        # R and Z are linear in the RZFourier DOFs once phi is fixed, and for
+        # CurveRZFourierJAX the toroidal angle is exactly 2*pi*phi.
+        order = int(csr_options['order'])
+        n_cols = order + 1 if stellsym else 2 * order + 1
+        if n_base < n_cols:
+            raise ValueError(
+                f"Fitting the central support ring at order {order} needs at "
+                f"least {n_cols} coils; got {n_base}. Lower "
+                "csr_options['order']."
+            )
+        theta = np.arctan2(x_ring[:, 1], x_ring[:, 0])
+        R = np.hypot(x_ring[:, 0], x_ring[:, 1])
+        ang = nfp * np.arange(order + 1)[None, :] * theta[:, None]
+        if stellsym:
+            csr_curve_dofs = np.concatenate([
+                np.linalg.lstsq(np.cos(ang), R, rcond=None)[0],
+                np.linalg.lstsq(np.sin(ang[:, 1:]), x_ring[:, 2], rcond=None)[0],
+            ])
+        else:
+            basis = np.concatenate([np.cos(ang), np.sin(ang[:, 1:])], axis=1)
+            csr_curve_dofs = np.concatenate([
+                np.linalg.lstsq(basis, R, rcond=None)[0],
+                np.linalg.lstsq(basis, x_ring[:, 2], rcond=None)[0],
+            ])
+
+        qp = np.linspace(0.0, 1.0, int(n_ring_samples), endpoint=False)
+        ring_gamma = np.asarray(CurveRZFourierJAX(
+            qp, csr_curve_dofs, order, nfp, stellsym,
+        ).gamma())
+        phi_end = qp[np.argmin(
+            np.sum((ring_gamma[None] - x_ring[:, None, :]) ** 2, axis=-1),
+            axis=1,
+        )]
+        # The Sorted codec increments phis_end_cr along the coil axis, so the
+        # recovered angles must ascend rather than wrap through 0.
+        phi_end = phi_end[0] + np.concatenate([
+            np.zeros(1), np.cumsum(np.diff(phi_end) % 1.0),
+        ])
+        phis_end_cr = phi_end[:, None]
+
+        enc = _encode_dphis({
+            'phis_start_cc': sd['phis_start_cc'],
+            'phis_start_cf': sd['phis_start_cf'],
+            'phis_start_cr': phis[:, :1],
+            'phis_end_cr': phis_end_cr,
+        })
+        s = _sector_width(nfp, stellsym)
+        if bool(jnp.any(enc['dphis_end_cr'][1:] > s)):
+            warnings.warn(
+                "Ring attachment angles of consecutive coils are more than "
+                f"one sector ({s:.4g}) apart; the initial dphis_end_cr will "
+                "sit outside its box bounds."
+            )
+
+        out = cls(
+            source._base_coils,
+            nfp,
+            stellsym,
+            beam_options={**source.beam_options, 'n_beam_cr': 1},
+            csr_options=csr_options,
+            problem_options=problem_options,
+            dphis_start_cc=enc['dphis_start_cc'],
+            dphis_end_cc=_encode_end_cc(sd['phis_end_cc'], stellsym),
+            dphis_start_cf=enc['dphis_start_cf'],
+            dphis_start_cr=enc['dphis_start_cr'],
+            dphis_end_cr=enc['dphis_end_cr'],
+            x_foundation=sd['x_foundation'],
+            thetas_orientation_cc=sd['thetas_orientation_cc'],
+            thetas_orientation_cf=sd['thetas_orientation_cf'],
+            thetas_orientation_cr=thetas_orientation_cr,
+            csr_curve_dofs=csr_curve_dofs,
+            fixed_clamp_options={'enabled': False},
+            fixed_dof_names=fixed_dof_names,
+            **kwargs,
+        )
+        # Under stellsym the first-increment fold of dphis_end_cr is a shift by
+        # 1/(2 nfp), which moves the attachment instead of leaving it invariant.
+        got = jnp.mod(out.support_dofs['phis_end_cr'], 1.0)
+        if not bool(jnp.allclose(got, jnp.mod(phis_end_cr, 1.0), atol=1e-9)):
+            warnings.warn(
+                "Ring attachment angles were folded into the first-increment "
+                "box of dphis_end_cr and no longer match the clamp positions; "
+                "the clamps of coil 0 lie outside the first sector."
+            )
+        return out
