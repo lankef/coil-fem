@@ -45,11 +45,17 @@ def _check_rect_shape(value, shape, name):
     """Validate and cast a user-supplied rectangular DOF array.
 
     Returns ``None`` when ``value`` is ``None``.
+
+    Empty arrays from GSON / numpy JSON lose zero-size axes
+    (``(n, 0)`` → ``(0,)``); those are reshaped when ``prod(shape) == 0``.
     """
     if value is None:
         return None
     arr = jnp.asarray(value, dtype=float)
     expected = tuple(int(s) for s in shape)
+    # GSON drops zero-size axes of empty arrays: (n, 0) → (0,).
+    if arr.size == 0 and any(s == 0 for s in expected) and arr.shape != expected:
+        arr = arr.reshape(expected)
     if arr.shape != expected:
         raise ValueError(
             f"{name} must have shape {expected}; got {arr.shape}."
@@ -665,7 +671,7 @@ class CoilSupportBeamsCSRSorted(_SortedDphisMixin, CoilSupportBeamsCSR):
         problem_options=None,
         thetas_orientation_cr=None,
         fixed_dof_names=None,
-        n_ring_samples=4096,
+        n_ring_samples=200,
         **kwargs,
     ):
         """Convert a single-clamp :class:`CoilSupportBeams` into a CSR support.

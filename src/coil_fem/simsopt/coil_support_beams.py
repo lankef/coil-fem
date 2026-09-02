@@ -90,6 +90,9 @@ def _check_ragged_shape(value, counts, name, trailing=()):
     Returns ``None`` when ``value`` is ``None`` (caller should substitute a
     default).  Raises ``ValueError`` when length or per-entry shapes disagree
     with ``counts``.
+
+    Empty arrays from GSON / numpy JSON lose trailing axes
+    (``(0, 3)`` → ``(0,)``); those are reshaped when ``counts[i] == 0``.
     """
     if value is None:
         return None
@@ -104,6 +107,9 @@ def _check_ragged_shape(value, counts, name, trailing=()):
     for i, v in enumerate(seq):
         arr = jnp.asarray(v, dtype=float)
         expected = (counts[i],) + trailing
+        # GSON drops trailing axes of empty arrays: (0, 3) → (0,).
+        if arr.size == 0 and counts[i] == 0 and arr.ndim != len(expected):
+            arr = arr.reshape(expected)
         if arr.shape != expected:
             raise ValueError(
                 f"{name}[{i}] must have shape {expected}; got {arr.shape}."
