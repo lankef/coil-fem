@@ -119,15 +119,25 @@ def _fold_first_dphis(tree, nfp, stellsym):
 def _apply_sorted_dphi_bounds(lb, ub, tree, nfp, stellsym):
     """Overlay Sorted first/rest ``dphis*`` box bounds on flattened ``lb``/``ub``.
 
+    Also overlays absolute CS attachment angles ``phis_start_cs`` /
+    ``phis_end_cs`` to each seed ± 0.5 when those keys are present on a
+    Sorted tree (detected via ``dphis*`` keys).
+
     No-op when ``tree`` has no ``dphis*`` keys (non-Sorted ``phis*`` classes).
 
     * first of :data:`_FIRST_DPHI_HALF_TURN_KEYS` (beam axis): ``[-0.5, 0.5]``
     * coil 0 of ``dphis_end_cr`` (row 0): ``[-0.5 s, 0.5 s]``
     * later coils of ``dphis_end_cr`` (rows ``1:``): upper bound ``s``
       (lower stays 0)
+    * ``phis_start_cs`` / ``phis_end_cs`` (Sorted only): ``[x0 ± 0.5]``
     """
-    if not any(k.startswith('dphis') for k in tree):
+    has_dphis = any(k.startswith('dphis') for k in tree)
+    has_cs = 'phis_start_cs' in tree or 'phis_end_cs' in tree
+    # Non-Sorted classes keep [0, 1] on phis_*_cs; seed±0.5 is Sorted-only.
+    if not has_dphis:
         return lb, ub
+    lb = np.asarray(lb, dtype=float).copy()
+    ub = np.asarray(ub, dtype=float).copy()
     s = _sector_width(nfp, stellsym)
     first_half, _ = ravel_pytree(
         _axis_mask(tree, _FIRST_DPHI_HALF_TURN_KEYS, axis=-1),
@@ -138,13 +148,33 @@ def _apply_sorted_dphi_bounds(lb, ub, tree, nfp, stellsym):
     rest_cr, _ = ravel_pytree(
         _axis_mask(tree, ('dphis_end_cr',), axis=0, rest=True),
     )
-    lb = np.asarray(lb, dtype=float).copy()
-    ub = np.asarray(ub, dtype=float).copy()
     lb = np.where(first_half, -0.5, lb)
     ub = np.where(first_half, 0.5, ub)
     lb = np.where(first_cr, -0.5 * s, lb)
     ub = np.where(first_cr, 0.5 * s, ub)
     ub = np.where(rest_cr, s, ub)
+    # CS absolute angles: half-turn box around construction-time seed.
+    if has_cs:
+        seed_tree = {
+            k: (v if k in ('phis_start_cs', 'phis_end_cs') else tree_map(
+                lambda leaf: np.zeros(np.shape(leaf), dtype=float), v,
+            ))
+            for k, v in tree.items()
+        }
+        mask_tree = {
+            k: tree_map(
+                lambda leaf, kk=k: np.ones(np.shape(leaf), dtype=bool)
+                if kk in ('phis_start_cs', 'phis_end_cs')
+                else np.zeros(np.shape(leaf), dtype=bool),
+                v,
+            )
+            for k, v in tree.items()
+        }
+        seeds, _ = ravel_pytree(seed_tree)
+        mask, _ = ravel_pytree(mask_tree)
+        seeds = np.asarray(seeds, dtype=float)
+        lb = np.where(mask, seeds - 0.5, lb)
+        ub = np.where(mask, seeds + 0.5, ub)
     return lb, ub
 
 

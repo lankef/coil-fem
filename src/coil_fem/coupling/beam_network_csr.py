@@ -75,6 +75,13 @@ class SupportBeamsCSR(SupportBeams):
     ):
         if 'n_beam_cr' not in beam_options:
             raise ValueError("beam_options must contain 'n_beam_cr'.")
+        if (
+            beam_options.get('i_beam_cs') is not None
+            or beam_options.get('s_beam_cs') is not None
+        ):
+            raise ValueError(
+                "CS beams are not supported on SupportBeamsCSR."
+            )
         super().__init__(
             nfp=nfp,
             stellsym=stellsym,

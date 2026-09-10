@@ -248,6 +248,7 @@ The coupling between coil FEM and support structures is split across three layer
 Key constructor arguments (all static; set once at construction):
 
 - `n_beam_cc`, `n_beam_cf` — beam counts. CC beams have one entry per CC *group*: `n_base + 1` when `stellsym=True` (the extra last entry is the coil-0 `phi = 0` wrap group), else `n_base`. CF beams have one entry per base coil.
+- `i_beam_cs`, `s_beam_cs` — optional stellarator-symmetric inter-coil (CS) topology (`stellsym=True` only). `i_beam_cs` is a list of `(i0, i1)` coil-index pairs; `s_beam_cs` is a same-length list of bools (`True` → `flip` about φ=0, `False` → `flip_half` about φ=π/nfp). Each entry is one master beam from `base_coil[i0]` to `Q(base_coil[i1])`; partners are not assembled. Default `None` (no CS beams). Not supported on `SupportBeamsCSR`.
 - `E`, `nu` — Young's modulus and Poisson's ratio.
 - `cross_section_fn(support_dofs) -> (A, Iy, Iz, J)` — cross-section properties.
 - `attachment_fn(surface_pts_beam_frame, dofs, sign_x, beam_options) -> weights` — selects coil surface points for coupling.
@@ -259,10 +260,11 @@ Key constructor arguments (all static; set once at construction):
 Optimisable quantities live in `support_dofs` (passed at solve time, never stored):
 
 - `phis_start_cc`, `phis_end_cc` — attachment angles for CC beams: per-group lists, entry `g` of shape `(n_beam_cc[g],)` (`n_base + 1` entries when `stellsym=True`, else `n_base`).  When `stellsym=True`, `phis_end_cc` is descending on the two wrap groups (`flip_half` / `flip`) so that `phi_end[j] = 1 - phi_start[j]`; :class:`~coil_fem.simsopt.CoilSupportBeamsSorted` stores those ends as nonnegative `dphis_end_cc` that walk backward from `phi = 1`.
+- `phis_start_cs`, `phis_end_cs` — attachment angles for CS beams when present: flat arrays of shape `(n_beam_cs,)`. Defaults place each start at the start-coil inboard point (`argmin R`) and set `phi_end = 1 - phi_start`. Sorted keeps these as absolute `phis_*` (not `dphis`), boxed to each seed ± 0.5.
 - **Note:** `params['support_k']` is the per-surface-quad stiffness [N/m³] (`(n_surface_quads,)`), obtained via `pipeline.surface_quad_points(pts)` → `support.compute_weights` → `support.stiffness`.
 - `phis_start_cf` — attachment angles for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i],)`.
 - `x_foundation` — foundation anchor positions for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i], 3)`.
-- `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam as a fraction of a turn in ``[0, 1]`` (same per-group / per-coil list layout as the attachment angles); applied as ``2π · θ`` in Rodrigues.
+- `thetas_orientation_cc`, `thetas_orientation_cf`, `thetas_orientation_cs` — cross-section roll angle per beam as a fraction of a turn in ``[0, 1]`` (CC/CF ragged lists; CS flat `(n_beam_cs,)`); applied as ``2π · θ`` in Rodrigues.
 
 ### `SupportBeamsCSR` (`coupling/beam_network_csr.py`)
 

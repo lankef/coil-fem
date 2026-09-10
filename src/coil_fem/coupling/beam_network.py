@@ -168,14 +168,19 @@ class SupportBeams(Support):
             (applied as ``k_attachment * w`` per surface node, for both the
             force and torque laws — see the *Stiffness matrix symmetry*
             note below).
+        i_beam_cs, s_beam_cs : sequence or None
+            Optional stellarator-symmetric inter-coil (CS) beam topology.
+            Only allowed when ``stellsym=True``.  See the *CS beams* note
+            below.  Default ``None`` (no CS beams).
         and additional constants that ``attachment_fn`` needs.
     cross_section_fn : callable
         ``cross_section_fn(support_dofs) -> (A, Iy, Iz, J)`` where each
         returned value is a per-group list of arrays: entry ``i < n_base``
         has shape ``(n_beam_cc[i] + n_beam_cf[i],)``; when ``stellsym=True``
         an extra entry ``n_base`` has shape ``(n_beam_cc[n_base],)`` (wrap
-        group, no CF part).  Section-property validation is delegated to
-        this callable.
+        group, no CF part); when CS beams are present a further trailing
+        entry of length ``n_beam_cs`` holds CS section DOFs.
+        Section-property validation is delegated to this callable.
     attachment_fn : callable
         ``attachment_fn(surface_pts_beam_frame, dofs, sign_x, beam_options) -> weights``
         where ``surface_pts_beam_frame`` is ``(N, 3)`` — query points in the
@@ -245,6 +250,14 @@ class SupportBeams(Support):
     rotation about x), so displacements, forces, torques and rotation DOFs
     transform alike.
 
+    **CS beams** (stellarator-symmetric inter-coil, optional):
+
+    When ``i_beam_cs`` / ``s_beam_cs`` are set (``stellsym`` required), each
+    entry is an independent master beam from ``base_coil[i0]`` to
+    ``Q(base_coil[i1])``, with ``Q = flip`` if ``s_beam_cs[i]`` else
+    ``flip_half``.  CS beams are appended after the wrap CC group and are
+    not count-halved (each listed beam is already a master).
+
     **Stiffness matrix symmetry**: with a single ``k_attachment`` modulus
     shared by the force and torque laws, ``K_ss`` is symmetric by
     construction (see :attr:`Support.matrix_symmetry`).
@@ -307,7 +320,61 @@ class SupportBeams(Support):
         self._beam_offsets = tuple(int(sum(_per_coil[:i])) for i in range(n_base))
         self._wrap_beam_offset = int(sum(_per_coil))
         _n_wrap = self._n_beam_cc[n_base] if stellsym else 0
-        self._n_beams_total = self._wrap_beam_offset + _n_wrap
+
+        # CS beams (stellarator-symmetric inter-coil): optional flat list of
+        # independent masters, appended after the wrap CC group.
+        i_cs = beam_options.get('i_beam_cs', None)
+        s_cs = beam_options.get('s_beam_cs', None)
+        if i_cs is None and s_cs is None:
+            self._i_beam_cs = ()
+            self._s_beam_cs = ()
+            self._n_beam_cs = 0
+        else:
+            if not stellsym:
+                raise ValueError(
+                    "Stellarator-symmetric inter-coil beams are only "
+                    "supported when stellsym==True."
+                )
+            if i_cs is None or s_cs is None:
+                raise ValueError(
+                    "beam_options['i_beam_cs'] and beam_options['s_beam_cs'] "
+                    "must both be set or both be None."
+                )
+            i_list = list(i_cs)
+            s_list = list(s_cs)
+            if len(i_list) == 0 and len(s_list) == 0:
+                self._i_beam_cs = ()
+                self._s_beam_cs = ()
+                self._n_beam_cs = 0
+            else:
+                if len(i_list) != len(s_list):
+                    raise ValueError(
+                        "beam_options['i_beam_cs'] and "
+                        "beam_options['s_beam_cs'] must have the same "
+                        f"length; got {len(i_list)} and {len(s_list)}."
+                    )
+                pairs = []
+                sides = []
+                for k, (pair, side) in enumerate(zip(i_list, s_list)):
+                    if len(pair) != 2:
+                        raise ValueError(
+                            f"i_beam_cs[{k}] must be a 2-element "
+                            f"(start_coil, end_coil) pair; got {pair!r}."
+                        )
+                    i0, i1 = int(pair[0]), int(pair[1])
+                    if not (0 <= i0 < n_base and 0 <= i1 < n_base):
+                        raise ValueError(
+                            f"i_beam_cs[{k}] = ({i0}, {i1}) is out of "
+                            f"range for n_base={n_base}."
+                        )
+                    pairs.append((i0, i1))
+                    sides.append(bool(side))
+                self._i_beam_cs = tuple(pairs)
+                self._s_beam_cs = tuple(sides)
+                self._n_beam_cs = len(pairs)
+
+        self._cs_beam_offset = self._wrap_beam_offset + _n_wrap
+        self._n_beams_total = self._cs_beam_offset + self._n_beam_cs
         self._k_attachment = float(beam_options['k_attachment'])
 
         self.cross_section_fn = cross_section_fn
@@ -490,6 +557,26 @@ class SupportBeams(Support):
     def wrap_beam_offset(self):
         """Global beam index where the stellsym wrap group (group ``n_base``) starts."""
         return self._wrap_beam_offset
+
+    @property
+    def n_beam_cs(self) -> int:
+        """Number of stellarator-symmetric inter-coil (CS) master beams."""
+        return self._n_beam_cs
+
+    @property
+    def i_beam_cs(self):
+        """CS coil-index pairs ``((i0, i1), ...)``; empty when no CS beams."""
+        return self._i_beam_cs
+
+    @property
+    def s_beam_cs(self):
+        """CS reflection sides ``(bool, ...)``; ``True`` → ``flip``, else ``flip_half``."""
+        return self._s_beam_cs
+
+    @property
+    def cs_beam_offset(self) -> int:
+        """Global beam index where the CS block starts (after wrap CC)."""
+        return self._cs_beam_offset
 
     @property
     def k_attachment(self) -> float:
@@ -716,6 +803,34 @@ class SupportBeams(Support):
         if self.stellsym:
             append_cc_group(self.n_base)
 
+        # CS beams: independent masters after wrap CC.
+        if self.n_beam_cs > 0:
+            phis_start_cs = support_dofs['phis_start_cs']
+            phis_end_cs = support_dofs['phis_end_cs']
+            for j, ((i0, i1), side) in enumerate(
+                zip(self.i_beam_cs, self.s_beam_cs)
+            ):
+                end_tfm = 'flip' if side else 'flip_half'
+                sl = slice(b0, b0 + 1)
+                d = x_end[sl] - x_start[sl]
+                _, p_s, q_s = fcs[i0].rotated_frame_eval(
+                    jnp.atleast_1d(phis_start_cs[j]),
+                )
+                _, p_e, q_e = fcs[i1].rotated_frame_eval(
+                    jnp.atleast_1d(phis_end_cs[j]),
+                )
+                p_e = self._apply_end_transform(p_e, end_tfm)
+                q_e = self._apply_end_transform(q_e, end_tfm)
+                xi_s_list.append(self._xi_surface_exit(
+                    d, p_s, q_s, a_all[i0], b_all[i0], is_disk[i0],
+                ))
+                xi_e_list.append(
+                    1.0 - self._xi_surface_exit(
+                        d, p_e, q_e, a_all[i1], b_all[i1], is_disk[i1],
+                    )
+                )
+                b0 += 1
+
         # Clipping to [0,1] ensures that when the coil-beam 
         # angle is small, and the beam has high-curvature,
         # the beam does not "protrude" outside the coil surface. 
@@ -787,7 +902,29 @@ class SupportBeams(Support):
                 b += 1
 
         if self.stellsym:
-            append_cc_group(self.n_base, b)
+            b = append_cc_group(self.n_base, b)
+
+        # CS beams: coil_origin indexes the trailing CS cross-section group.
+        if self.n_beam_cs > 0:
+            cs_group = self.n_groups_cc
+            for j, ((i0, i1), side) in enumerate(
+                zip(self.i_beam_cs, self.s_beam_cs)
+            ):
+                end_tfm = 'flip' if side else 'flip_half'
+                g3 = gamma3[b]
+                specs.append(EndpointSpec(
+                    b=b, coil_origin=cs_group, j_local=j,
+                    node_side=0, coil=i0,
+                    x_ep=geom['x_start'][b], gamma3=g3,
+                    sign_x=True, tfm='none',
+                ))
+                specs.append(EndpointSpec(
+                    b=b, coil_origin=cs_group, j_local=j,
+                    node_side=1, coil=i1,
+                    x_ep=geom['x_end'][b], gamma3=g3,
+                    sign_x=False, tfm=end_tfm,
+                ))
+                b += 1
 
         specs_by_coil: dict[int, list[EndpointSpec]] = {}
         for spec in specs:
@@ -1080,6 +1217,38 @@ class SupportBeams(Support):
         if self.stellsym:
             append_cc_group(self.n_base)
 
+        # CS beams: independent masters after wrap CC (stellsym only).
+        if self.n_beam_cs > 0:
+            phis_start_cs = support_dofs['phis_start_cs']
+            phis_end_cs = support_dofs['phis_end_cs']
+            for j, ((i0, i1), side) in enumerate(
+                zip(self.i_beam_cs, self.s_beam_cs)
+            ):
+                end_tfm = 'flip' if side else 'flip_half'
+                curve_s = curves_jax[i0]
+                curve_e = curves_jax[i1]
+                phi_s = jnp.atleast_1d(phis_start_cs[j])
+                phi_e = jnp.atleast_1d(phis_end_cs[j])
+
+                x_s = curve_s.gamma_eval(phi_s)
+                x_e = self._apply_end_transform(
+                    curve_e.gamma_eval(phi_e), end_tfm,
+                )
+                t_cs_raw = curve_s.gamma_eval(phi_s, diff_order=1)
+                t_cs = t_cs_raw / (
+                    jnp.linalg.norm(t_cs_raw, axis=1, keepdims=True) + 1e-300
+                )
+                t_ce_raw = self._apply_end_transform(
+                    curve_e.gamma_eval(phi_e, diff_order=1), end_tfm,
+                )
+                t_ce = t_ce_raw / (
+                    jnp.linalg.norm(t_ce_raw, axis=1, keepdims=True) + 1e-300
+                )
+                x_start_list.append(x_s)
+                x_end_list.append(x_e)
+                t_coil_start_list.append(t_cs)
+                t_coil_end_list.append(t_ce)
+
         x_start      = jnp.concatenate(x_start_list,      axis=0)
         x_end        = jnp.concatenate(x_end_list,        axis=0)
         t_coil_start = jnp.concatenate(t_coil_start_list, axis=0)
@@ -1100,6 +1269,8 @@ class SupportBeams(Support):
                 theta_parts.append(theta_cf[i])
         if self.stellsym and self.n_beam_cc[self.n_base] > 0:
             theta_parts.append(theta_cc[self.n_base])
+        if self.n_beam_cs > 0:
+            theta_parts.append(support_dofs['thetas_orientation_cs'])
         thetas = jnp.concatenate(theta_parts, axis=0)
 
         def single_dcm(t_b, t_c, theta):
@@ -1258,6 +1429,15 @@ class SupportBeams(Support):
                 [coil_idx_arr, onp.zeros(n_wrap, dtype=onp.int32)])
             beam_type = onp.concatenate(
                 [beam_type, onp.zeros(n_wrap, dtype=onp.int32)])
+        # CS beams: type 0 (CC family); coil_idx = start coil i0.
+        if self.n_beam_cs > 0:
+            cs_coil = onp.array(
+                [i0 for i0, _ in self.i_beam_cs], dtype=onp.int32,
+            )
+            coil_idx_arr = onp.concatenate([coil_idx_arr, cs_coil])
+            beam_type = onp.concatenate([
+                beam_type, onp.zeros(self.n_beam_cs, dtype=onp.int32),
+            ])
         return coil_idx_arr, beam_type
 
     def endpoint_state(self, u_s: jax.Array) -> jax.Array:
@@ -1422,6 +1602,12 @@ class SupportBeams(Support):
                 _add_endpoint(b, 0, start_w)
                 _add_endpoint(b, 1, end_w)
                 b += 1
+
+        # CS beams after wrap CC.
+        for i0, i1 in self.i_beam_cs:
+            _add_endpoint(b, 0, i0)
+            _add_endpoint(b, 1, i1)
+            b += 1
 
         if not I_cs_parts:
             empty = np.zeros(0, dtype=np.int32)
