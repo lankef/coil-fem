@@ -817,9 +817,9 @@ class BeamCurveDistance(Optimizable):
         \xi_\mathrm{end}^\mathrm{eff}
             = \min(\xi_\mathrm{end},\, 1 - r_\mathrm{safe}/L),
 
-    with :math:`S_b` the segment between those stations.  When
-    :math:`\xi_\mathrm{start}^\mathrm{eff} > \xi_\mathrm{end}^\mathrm{eff}`,
-    beam :math:`b` contributes zero.
+    with :math:`S_b` the segment between those stations.  Per-end trim is
+    capped at just under :math:`L/2` so the free span cannot invert; a
+    collapsed beam still contributes a mid-chord sliver rather than zero.
 
     Parameters
     ----------
@@ -828,6 +828,8 @@ class BeamCurveDistance(Optimizable):
         :class:`~coil_fem.coupling.SupportBeams` model.
     dead_length : float
         Length ignored from each chord end before the free span [m].
+        Must be ``> 0``.  If larger than half a beam's length it is
+        capped per beam so a non-empty free span remains.
     minimum_distance : float
         Desired minimum beam-to-coil clearance [m].
 
@@ -855,8 +857,11 @@ class BeamCurveDistance(Optimizable):
 
         dead_length = float(dead_length)
         minimum_distance = float(minimum_distance)
-        if dead_length < 0.0:
-            raise ValueError(f"dead_length must be >= 0; got {dead_length}.")
+        if dead_length <= 0.0:
+            raise ValueError(
+                f"dead_length must be > 0; got {dead_length}. "
+                "Zero puts attachments on the free span and makes dJ NaN."
+            )
         if minimum_distance < 0.0:
             raise ValueError(
                 f"minimum_distance must be >= 0; got {minimum_distance}."
@@ -905,14 +910,33 @@ class BeamCurveDistance(Optimizable):
         x_start = geom['x_start']
         x_end = geom['x_end']
         L = geom['L']
-        xi_safe_start = self.dead_length / (L + 1e-300)
-        xi_safe_end = 1.0 - self.dead_length / (L + 1e-300)
+        MIN_SPAN = 1e-3  # [m] always keep a non-empty free span
+
+        # dead_length is per end. If 2*dead_length >= L the span inverts and
+        # the unused hinge branch can leak NaNs into the GPU VJP. Cap with
+        # jnp.minimum so this stays in the JAX trace (L depends on DOFs).
+        # On beams shorter than 2*MIN_SPAN, keep 2% of L instead of 1 mm.
+        min_span = jnp.minimum(MIN_SPAN, 0.01 * L)
+        dead_eff = jnp.minimum(
+            self.dead_length,
+            jnp.maximum(0.0, 0.5 * L - min_span),
+        )
+        xi_safe_start = dead_eff / (L + 1e-300)
+        xi_safe_end = 1.0 - dead_eff / (L + 1e-300)
         xi_start_eff = jnp.maximum(geom['xi_start'], xi_safe_start)
         xi_end_eff = jnp.minimum(geom['xi_end'], xi_safe_end)
-        active = xi_start_eff <= xi_end_eff
+
+        # Mesh trim (xi_start / xi_end) can still invert; push to a mid-sliver.
+        mid = 0.5 * (xi_start_eff + xi_end_eff)
+        half = 0.5 * (min_span / (L + 1e-300))
+        inverted = xi_start_eff > xi_end_eff
+        xi_start_eff = jnp.where(inverted, mid - half, xi_start_eff)
+        xi_end_eff = jnp.where(inverted, mid + half, xi_end_eff)
+
         d = x_end - x_start
         x_a = x_start + xi_start_eff[:, None] * d
         x_b = x_start + xi_end_eff[:, None] * d
+        active = jnp.ones(L.shape, dtype=bool)
         return x_a, x_b, active
 
     def _accumulate_J(self, curves_jax, x_a, x_b, active):
@@ -955,6 +979,24 @@ class BeamCurveDistance(Optimizable):
 
         if support.stellsym:
             J, b = add_cc(J, n_base, b)
+
+        # CS beams after wrap CC.
+        for _j, ((i0, i1), side) in enumerate(
+            zip(support.i_beam_cs, support.s_beam_cs)
+        ):
+            end_tfm = 'flip' if side else 'flip_half'
+            sl = slice(b, b + 1)
+            c_s = curves_jax[i0]
+            c_e = curves_jax[i1]
+            gamma_e = support._apply_end_transform(c_e.gamma(), end_tfm)
+            hs = _curve_segment_hinge(
+                x_a[sl], x_b[sl], c_s.gamma(), c_s.gammadash(), dmin,
+            )
+            he = _curve_segment_hinge(
+                x_a[sl], x_b[sl], gamma_e, c_e.gammadash(), dmin,
+            )
+            J = J + jnp.sum(jnp.where(active[sl], hs + he, 0.0))
+            b += 1
 
         return J
 
@@ -1007,9 +1049,10 @@ class BeamCurveDistance(Optimizable):
         Returns
         -------
         float
-            Minimum over active beams of the distance from segment ``S`` to
-            the start coil (and, for CC beams, the end coil).  Inactive beams
-            are ignored.  If every beam is inactive, returns ``inf``.
+            Minimum over beams of the distance from segment ``S`` to the
+            start coil (and, for CC beams, the end coil).  Free spans are
+            kept non-empty by capping ``dead_length``; the active mask is
+            retained for callers and is all-true after the cap.
         """
         cdofs, sdofs = self._read_dofs()
         curves_jax = self._curves_jax(cdofs)
@@ -1055,6 +1098,23 @@ class BeamCurveDistance(Optimizable):
 
         if support.stellsym:
             best, b = min_cc(n_base, b, best)
+
+        # CS beams after wrap CC.
+        for _j, ((i0, i1), side) in enumerate(
+            zip(support.i_beam_cs, support.s_beam_cs)
+        ):
+            end_tfm = 'flip' if side else 'flip_half'
+            sl = slice(b, b + 1)
+            gamma_s = curves_jax[i0].gamma()
+            gamma_e = support._apply_end_transform(
+                curves_jax[i1].gamma(), end_tfm,
+            )
+            ds = jnp.min(_segment_point_dists(x_a[sl], x_b[sl], gamma_s), axis=1)
+            de = jnp.min(_segment_point_dists(x_a[sl], x_b[sl], gamma_e), axis=1)
+            d = jnp.minimum(ds, de)
+            d = jnp.where(active[sl], d, jnp.inf)
+            best = jnp.minimum(best, jnp.min(d))
+            b += 1
 
         return float(best)
 
