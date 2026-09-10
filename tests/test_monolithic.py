@@ -338,7 +338,8 @@ def test_monolithic_static_reuses_K_when_symmetric():
 def test_monolithic_support_phi_grad_matches_fd():
     """Analytic ∂J/∂phis_start_cc must match centered FD (geom VJP regression).
 
-    Freezing ``beam_geometry`` in ``make_merged_solve``'s constraint VJP cuts
+    Freezing ``beam_geometry`` in ``merged_solve``'s constraint VJP (inside
+    :func:`~coil_fem.coupling.drivers.build_monolithic_static`) cuts
     ∂K/∂φ through the beam frame; the analytic directional derivative then
     disagrees with FD by orders of magnitude.  This tiny-mesh check catches
     that class of bug without the full-resolution Taylor job.

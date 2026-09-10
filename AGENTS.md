@@ -193,13 +193,13 @@ Two kinds of data bundles appear in this codebase; use the correct container for
 - Use plain `dict` or `NamedTuple`.  Both are JAX pytrees.
 - Example: `geom` dict returned by `SupportBeams.beam_geometry(curves_jax, support_dofs)` contains endpoint positions, lengths, DCMs, and (when meshes are bound) `L_eff` — all traced arrays.
 - Example: `support_dofs` passed to solvers and metrics.
-- **Never freeze `beam_geometry` in the monolithic constraint VJP** (`make_merged_solve` `_bwd` in `coupling/drivers.py`). Attachment DOFs (`phis_*`, etc.) enter `K_ss`/`K_cs`/`K_sc` through that geom; freezing it breaks `dJ` / Taylor tests. Forward-only geom sharing in `_solve_all` is fine; for memory use `jax.checkpoint`/remat, not a freeze.
+- **Never freeze `beam_geometry` in the monolithic constraint VJP** (nested `merged_solve` `_bwd` inside `build_monolithic_static` in `coupling/drivers.py`). Attachment DOFs (`phis_*`, etc.) enter `K_ss`/`K_cs`/`K_sc` through that geom; freezing it breaks `dJ` / Taylor tests. Forward-only geom sharing in `_solve_all` is fine; for memory use `jax.checkpoint`/remat, not a freeze.
 
 **Static bundles** (fixed at construction, never traced):
 - Use `@dataclasses.dataclass(frozen=True, eq=False)`.  The `eq=False` flag prevents JAX from treating the dataclass as a pytree leaf during hashing; the `frozen=True` flag enforces immutability.
 - Example: `MonolithicStatic` in `coupling/drivers.py` — holds CSR patterns, cuDSS solver handles, and the pre-built `merged_solve` callable.
 - **Never store traced JAX arrays on `self`.**  Traced values must always be passed as arguments so that JAX's tracing and autodiff machinery can see them.
-- `CoilFEM.build_monolithic_static(solver)` is the canonical construction entry point for the monolithic static bundle; it is called once at `__init__` when `coupling == 'monolithic'` and `support.is_coupled`.
+- `build_monolithic_static(...)` in `coupling/drivers.py` is the canonical construction entry point for the monolithic static bundle; `CoilFEM.__init__` calls it once when `coupling == 'monolithic'` and `support.is_coupled`. Only `solver == 'cudss'` fills `merged_solve`; other solvers leave it `None` and `solve_monolithic` raises.
 
 ## Build and Packaging
 
@@ -277,18 +277,18 @@ Optimisable quantities live in `support_dofs` (passed at solve time, never store
 
 ### Solver drivers (`coupling/drivers.py`)
 
-Two module-level driver functions replace the uncoupled per-coil loop in `CoilFEM` when `support.is_coupled=True`:
+Module-level drivers used when `support.is_coupled=True`:
 
-- **`solve_staggered`** — Block Gauss-Seidel with Aitken relaxation.  Works on all backends (CPU and GPU).  Gradients are computed via a `@jax.custom_vjp` that applies the implicit-function theorem (IFT): the GMRES solve of `(I − dT/du_s)ᵀ λ = g` provides the correct adjoint without differentiating through the iteration history.  *Note:* the Python-loop forward pass is concrete (not JIT-compiled); wrapping the caller with `jax.jit` will fail.
-
-- **`solve_monolithic`** — Assembles a single merged block matrix `[K_cc | K_cs; K_sc | K_ss]` and solves it with cuDSS in one shot.  Raises `NotImplementedError` when `solver != 'cudss'`.
+- **`build_monolithic_static`** — Host-side construction of `MonolithicStatic` (layout, optional cuDSS handles, nested `custom_vjp` `merged_solve`). Called once from `CoilFEM.__init__`.
+- **`solve_monolithic`** — Assembles a single merged block matrix `[K_cc | K_cs; K_sc | K_ss]` and solves it with cuDSS in one shot.  Raises `NotImplementedError` when `static.merged_solve is None` (i.e. `solver != 'cudss'`).
+- **`solve_staggered`** — **Retired**; raises `NotImplementedError`. Use `coupling='monolithic'` with `solver='cudss'`.
 
 ### `CoilFEM` dispatch
 
-`CoilFEM.__init__` accepts a `coupling='staggered'|'monolithic'|'uncoupled'` keyword (default `'monolithic'`).  The internal `_solve_all` helper:
+`CoilFEM.__init__` accepts a `coupling='staggered'|'monolithic'` keyword (default `'monolithic'`). When coupled + monolithic it builds `self.monolithic_static` via `build_monolithic_static`. The internal `_solve_all` helper:
 
 1. Builds per-coil mesh points, body forces, and Winkler stiffnesses via `support.stiffness(*support.compute_weights(...))`.
-2. Dispatches to `solve_staggered` or `solve_monolithic` when `support.is_coupled=True`.
+2. Dispatches to `solve_monolithic` when `support.is_coupled=True` and `coupling == 'monolithic'` (staggered raises at solve time).
 3. Falls back to an independent per-coil loop when `support.is_coupled=False`.
 
 `support` is a required `CoilFEM` argument.  Both moduli (`k_clamp`, `k_attachment`) live on `Support`; `problem_options` no longer carries a Winkler modulus.

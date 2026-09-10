@@ -253,6 +253,21 @@ def test_coilfem_dispatch_calls_monolithic(monkeypatch):
     )
 
 
+def test_monolithic_static_built_at_init():
+    """Coupled monolithic + umfpack: bundle is an __init__ field, not lazy.
+
+    ``merged_solve`` stays ``None`` unless ``solver == 'cudss'`` inside
+    :func:`~coil_fem.coupling.drivers.build_monolithic_static`.
+    """
+    support = _TrivialCoupledSupport()
+    fem = _make_coilfem(coupling='monolithic', support=support)
+    assert 'monolithic_static' in fem.__dict__
+    static = fem.monolithic_static
+    assert static is not None
+    assert static.merged_solve is None
+    assert static.n_s == support.n_support_dofs
+
+
 # ============================================================================
 # 4. solve_staggered is retired
 # ============================================================================
