@@ -9,11 +9,9 @@ solve per base coil regardless of metric count.
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import logging
 import os
-import warnings
 
 import meshio
 import numpy as np
@@ -37,9 +35,9 @@ from .problems import (
 )
 from .pipelines import ElasticPipeline, ThermoElasticPipeline
 from .coupling import (
-    Support, 
+    Support,
     solve_uncoupled, solve_staggered, solve_monolithic,
-    MonolithicStatic, make_merged_solve,
+    MonolithicStatic, build_monolithic_static,
 )
 from .metrics import (
     max_von_mises_hard,
@@ -160,6 +158,7 @@ def _broadcast_problem_options(problem_options: dict | None) -> dict:
 
 
 _VALID_COUPLING = {'staggered', 'monolithic'}
+
 
 # ============================================================================
 # CoilFEM container
@@ -333,8 +332,19 @@ class CoilFEM:
         if hasattr(self.support, 'bind_coil_meshes'):
             self.support.bind_coil_meshes(self.meshes)
 
-        # Monolithic CSR / cuDSS bundle is built lazily on first access to
-        # :attr:`monolithic_static` (see cached_property below).
+        # Monolithic CSR / solver bundle: host-side, once, before any jax.jit.
+        self.monolithic_static: MonolithicStatic | None = (
+            build_monolithic_static(
+                self.pipelines,
+                self.support,
+                self.problem_options.get('solver', 'umfpack'),
+                self.problem_options,
+                tuple(c.quadpoints for c in self.base_curves_jax),
+                tuple(c.order for c in self.base_curves_jax),
+            )
+            if self.support.is_coupled and self.coupling == 'monolithic'
+            else None
+        )
 
         # ── Per-coil JIT body force functions ────────────────────────────────
         # Binding coil_idx statically via functools.partial lets JAX resolve
@@ -362,195 +372,6 @@ class CoilFEM:
             )
             for p in self.pipelines
         ]
-
-    # ============================================================================
-    # Static monolithic bundle
-    # ============================================================================
-
-    @functools.cached_property
-    def monolithic_static(self) -> MonolithicStatic | None:
-        """Pre-built monolithic pattern / solver bundle, or ``None``.
-
-        Built on first access when ``coupling == 'monolithic'`` and the support
-        is coupled; otherwise ``None``.  Deferred so constructing / loading a
-        ``CoilFEM`` with ``solver='cudss'`` does not require CUDA until a
-        monolithic solve (or an explicit read of this attribute) runs.
-        """
-        if not (self.support.is_coupled and self.coupling == 'monolithic'):
-            return None
-        return self.build_monolithic_static(
-            self.problem_options.get('solver', 'umfpack')
-        )
-
-    def build_monolithic_static(self, solver: str) -> MonolithicStatic:
-        """Pre-build all static pattern and solver data for the monolithic solve.
-
-        Reads ``problem.I`` / ``problem.J`` directly from each pipeline (no
-        probe Jacobian assembly), merges with the support K_ss pattern from
-        ``support.support_pattern``, and the coupling pattern from
-        ``support.coupling_pattern``.  Builds the forward and (when
-        ``solver == 'cudss'``) adjoint CSR patterns and cuDSS solver handles,
-        then creates the ``custom_vjp``-wrapped ``merged_solve`` via
-        :func:`~coil_fem.coupling.drivers.make_merged_solve`.
-
-        Parameters
-        ----------
-        solver : str
-            Value of ``problem_options['solver']``.  The cuDSS-specific layer
-            (``solver_K``, ``solver_KT``, ``merged_solve``) is populated only
-            when ``solver == 'cudss'``; all three fields are ``None`` otherwise.
-
-        Returns
-        -------
-        MonolithicStatic
-        """
-        n_base = len(self.base_curves_jax)
-
-        # ── DOF layout ───────────────────────────────────────────────────────
-        n_dofs_per_coil: list[int] = [
-            p.problem.num_total_dofs_all_vars for p in self.pipelines
-        ]
-        coil_dof_offsets: list[int] = []
-        offset = 0
-        for nd in n_dofs_per_coil:
-            coil_dof_offsets.append(offset)
-            offset += nd
-        support_dof_offset = offset
-        n_s = self.support.n_support_dofs
-        n_total_dofs = offset + n_s
-
-        surface_node_indices_by_coil = [
-            p.surface_node_indices for p in self.pipelines
-        ]
-
-        # ── Static COO I/J for each block ────────────────────────────────────
-        # Coil K_cc blocks: read problem.I/J directly, no probe assembly.
-        I_blocks, J_blocks = [], []
-        for i, pipeline in enumerate(self.pipelines):
-            I_cc = np.asarray(pipeline.problem.I, dtype=np.int32) + coil_dof_offsets[i]
-            J_cc = np.asarray(pipeline.problem.J, dtype=np.int32) + coil_dof_offsets[i]
-            I_blocks.append(I_cc)
-            J_blocks.append(J_cc)
-
-        # Support K_ss block: local pattern from support, shifted to global DOFs.
-        I_ss_local, J_ss_local = self.support.support_pattern()
-        I_ss_pat = np.asarray(I_ss_local, dtype=np.int32) + support_dof_offset
-        J_ss_pat = np.asarray(J_ss_local, dtype=np.int32) + support_dof_offset
-        I_blocks.append(I_ss_pat)
-        J_blocks.append(J_ss_pat)
-
-        # Coupling K_cs / K_sc: pure numpy, no tracing.
-        I_cs_pat, J_cs_pat, I_sc_pat, J_sc_pat = self.support.coupling_pattern(
-            coil_dof_offsets, support_dof_offset, surface_node_indices_by_coil,
-        )
-        has_cs = len(I_cs_pat) > 0
-        has_sc = len(I_sc_pat) > 0
-        if has_cs:
-            I_blocks.append(np.asarray(I_cs_pat, dtype=np.int32))
-            J_blocks.append(np.asarray(J_cs_pat, dtype=np.int32))
-        if has_sc:
-            I_blocks.append(np.asarray(I_sc_pat, dtype=np.int32))
-            J_blocks.append(np.asarray(J_sc_pat, dtype=np.int32))
-
-        I_merged = np.concatenate(I_blocks)
-        J_merged = np.concatenate(J_blocks)
-
-        # Static curve metadata for the merged_solve closure.
-        curve_qps    = tuple(c.quadpoints for c in self.base_curves_jax)
-        curve_orders = tuple(c.order      for c in self.base_curves_jax)
-
-        # ── cuDSS-specific layer ──────────────────────────────────────────────
-        if solver == 'cudss':
-            from .solvers.cudss import (
-                _import_cudss_solver,
-                build_csr_pattern,
-                weakest_symmetry,
-                adjoint_reuses_forward_K,
-                _MTYPE_ID,
-            )
-
-            # Derive merged matrix type from each block's declared symmetry.
-            _sym_claims = [p.problem.matrix_symmetry for p in self.pipelines]
-            _sym_claims.append(self.support.matrix_symmetry)
-            merged_sym = weakest_symmetry(*_sym_claims)
-            mtype_id = _MTYPE_ID[merged_sym]
-            if 'cudss_mtype_id' in self.problem_options:
-                override = int(self.problem_options['cudss_mtype_id'])
-                if override != mtype_id:
-                    warnings.warn(
-                        f"cudss_mtype_id={override} overrides derived merged "
-                        f"value {mtype_id} (from weakest of {_sym_claims}). "
-                        "Verify this is intentional.",
-                        stacklevel=2,
-                    )
-                mtype_id = override
-            device_id = int(self.problem_options.get('cudss_device_id', 0))
-            mview_id  = 0
-            adjoint_reuses_K = adjoint_reuses_forward_K(merged_sym, mtype_id)
-
-            CuDSSSolver = _import_cudss_solver()
-
-            def _make_solver(indptr, indices):
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        'ignore',
-                        message='A JAX array is being set as static!',
-                        category=UserWarning,
-                    )
-                    return CuDSSSolver(indptr, indices, device_id, mtype_id, mview_id)
-
-            indptr, indices, coo_to_csr, _, _, nnz_csr = build_csr_pattern(
-                I_merged, J_merged, n_total_dofs
-            )
-            solver_K = _make_solver(indptr, indices)
-
-            # Symmetric / SPD: Kᵀ = K — skip a second cuDSS workspace.
-            if adjoint_reuses_K:
-                coo_to_csr_T = nnz_csr_T = solver_KT = None
-            else:
-                iT, jT, coo_to_csr_T, _, _, nnz_csr_T = build_csr_pattern(
-                    J_merged, I_merged, n_total_dofs
-                )
-                solver_KT = _make_solver(iT, jT)
-        else:
-            indptr = indices = coo_to_csr = None
-            nnz_csr = 0
-            adjoint_reuses_K = True  # unused when merged_solve is None
-            coo_to_csr_T = nnz_csr_T = solver_K = solver_KT = None
-
-        static = MonolithicStatic(
-            coil_dof_offsets=tuple(coil_dof_offsets),
-            support_dof_offset=support_dof_offset,
-            n_total_dofs=n_total_dofs,
-            n_dofs_per_coil=tuple(n_dofs_per_coil),
-            n_s=n_s,
-            has_cs=has_cs,
-            has_sc=has_sc,
-            surface_node_indices_by_coil=tuple(surface_node_indices_by_coil),
-            curve_qps=curve_qps,
-            curve_orders=curve_orders,
-            I_ss_pat=I_ss_pat,
-            J_ss_pat=J_ss_pat,
-            I_cs_pat=I_cs_pat if has_cs else None,
-            J_cs_pat=J_cs_pat if has_cs else None,
-            I_sc_pat=I_sc_pat if has_sc else None,
-            J_sc_pat=J_sc_pat if has_sc else None,
-            indptr=indptr,
-            indices=indices,
-            coo_to_csr=coo_to_csr,
-            nnz_csr=nnz_csr,
-            adjoint_reuses_K=adjoint_reuses_K,
-            coo_to_csr_T=coo_to_csr_T,
-            nnz_csr_T=nnz_csr_T,
-            solver_K=solver_K,
-            solver_KT=solver_KT,
-            merged_solve=None,
-        )
-        if solver == 'cudss':
-            static = dataclasses.replace(
-                static, merged_solve=make_merged_solve(self.pipelines, self.support, static)
-            )
-        return static
 
     # ============================================================================
     # Logging verbosity
@@ -777,7 +598,7 @@ class CoilFEM:
 
         # When coupled, compute beam geometry once and reuse for *forward*
         # weights + monolithic assemble.  This is a forward-only cache: the
-        # custom_vjp constraint in make_merged_solve must recompute
+        # custom_vjp constraint in build_monolithic_static's merged_solve must recompute
         # beam_geometry from support DOFs so ∂K/∂φ reaches the adjoint.
         # Do not freeze geom in that VJP as a "memory optimization".
         support_geom = None
@@ -829,7 +650,7 @@ class CoilFEM:
             # recompute_fe_geometry there.
             'fe_geom_by_coil':     fe_geom_by_coil,
             # Pre-computed beam geometry for the forward assemble only.
-            # Adjoint path in make_merged_solve recomputes beam_geometry.
+            # Adjoint path in merged_solve recomputes beam_geometry.
             'support_geom':        support_geom,
         }
 
