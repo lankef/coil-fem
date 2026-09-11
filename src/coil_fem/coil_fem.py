@@ -65,7 +65,9 @@ _METRIC_REGISTRY = {
 # reduced across base coils with ``max`` rather than ``sum`` in ``objective``,
 # so the result is the worst-coil peak instead of a coil total. Other metrics
 # are reduced by adding the per-coil values.
-_METRIC_REGISTRY_MAX = frozenset({'max_von_mises', 'max_von_mises_lse'})
+_METRIC_REGISTRY_MAX = frozenset({
+    'max_von_mises', 'max_von_mises_lse', 'sq_max_von_mises_lse',
+})
 
 def _build_metric_fn(name: str):
     """Return ``(problem, sol_list, lam, mu) -> scalar`` for the given name."""
