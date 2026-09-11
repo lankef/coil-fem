@@ -307,7 +307,7 @@ def to_full_body(
         ) from exc
 
     path = Path(path)
-    coil_support = Jstress._coil_support
+    coil_support = Jstress.coil_support
     fem = Jstress.fem
     support = fem.support
     meshes = fem.meshes

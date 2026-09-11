@@ -34,6 +34,7 @@ from .coil_support_beams import (
     _uniform_list,
     _zeros_list,
     _check_ragged_shape,
+    _inboard_midplane_phi,
 )
 
 
@@ -78,13 +79,14 @@ def _coil_center_phi_array(base_coils, n_beam_cr):
     return jnp.stack(rows, axis=0) if rows else jnp.zeros((0, n))
 
 
-def _min_R_phi_window_array(base_coils, n_beam_cr, width=0.1):
+def _inboard_midplane_phi_window_array(base_coils, n_beam_cr, width=0.1):
     """``phis_start_cr`` of shape ``(n_coil, n_beam_cr)``.
 
-    For each coil, sample ``gamma`` on its quadpoints, take
-    ``phi0 = argmin sqrt(x^2+y^2)``, place ``n`` points with
-    ``linspace(phi0 - width/2, phi0 + width/2, n)``, then ``mod 1`` and
-    sort ascending so Sorted ``dphis_start_cr`` stay non-negative.
+    For each coil, take ``phi0`` at the inboard midplane (among
+    ``r < r_center``, closest ``z`` to the coil centre), place ``n``
+    points with ``linspace(phi0 - width/2, phi0 + width/2, n)``, then
+    ``mod 1`` and sort ascending so Sorted ``dphis_start_cr`` stay
+    non-negative.
 
     ponytail: sorting after ``% 1`` can reorder beam indices when the window
     wraps across 0; upgrade path is a wrap-aware Sorted codec.
@@ -97,11 +99,9 @@ def _min_R_phi_window_array(base_coils, n_beam_cr, width=0.1):
     rows = []
     for coil in base_coils:
         curve = CurveXYZFourierJAX.from_simsopt(coil.curve)
-        gamma = curve.gamma()
-        R = jnp.sqrt(gamma[:, 0] ** 2 + gamma[:, 1] ** 2)
-        phi0 = curve.quadpoints[jnp.argmin(R)]
+        phi0 = _inboard_midplane_phi(curve)
         if n == 1:
-            rows.append(jnp.array([phi0 % 1.0]))
+            rows.append(jnp.array([phi0]))
         else:
             phis = jnp.linspace(phi0 - half, phi0 + half, n) % 1.0
             rows.append(jnp.sort(phis))
@@ -368,7 +368,7 @@ class CoilSupportBeamsCSR(CoilSupport):
             ),
             'phis_start_cr': (
                 _phis_start_cr if _phis_start_cr is not None
-                else _min_R_phi_window_array(base_coils, n_beam_cr)
+                else _inboard_midplane_phi_window_array(base_coils, n_beam_cr)
             ),
             'phis_end_cr': (
                 _phis_end_cr if _phis_end_cr is not None

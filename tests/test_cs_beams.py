@@ -239,12 +239,11 @@ def test_coil_support_beams_cs_defaults():
     assert ps.shape == (2,)
     np.testing.assert_allclose(pe, 1.0 - ps, atol=1e-12)
 
-    # Inboard point: argmin R on each start coil.
+    # Inboard midplane on each start coil.
+    from coil_fem.simsopt.coil_support_beams import _inboard_midplane_phi
     for j, (i0, _) in enumerate(cs.support.i_beam_cs):
         curve = CurveXYZFourierJAX.from_simsopt(base_coils[i0].curve)
-        gamma = curve.gamma()
-        R = np.sqrt(gamma[:, 0] ** 2 + gamma[:, 1] ** 2)
-        phi0 = float(curve.quadpoints[np.argmin(R)] % 1.0)
+        phi0 = float(_inboard_midplane_phi(curve))
         np.testing.assert_allclose(ps[j], phi0, atol=1e-10)
 
     # Sorted: same absolute keys, bounds seed ± 0.5.
@@ -280,3 +279,57 @@ def test_coil_support_beams_cs_defaults():
             assert abs(full_hi[idx] - (seed[j] + 0.5)) < 1e-12, (
                 target, full_hi[idx], seed[j],
             )
+
+
+def test_inboard_midplane_phi_differs_from_min_R():
+    """Phase-shifted circle: midplane-inboard ≠ argmin R."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import CurveXYZFourier
+    from coil_fem.simsopt.coil_support_beams import _inboard_midplane_phi
+    from coil_fem.simsopt import CoilSupportBeams
+
+    R0, R1, delta = 1.0, 0.5, np.pi / 4
+    qp = np.linspace(0.0, 1.0, 64, endpoint=False)
+    # Two identical phase-shifted coils (stellsym needs n_base >= 2 for CS).
+    base_coils = []
+    for i in range(2):
+        c = CurveXYZFourier(qp, 1)
+        dofs = np.zeros(9)
+        dofs[0] = R0
+        dofs[2] = R1  # xc cos
+        dofs[7] = R1 * np.cos(delta)  # zc sin
+        dofs[8] = R1 * np.sin(delta)  # zc cos
+        # Rotate second coil by half-period in xy for a distinct location.
+        if i == 1:
+            dofs[0] = 0.0
+            dofs[3] = R0
+            dofs[2] = 0.0
+            dofs[5] = R1  # yc cos
+        c.set_dofs(dofs)
+        base_coils.append(Coil(c, Current(1e5)))
+
+    curve0 = CurveXYZFourierJAX.from_simsopt(base_coils[0].curve)
+    gamma = np.asarray(curve0.gamma())
+    r = np.hypot(gamma[:, 0], gamma[:, 1])
+    phi_min_R = float(np.asarray(curve0.quadpoints)[np.argmin(r)] % 1.0)
+    phi_mid = float(_inboard_midplane_phi(curve0))
+    assert abs(phi_mid - phi_min_R) > 1e-3, (phi_mid, phi_min_R)
+
+    cs = CoilSupportBeams(
+        base_coils=base_coils, nfp=2, stellsym=True,
+        beam_options={
+            'n_beam_cc': 0,
+            'n_beam_cf': 0,
+            'E': 200e9,
+            'nu': 0.3,
+            'cross_section_type': 'solid_circle',
+            'attachment_type': 'direct',
+            'i_beam_cs': [(0, 0)],
+            's_beam_cs': [True],
+        },
+        r_beam=0.05,
+    )
+    np.testing.assert_allclose(
+        float(cs.support_dofs['phis_start_cs'][0]), phi_mid, atol=1e-10,
+    )

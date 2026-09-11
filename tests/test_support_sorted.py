@@ -481,13 +481,13 @@ def test_csr_default_phis_end_cr_at_coil_center():
     np.testing.assert_allclose(d, expected_d, atol=1e-12)
 
 
-def test_csr_default_phis_start_cr_min_R_window():
-    """phis_start_cr in the default min-R window."""
+def test_csr_default_phis_start_cr_inboard_midplane_window():
+    """phis_start_cr in the default inboard-midplane window."""
     pytest.importorskip("simsopt")
     from simsopt.field import Coil, Current
     from simsopt.geo import create_equally_spaced_curves
-    from coil_fem.geo import CurveXYZFourierJAX
     from coil_fem.simsopt import CoilSupportBeamsCSRSorted
+    from coil_fem.simsopt.coil_support_beams import _inboard_midplane_phi
     from coil_fem.simsopt.sorted_dphis import _encode_dphis
 
     n_base, nfp, n_cr = 1, 2, 3
@@ -495,10 +495,9 @@ def test_csr_default_phis_start_cr_min_R_window():
         n_base, nfp, stellsym=False, R0=1.0, R1=0.5, order=2, numquadpoints=32,
     )
     base_coils = [Coil(c, Current(1e5)) for c in curves]
+    from coil_fem.geo import CurveXYZFourierJAX
     curve = CurveXYZFourierJAX.from_simsopt(base_coils[0].curve)
-    gamma = np.asarray(curve.gamma())
-    R = np.sqrt(gamma[:, 0] ** 2 + gamma[:, 1] ** 2)
-    phi0 = float(np.asarray(curve.quadpoints)[np.argmin(R)])
+    phi0 = float(_inboard_midplane_phi(curve))
 
     cs = CoilSupportBeamsCSRSorted(
         base_coils=base_coils,
@@ -524,6 +523,47 @@ def test_csr_default_phis_start_cr_min_R_window():
     assert -0.5 - 1e-14 <= dphis[0] <= 0.5 + 1e-14
     assert np.all(dphis[1:] >= -1e-15)
     np.testing.assert_allclose(np.cumsum(dphis), ps, atol=1e-12)
+
+
+def test_csr_default_phis_start_cr_phase_shifted_differs_from_min_R():
+    """CR window centres on midplane-inboard, not argmin R, for a tilted circle."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import CurveXYZFourier
+    from coil_fem.geo import CurveXYZFourierJAX
+    from coil_fem.simsopt import CoilSupportBeamsCSR
+    from coil_fem.simsopt.coil_support_beams import _inboard_midplane_phi
+
+    R0, R1, delta = 1.0, 0.5, np.pi / 4
+    qp = np.linspace(0.0, 1.0, 64, endpoint=False)
+    c = CurveXYZFourier(qp, 1)
+    dofs = np.zeros(9)
+    dofs[0] = R0
+    dofs[2] = R1
+    dofs[7] = R1 * np.cos(delta)
+    dofs[8] = R1 * np.sin(delta)
+    c.set_dofs(dofs)
+    base_coils = [Coil(c, Current(1e5))]
+
+    curve = CurveXYZFourierJAX.from_simsopt(base_coils[0].curve)
+    gamma = np.asarray(curve.gamma())
+    r = np.hypot(gamma[:, 0], gamma[:, 1])
+    phi_min_R = float(np.asarray(curve.quadpoints)[np.argmin(r)] % 1.0)
+    phi_mid = float(_inboard_midplane_phi(curve))
+    assert abs(phi_mid - phi_min_R) > 1e-3
+
+    cs = CoilSupportBeamsCSR(
+        base_coils=base_coils,
+        nfp=2,
+        stellsym=False,
+        beam_options=_csr_beam_options(n_beam_cc=0, n_beam_cr=1),
+        csr_options=_csr_options(nfp=2),
+        problem_options={'solver': 'umfpack'},
+        r_beam=0.05,
+    )
+    ps = float(np.asarray(cs.support_dofs['phis_start_cr'][0, 0]))
+    np.testing.assert_allclose(ps, phi_mid, atol=1e-10)
+    assert abs(ps - phi_min_R) > 1e-3
 
 
 def test_csr_sorted_dphis_cr_flatten_grad_fd():

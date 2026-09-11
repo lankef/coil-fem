@@ -143,7 +143,7 @@ class CoilFEMObjective(Optimizable):
                 f"len(metric_weights)={len(metric_weights)}."
             )
 
-        self._coil_support = coil_support
+        self.coil_support = coil_support
 
         # Store constructor args for serialisation introspection.
         self._mesh_options     = mesh_options
@@ -228,12 +228,12 @@ class CoilFEMObjective(Optimizable):
         """Read coil / current / support DOFs live from the simsopt graph."""
         base_curves_dofs = [
             jnp.asarray(c.get_dofs())
-            for c in self._coil_support.base_curves
+            for c in self.coil_support.base_curves
         ]
         base_currents_dofs = jnp.array(
-            [c.get_value() for c in self._coil_support.base_currents]
+            [c.get_value() for c in self.coil_support.base_currents]
         )
-        support_dofs = self._coil_support.support_dofs
+        support_dofs = self.coil_support.support_dofs
         return base_curves_dofs, base_currents_dofs, support_dofs
 
     def _weighted_J(self, cdofs, idofs, sdofs):
@@ -288,13 +288,13 @@ class CoilFEMObjective(Optimizable):
         self._compute_dJ()
 
         d = Derivative({})
-        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+        for curve, g in zip(self.coil_support.base_curves, self._grad_curves):
             d = d + Derivative({curve: g})
-        for current, g in zip(self._coil_support.base_currents, self._grad_currents):
+        for current, g in zip(self.coil_support.base_currents, self._grad_currents):
             d = d + current.vjp(np.array([float(g)]))
         d = d + Derivative({
-            self._coil_support:
-                self._coil_support.flatten_grad(self._grad_support)
+            self.coil_support:
+                self.coil_support.flatten_grad(self._grad_support)
         })
         return d
 

@@ -120,6 +120,21 @@ def _check_ragged_shape(value, counts, name, trailing=()):
     return out
 
 
+def _inboard_midplane_phi(curve):
+    """Coil parameter at the inboard midplane quadpoint.
+
+    Among quadpoints with cylindrical radius strictly less than the coil
+    centre radius, pick the one whose ``z`` is closest to the centre's
+    ``z``.  Returns that quadpoint's parameter in ``[0, 1)``.
+    """
+    c = curve.curve_center()
+    r_center = jnp.hypot(c[0], c[1])
+    gamma = curve.gamma()
+    r = jnp.hypot(gamma[:, 0], gamma[:, 1])
+    dz = jnp.where(r < r_center, jnp.abs(gamma[:, 2] - c[2]), jnp.inf)
+    return curve.quadpoints[jnp.argmin(dz)] % 1.0
+
+
 class CoilSupportBeams(CoilSupport):
     """Simsopt-optimizable beam-network coil support.
 
@@ -191,7 +206,8 @@ class CoilSupportBeams(CoilSupport):
     phis_start_cs, phis_end_cs : array-like or None
         Initial attachment angles for optional CS beams, shape
         ``(n_beam_cs,)``.  Defaults place each start at the start-coil
-        inboard point (``argmin R``) and set ``phi_end = 1 - phi_start``.
+        inboard midplane (among ``r < r_center``, closest ``z`` to the
+        coil centre) and set ``phi_end = 1 - phi_start``.
     thetas_orientation_cs : array-like or None
         Initial CS roll angles, shape ``(n_beam_cs,)``.
     fixed_clamp_options : dict
@@ -432,16 +448,13 @@ class CoilSupportBeams(CoilSupport):
                         f"got {_ps_cs.shape}."
                     )
             else:
-                # One inboard point per CS beam (argmin R on start coil).
+                # One inboard-midplane point per CS beam (start coil).
                 _ps_list = []
                 for i0, _i1 in beams.i_beam_cs:
                     curve = CurveXYZFourierJAX.from_simsopt(
                         base_coils[i0].curve,
                     )
-                    gamma = curve.gamma()
-                    R = jnp.sqrt(gamma[:, 0] ** 2 + gamma[:, 1] ** 2)
-                    phi0 = curve.quadpoints[jnp.argmin(R)]
-                    _ps_list.append(phi0 % 1.0)
+                    _ps_list.append(_inboard_midplane_phi(curve))
                 _ps_cs = jnp.asarray(_ps_list, dtype=float)
             if phis_end_cs is not None:
                 _pe_cs = jnp.asarray(phis_end_cs, dtype=float)
