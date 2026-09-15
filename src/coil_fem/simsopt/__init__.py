@@ -8,6 +8,7 @@ beam / CSR geometric constraints.
 from .objectives import (
     BeamSurfaceDistance,
     BeamCurveDistance,
+    BeamBeamDistance,
     BeamCurveAngle,
     ClampInboard,
     CoilFEMObjective,
@@ -29,6 +30,7 @@ from .utils import constraint_from_optimizable
 __all__ = [
     "BeamSurfaceDistance",
     "BeamCurveDistance",
+    "BeamBeamDistance",
     "BeamCurveAngle",
     "ClampInboard",
     "CoilFEMObjective",
