@@ -196,12 +196,14 @@ def _write_vtu(
     rho,
     g_vec,
 ):
-    # VTU contents for beam_dolfinx2.py:
+    # VTU contents for beam_dolfinx.py:
     #
     # FieldData — REQUIRED by load_vtu_problem / solve:
-    #   clamp_centers, r_clamp, eps_sigmoid, k_clamp, E, nu, rho, g_vec
+    #   r_clamp, eps_sigmoid, k_clamp, E, nu, rho, g_vec
+    #   clamp_centers — omitted when there are no fixed clamps (empty
+    #   arrays are rejected by PyVista FieldData)
     #
-    # PointData — sanity / Paraview only (not read by beam_dolfinx2; Lorentz
+    # PointData — sanity / Paraview only (not read by beam_dolfinx; Lorentz
     # reclassifies quads from Jstress.json; Winkler uses FieldData spheres):
     #   owner_coil, owner_sym
     meshio.Mesh(
@@ -213,7 +215,9 @@ def _write_vtu(
         },
     ).write(path)
     grid = pv.read(str(path))
-    grid.field_data["clamp_centers"] = np.asarray(clamp_centers, dtype=np.float64)
+    clamp_centers = np.asarray(clamp_centers, dtype=np.float64).reshape(-1, 3)
+    if clamp_centers.shape[0]:
+        grid.field_data["clamp_centers"] = clamp_centers
     grid.field_data["r_clamp"] = np.array([r_clamp], dtype=np.float64)
     grid.field_data["eps_sigmoid"] = np.array([eps_sigmoid], dtype=np.float64)
     grid.field_data["k_clamp"] = np.array([k_clamp], dtype=np.float64)
@@ -266,7 +270,9 @@ def to_full_body(
     Uses wildmeshing (fTetWild) to tetrahedralise a triangle soup of the
     unfused beam and coil surfaces.  No OCC boolean is performed, so
     sub-mesh-size slivers from beam–coil intersections are absorbed
-    automatically by the fTetWild envelope.
+    automatically by the fTetWild envelope.  When fixed clamps are
+    disabled, ``clamp_centers`` is omitted from FieldData; consumers
+    must treat that key as optional.
 
     Parameters
     ----------
