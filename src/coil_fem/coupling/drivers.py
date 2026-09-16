@@ -389,6 +389,29 @@ def build_monolithic_static(
             _MTYPE_ID,
         )
 
+        try:
+            CuDSSSolver = _import_cudss_solver()
+        except RuntimeError as e:
+            # Reached from CoilFEM.__init__ — including simsopt JSON
+            # deserialisation, which always reconstructs a real CoilFEM.
+            # Degrade to a CoilFEM with no monolithic solver bundle rather
+            # than block loading/inspection on a CPU-only machine;
+            # solve_monolithic() re-checks and raises there if a solve is
+            # actually attempted.
+            warnings.warn(
+                "problem_options['solver']='cudss' was requested but the "
+                f"cuDSS backend is unavailable ({e}). Building this CoilFEM "
+                "WITHOUT a monolithic solver bundle: mesh/pipeline "
+                "attributes and body force are still usable, but "
+                "objective()/dJ()/solve_monolithic() will raise an error "
+                "when called. To perform FEM solves, please run on a "
+                "machine with a working GPU and cuDSS installation.",
+                UserWarning,
+                stacklevel=4,
+            )
+            CuDSSSolver = None
+
+    if solver == 'cudss' and CuDSSSolver is not None:
         _sym_claims = [p.problem.matrix_symmetry for p in pipelines]
         _sym_claims.append(support.matrix_symmetry)
         merged_sym = weakest_symmetry(*_sym_claims)
@@ -406,8 +429,6 @@ def build_monolithic_static(
         device_id = int(problem_options.get('cudss_device_id', 0))
         mview_id = 0
         adjoint_reuses_K = adjoint_reuses_forward_K(merged_sym, mtype_id)
-
-        CuDSSSolver = _import_cudss_solver()
 
         def _make_solver(indptr_in, indices_in):
             with warnings.catch_warnings():
@@ -726,23 +747,38 @@ def solve_monolithic(
 
     Raises
     ------
+    RuntimeError
+        When ``pipelines[0].problem_options['solver'] == 'cudss'`` but no
+        CUDA JAX backend is available.  CoilFEM is designed to temporarily
+        ignore a missing backend during initialisation: this is implemented
+        by letting :func:`build_monolithic_static` build a dummy ``static``
+        and throw a warning rather than a hard error, so a pickled/JSON
+        CoilFEM can still be loaded and its parameters, body force, and
+        boundary conditions inspected regardless of backend availability.
+        The hard error is deferred to here, raised only when the user
+        actually requests an FEM solve through ``merged_solve``.
     NotImplementedError
         When ``static.merged_solve`` is ``None``, which happens when the
         pipeline solver is not ``'cudss'``.  CPU-only monolithic solves are
         not implemented.
     """
+    solver_opt = pipelines[0].problem_options.get('solver', '')
+    if solver_opt == 'cudss':
+        # Either re-check freshly (backend may have appeared/vanished since
+        # construction) or, when build_monolithic_static degraded to no
+        # solver bundle because cuDSS was unavailable at construction time,
+        # surface that precise reason here instead of the generic message
+        # below.
+        from ..solvers.cudss import require_cuda_for_cudss
+        require_cuda_for_cudss()
+
     if static.merged_solve is None:
-        solver_opt = pipelines[0].problem_options.get('solver', '')
         raise NotImplementedError(
             "solve_monolithic requires problem_options={'solver': 'cudss'}. "
             f"Got solver='{solver_opt}'. "
             "The monolithic merge assembles K_cc^i from problem.V_jax which "
             "is only populated on the cuDSS GPU path."
         )
-
-    # Catch Host-pinned JAX before spineax's CUDA-only FFI fails opaquely.
-    from ..solvers.cudss import require_cuda_for_cudss
-    require_cuda_for_cudss()
 
     coil_dof_offsets = static.coil_dof_offsets
     n_dofs_per_coil  = static.n_dofs_per_coil
