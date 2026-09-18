@@ -23,7 +23,7 @@ variables by simsopt. Each section type ``name`` is accompanied by:
 * ``name_dof_keys`` — keys required in ``support_dofs``;
 * ``name_option_keys`` — keys required in ``beam_options``;
 * ``name_attachment`` — soft attachment weight function;
-* ``name_solid`` — OCC body factory for :func:`~coil_fem.io.to_full_body`
+* ``name_solid`` — OCC body factory for :func:`~coil_fem.io.gmsh.to_full_body`
   (``solid_fn(occ, dofs, L) -> list[(dim, tag)]`` in the beam-local frame).
 
 Conventions (matching ``docs/theory/bisymbeam.rst``)
