@@ -1,5 +1,4 @@
-"""I/O helpers for coil-fem (gmsh full-body export, etc.)."""
+"""I/O helpers for coil-fem.
 
-from .gmsh import to_full_body
-
-__all__ = ["to_full_body",]
+Import from submodules (e.g. :mod:`coil_fem.io.gmsh`), not this package.
+"""
