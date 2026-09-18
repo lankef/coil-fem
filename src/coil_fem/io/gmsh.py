@@ -264,6 +264,7 @@ def to_full_body(
     path: str | Path = "full_body_fields.vtu",
     output_msh: bool = False,
     epsilon: float = 5e-4,
+    quality_loop: bool = False,
 ) -> Path:
     """Build a full-device TET10 mesh and write ``full_body_fields.vtu``.
 
@@ -293,6 +294,11 @@ def to_full_body(
         diagonal.  Features thinner than ``epsilon * diag`` may be
         absorbed.  Default ``5e-4`` gives ~5 mm on a 10 m device, safely
         below ``t_beam = 30 mm``.  Decrease if thin walls are lost.
+    quality_loop : bool
+        If ``True``, run fTetWild's split/collapse/swap/smooth passes
+        (``max_its=80``, stop at AMIPS energy 10).  Default ``False``
+        skips that loop (``max_its=0``); insertion, envelope fill, and
+        the pre/post collapses still run.
 
     Returns
     -------
@@ -419,6 +425,7 @@ def to_full_body(
     )
     tet = wm.Tetrahedralizer(
         stop_quality=10,
+        max_its=80 if quality_loop else 0,
         epsilon=epsilon,
         edge_length_r=size_max / diag,
     )
