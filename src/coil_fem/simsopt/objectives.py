@@ -10,8 +10,20 @@ and any optimisable support DOFs (e.g. clamp locations).
 support beams clear of a target surface.
 :class:`BeamCurveDistance` hinges free-span beam clearance to the attached
 coil curves.
+:class:`BeamBeamDistance` hinges pairwise clearance between support beams
+(intra-group CC, CS plus symmetry images).
 :class:`BeamCurveAngle` penalises beam–coil attachments that are too nearly
 tangent.
+:class:`CSRVolume` estimates the central support ring volume as
+``w1 * w2 * L`` from the live CSR curve.
+:class:`CSRCurveDistance` hinges CSR–coil centreline clearance
+(coil–coil pairs are omitted).
+:class:`CSRSurfaceDistance` hinges CSR–surface clearance on one
+field period (half period if stellsym).
+:class:`ClampInboard` hinges fixed clamps that sit radially outboard of
+each coil centre.
+:class:`CRBeamInboard` hinges coil-to-CSR beam starts that sit radially
+outboard of each coil centre.
 """
 
 from __future__ import annotations
@@ -23,17 +35,24 @@ from jax import value_and_grad
 import numpy as np
 import jax.numpy as jnp
 
-from ..geo import CurveXYZFourierJAX
+from ..geo import (
+    CurveXYZFourierJAX,
+    CurveRZFourierJAX,
+    apply_symmetries_to_gammas,
+)
 from ..problems import recompute_fe_geometry
 from ..metrics import total_strain_energy
+from ..coupling import SupportBeams, SupportBeamsCSR
 
 try:
     from simsopt._core.optimizable import Optimizable
     from simsopt._core.derivative import derivative_dec, Derivative
+    from simsopt.geo.curveobjectives import cc_distance_pure
     _HAS_SIMSOPT = True
 except ImportError:  # pragma: no cover
     Optimizable = object           # type: ignore[misc, assignment]
     _HAS_SIMSOPT = False
+    cc_distance_pure = None        # type: ignore[misc, assignment]
 
     def derivative_dec(fn):        # type: ignore[misc]
         return fn
@@ -132,7 +151,7 @@ class CoilFEMObjective(Optimizable):
                 f"len(metric_weights)={len(metric_weights)}."
             )
 
-        self._coil_support = coil_support
+        self.coil_support = coil_support
 
         # Store constructor args for serialisation introspection.
         self._mesh_options     = mesh_options
@@ -217,12 +236,12 @@ class CoilFEMObjective(Optimizable):
         """Read coil / current / support DOFs live from the simsopt graph."""
         base_curves_dofs = [
             jnp.asarray(c.get_dofs())
-            for c in self._coil_support.base_curves
+            for c in self.coil_support.base_curves
         ]
         base_currents_dofs = jnp.array(
-            [c.get_value() for c in self._coil_support.base_currents]
+            [c.get_value() for c in self.coil_support.base_currents]
         )
-        support_dofs = self._coil_support.support_dofs
+        support_dofs = self.coil_support.support_dofs
         return base_curves_dofs, base_currents_dofs, support_dofs
 
     def _weighted_J(self, cdofs, idofs, sdofs):
@@ -277,13 +296,13 @@ class CoilFEMObjective(Optimizable):
         self._compute_dJ()
 
         d = Derivative({})
-        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+        for curve, g in zip(self.coil_support.base_curves, self._grad_curves):
             d = d + Derivative({curve: g})
-        for current, g in zip(self._coil_support.base_currents, self._grad_currents):
+        for current, g in zip(self.coil_support.base_currents, self._grad_currents):
             d = d + current.vjp(np.array([float(g)]))
         d = d + Derivative({
-            self._coil_support:
-                self._coil_support.flatten_grad(self._grad_support)
+            self.coil_support:
+                self.coil_support.flatten_grad(self._grad_support)
         })
         return d
 
@@ -360,15 +379,25 @@ class CoilFEMObjective(Optimizable):
             'strain_energy_J':    strain_energy,
         }
 
-    def save_run_vtu(self, out_dir: str = ".", *, prefix: str = "coil"):
-        """Export per-coil FEM results as VTU files at the *current* DOFs.
+    def to_vtu(self, out_dir: str = ".", *, run: bool = True,
+               prefix: str = "coil", n_sub: int = 20):
+        """Export coil / support / beam VTU files at the *current* DOFs.
+
+        Thin wrapper over :meth:`coil_fem.CoilFEM.to_vtu` that reads the
+        current simsopt DOFs.  With ``run=True`` (default) a forward FEM solve
+        is performed and the deformed-state fields are written; with
+        ``run=False`` only geometry and Winkler-support weights are exported.
 
         Parameters
         ----------
         out_dir : str
             Output directory.
+        run : bool
+            Whether to run the forward solve (default ``True``).
         prefix : str
             File-name prefix.
+        n_sub : int
+            Beam sub-segments in ``{prefix}_beams.vtu`` when ``run``.
 
         Returns
         -------
@@ -376,35 +405,14 @@ class CoilFEMObjective(Optimizable):
             Paths of all files written.
         """
         cdofs, idofs, sdofs = self._read_dofs()
-        return self.fem.save_run_vtu(
+        return self.fem.to_vtu(
             out_dir,
+            run=run,
             prefix=prefix,
             base_curves_dofs=cdofs,
             base_currents_dofs=idofs,
             base_support_dofs=sdofs,
-        )
-
-    def save_support_vtu(self, out_dir: str = ".", *, prefix: str = "coil"):
-        """Export per-coil Winkler support weights as VTU files at the *current* DOFs.
-
-        Parameters
-        ----------
-        out_dir : str
-            Output directory.
-        prefix : str
-            File-name prefix.
-
-        Returns
-        -------
-        list[str]
-            Paths of all files written.
-        """
-        cdofs, _, sdofs = self._read_dofs()
-        return self.fem.save_support_vtu(
-            out_dir,
-            prefix=prefix,
-            base_curves_dofs=cdofs,
-            base_support_dofs=sdofs,
+            n_sub=n_sub,
         )
 
     def compute_strain_tensors(self):
@@ -806,9 +814,9 @@ class BeamCurveDistance(Optimizable):
         \xi_\mathrm{end}^\mathrm{eff}
             = \min(\xi_\mathrm{end},\, 1 - r_\mathrm{safe}/L),
 
-    with :math:`S_b` the segment between those stations.  When
-    :math:`\xi_\mathrm{start}^\mathrm{eff} > \xi_\mathrm{end}^\mathrm{eff}`,
-    beam :math:`b` contributes zero.
+    with :math:`S_b` the segment between those stations.  Per-end trim is
+    capped at just under :math:`L/2` so the free span cannot invert; a
+    collapsed beam still contributes a mid-chord sliver rather than zero.
 
     Parameters
     ----------
@@ -817,6 +825,8 @@ class BeamCurveDistance(Optimizable):
         :class:`~coil_fem.coupling.SupportBeams` model.
     dead_length : float
         Length ignored from each chord end before the free span [m].
+        Must be ``> 0``.  If larger than half a beam's length it is
+        capped per beam so a non-empty free span remains.
     minimum_distance : float
         Desired minimum beam-to-coil clearance [m].
 
@@ -844,8 +854,11 @@ class BeamCurveDistance(Optimizable):
 
         dead_length = float(dead_length)
         minimum_distance = float(minimum_distance)
-        if dead_length < 0.0:
-            raise ValueError(f"dead_length must be >= 0; got {dead_length}.")
+        if dead_length <= 0.0:
+            raise ValueError(
+                f"dead_length must be > 0; got {dead_length}. "
+                "Zero puts attachments on the free span and makes dJ NaN."
+            )
         if minimum_distance < 0.0:
             raise ValueError(
                 f"minimum_distance must be >= 0; got {minimum_distance}."
@@ -894,14 +907,33 @@ class BeamCurveDistance(Optimizable):
         x_start = geom['x_start']
         x_end = geom['x_end']
         L = geom['L']
-        xi_safe_start = self.dead_length / (L + 1e-300)
-        xi_safe_end = 1.0 - self.dead_length / (L + 1e-300)
+        MIN_SPAN = 1e-3  # [m] always keep a non-empty free span
+
+        # dead_length is per end. If 2*dead_length >= L the span inverts and
+        # the unused hinge branch can leak NaNs into the GPU VJP. Cap with
+        # jnp.minimum so this stays in the JAX trace (L depends on DOFs).
+        # On beams shorter than 2*MIN_SPAN, keep 2% of L instead of 1 mm.
+        min_span = jnp.minimum(MIN_SPAN, 0.01 * L)
+        dead_eff = jnp.minimum(
+            self.dead_length,
+            jnp.maximum(0.0, 0.5 * L - min_span),
+        )
+        xi_safe_start = dead_eff / (L + 1e-300)
+        xi_safe_end = 1.0 - dead_eff / (L + 1e-300)
         xi_start_eff = jnp.maximum(geom['xi_start'], xi_safe_start)
         xi_end_eff = jnp.minimum(geom['xi_end'], xi_safe_end)
-        active = xi_start_eff <= xi_end_eff
+
+        # Mesh trim (xi_start / xi_end) can still invert; push to a mid-sliver.
+        mid = 0.5 * (xi_start_eff + xi_end_eff)
+        half = 0.5 * (min_span / (L + 1e-300))
+        inverted = xi_start_eff > xi_end_eff
+        xi_start_eff = jnp.where(inverted, mid - half, xi_start_eff)
+        xi_end_eff = jnp.where(inverted, mid + half, xi_end_eff)
+
         d = x_end - x_start
         x_a = x_start + xi_start_eff[:, None] * d
         x_b = x_start + xi_end_eff[:, None] * d
+        active = jnp.ones(L.shape, dtype=bool)
         return x_a, x_b, active
 
     def _accumulate_J(self, curves_jax, x_a, x_b, active):
@@ -944,6 +976,24 @@ class BeamCurveDistance(Optimizable):
 
         if support.stellsym:
             J, b = add_cc(J, n_base, b)
+
+        # CS beams after wrap CC.
+        for _j, ((i0, i1), side) in enumerate(
+            zip(support.i_beam_cs, support.s_beam_cs)
+        ):
+            end_tfm = 'flip' if side else 'flip_half'
+            sl = slice(b, b + 1)
+            c_s = curves_jax[i0]
+            c_e = curves_jax[i1]
+            gamma_e = support._apply_end_transform(c_e.gamma(), end_tfm)
+            hs = _curve_segment_hinge(
+                x_a[sl], x_b[sl], c_s.gamma(), c_s.gammadash(), dmin,
+            )
+            he = _curve_segment_hinge(
+                x_a[sl], x_b[sl], gamma_e, c_e.gammadash(), dmin,
+            )
+            J = J + jnp.sum(jnp.where(active[sl], hs + he, 0.0))
+            b += 1
 
         return J
 
@@ -996,9 +1046,10 @@ class BeamCurveDistance(Optimizable):
         Returns
         -------
         float
-            Minimum over active beams of the distance from segment ``S`` to
-            the start coil (and, for CC beams, the end coil).  Inactive beams
-            are ignored.  If every beam is inactive, returns ``inf``.
+            Minimum over beams of the distance from segment ``S`` to the
+            start coil (and, for CC beams, the end coil).  Free spans are
+            kept non-empty by capping ``dead_length``; the active mask is
+            retained for callers and is all-true after the cap.
         """
         cdofs, sdofs = self._read_dofs()
         curves_jax = self._curves_jax(cdofs)
@@ -1045,7 +1096,327 @@ class BeamCurveDistance(Optimizable):
         if support.stellsym:
             best, b = min_cc(n_base, b, best)
 
+        # CS beams after wrap CC.
+        for _j, ((i0, i1), side) in enumerate(
+            zip(support.i_beam_cs, support.s_beam_cs)
+        ):
+            end_tfm = 'flip' if side else 'flip_half'
+            sl = slice(b, b + 1)
+            gamma_s = curves_jax[i0].gamma()
+            gamma_e = support._apply_end_transform(
+                curves_jax[i1].gamma(), end_tfm,
+            )
+            ds = jnp.min(_segment_point_dists(x_a[sl], x_b[sl], gamma_s), axis=1)
+            de = jnp.min(_segment_point_dists(x_a[sl], x_b[sl], gamma_e), axis=1)
+            d = jnp.minimum(ds, de)
+            d = jnp.where(active[sl], d, jnp.inf)
+            best = jnp.minimum(best, jnp.min(d))
+            b += 1
+
         return float(best)
+
+
+# ============================================================================
+# Beam-beam distance
+# ============================================================================
+
+
+def _chord_quadrature(x_start, x_end, n_quad):
+    """Uniform samples and constant tangents along beam chords.
+
+    Returns ``(pts, tangents)`` of shape ``(N, n_quad, 3)``, shaped as the
+    ``(gamma, gammadash)`` pair :func:`simsopt.geo.curveobjectives.cc_distance_pure`
+    expects.  ``‖tangent‖`` is the chord length, so it carries the ``dl``
+    weight.
+
+    Parameters
+    ----------
+    x_start, x_end : jax.Array, shape (N, 3)
+        Chord endpoints.
+    n_quad : int
+        Number of midpoint samples along each chord.
+
+    Returns
+    -------
+    pts : jax.Array, shape (N, n_quad, 3)
+    tangents : jax.Array, shape (N, n_quad, 3)
+    """
+    xi = (jnp.arange(n_quad) + 0.5) / n_quad
+    d = x_end - x_start
+    pts = x_start[:, None, :] + xi[None, :, None] * d[:, None, :]
+    return pts, jnp.broadcast_to(d[:, None, :], pts.shape)
+
+
+def _beam_beam_pair_indices(support):
+    """Static ``(ia, ib)`` pool indices for CC intra-group and CS-vs-image pairs."""
+    ia: list[int] = []
+    ib: list[int] = []
+    n_base = support.n_base
+    for g in range(support.n_groups_cc):
+        n_g = support.n_beam_cc[g]
+        if n_g < 2:
+            continue
+        start = (
+            support.beam_offsets[g] if g < n_base
+            else support.wrap_beam_offset
+        )
+        for i in range(n_g):
+            for j in range(i + 1, n_g):
+                ia.append(start + i)
+                ib.append(start + j)
+
+    n_cs = support.n_beam_cs
+    if n_cs > 0:
+        n_images = n_cs * support.nfp * (1 + int(support.stellsym))
+        n_beams = support.n_beams_total
+        cs0 = support.cs_beam_offset
+
+        def cs_pool(m):
+            if m < n_cs:
+                return cs0 + m
+            return n_beams + (m - n_cs)
+
+        for a in range(n_cs):
+            for m in range(a + 1, n_images):
+                ia.append(cs_pool(a))
+                ib.append(cs_pool(m))
+
+    return (
+        np.asarray(ia, dtype=np.int32),
+        np.asarray(ib, dtype=np.int32),
+    )
+
+
+def _pooled_endpoints(geom, support):
+    """Geom endpoints plus non-identity CS field-period / stellsym images."""
+    x_s = geom['x_start']
+    x_e = geom['x_end']
+    n_cs = support.n_beam_cs
+    if n_cs == 0:
+        return x_s, x_e
+    sl = slice(support.cs_beam_offset, support.cs_beam_offset + n_cs)
+    xs_img = apply_symmetries_to_gammas(
+        x_s[sl][:, None, :], support.nfp, support.stellsym,
+    )
+    xe_img = apply_symmetries_to_gammas(
+        x_e[sl][:, None, :], support.nfp, support.stellsym,
+    )
+    return (
+        jnp.concatenate([x_s, xs_img[n_cs:, 0, :]], axis=0),
+        jnp.concatenate([x_e, xe_img[n_cs:, 0, :]], axis=0),
+    )
+
+
+class BeamBeamDistance(Optimizable):
+    r"""Penalise support beams that come closer than ``minimum_distance``.
+
+    The beam analogue of :class:`simsopt.geo.CurveCurveDistance`: the same
+    hinge kernel (:func:`~simsopt.geo.curveobjectives.cc_distance_pure`)
+    applied to midpoint samples of each beam chord.
+
+    .. math::
+        J = \sum_{(a,b)}
+            \int_{S_a} \int_{S_b}
+                \max\bigl(0,\, d_\min - \| \mathbf{r}_a - \mathbf{r}_b \|_2\bigr)^2
+                \, dl_a \, dl_b
+
+    Pairs are:
+
+    * **CC** — the strict upper triangle inside each CC group (beams that
+      share the same start and end coils).
+    * **CS** — each master against every later image in the
+      ``n_\mathrm{cs}\, n_\mathrm{fp}\, (1+\mathrm{stellsym})`` expansion
+      produced by :func:`~coil_fem.geo.apply_symmetries_to_gammas`, matching
+      the ``num_basecurves`` scheme of
+      :class:`~simsopt.geo.CurveCurveDistance`.
+
+    Coil–foundation (CF) beams are not implemented.
+
+    Parameters
+    ----------
+    coil_support_beams : CoilSupportBeams
+        Provides the base curves, the beam DOFs, and the underlying
+        :class:`~coil_fem.coupling.SupportBeams` model.  CSR supports are
+        rejected.
+    minimum_distance : float
+        Desired minimum beam-to-beam clearance [m].
+    n_quad : int
+        Midpoint samples along each chord (default 32).
+
+    Notes
+    -----
+    Only the base (master) CC beams held in
+    ``SupportBeams.beam_geometry`` are paired; stellarator-mirrored CC
+    partners and field-period rotations of CC beams are not replicated.
+
+    The full centreline chord ``x_start -> x_end`` is used, not the free
+    span between ``xi_start`` and ``xi_end``.
+
+    A CS beam that lies in a symmetry plane coincides with its own image
+    and yields a near-zero distance — the same caveat as
+    :class:`~simsopt.geo.CurveCurveDistance` on a symmetric coil set.
+
+    :meth:`shortest_distance` measures sampled points of one beam against
+    the exact chord of the other, so it slightly over-estimates the true
+    segment–segment minimum.
+
+    Examples
+    --------
+    >>> Jbb = BeamBeamDistance(coil_support, minimum_distance=0.1)  # doctest: +SKIP
+    >>> Jbb.shortest_distance()  # doctest: +SKIP
+    0.22...
+    """
+
+    def __init__(
+        self,
+        coil_support_beams,
+        minimum_distance: float,
+        n_quad: int = 32,
+    ):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for BeamBeamDistance.")
+
+        support = coil_support_beams.support
+        if (
+            not isinstance(support, SupportBeams)
+            or isinstance(support, SupportBeamsCSR)
+        ):
+            raise TypeError(
+                "BeamBeamDistance requires a CoilSupportBeams support "
+                f"(SupportBeams, not SupportBeamsCSR); got {type(support)!r}."
+            )
+        if sum(support.n_beam_cf) > 0:
+            raise NotImplementedError(
+                "CF beams are not supported by BeamBeamDistance."
+            )
+
+        minimum_distance = float(minimum_distance)
+        if minimum_distance < 0.0:
+            raise ValueError(
+                f"minimum_distance must be >= 0; got {minimum_distance}."
+            )
+        n_quad = int(n_quad)
+        if n_quad < 1:
+            raise ValueError(f"n_quad must be >= 1; got {n_quad}.")
+
+        self._coil_support = coil_support_beams
+        self._support = support
+        self.minimum_distance = minimum_distance
+        self.n_quad = n_quad
+
+        ia, ib = _beam_beam_pair_indices(support)
+        self._ia = jnp.asarray(ia)
+        self._ib = jnp.asarray(ib)
+
+        self._base_curves_jax = [
+            CurveXYZFourierJAX.from_simsopt(c)
+            for c in coil_support_beams.base_curves
+        ]
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=(0, 1)))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_curves: list | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support_beams])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _read_dofs(self):
+        """Read coil / support DOFs live from the simsopt graph."""
+        base_curves_dofs = [
+            jnp.asarray(c.get_dofs())
+            for c in self._coil_support.base_curves
+        ]
+        return base_curves_dofs, self._coil_support.support_dofs
+
+    def _curves_jax(self, cdofs):
+        """Rebuild traced curve pytrees from live DOFs."""
+        return [
+            CurveXYZFourierJAX(ref.quadpoints, d, ref.order)
+            for ref, d in zip(self._base_curves_jax, cdofs)
+        ]
+
+    def _J_pure(self, cdofs, sdofs):
+        """Beam-to-beam hinge penalty (traced scalar)."""
+        curves_jax = self._curves_jax(cdofs)
+        geom = self._support.beam_geometry(curves_jax, sdofs)
+        x_s, x_e = _pooled_endpoints(geom, self._support)
+        pts, tan = _chord_quadrature(x_s, x_e, self.n_quad)
+        if self._ia.size == 0:
+            return jnp.asarray(0.0)
+        return jnp.sum(jax.vmap(
+            cc_distance_pure, in_axes=(0, 0, 0, 0, None),
+        )(
+            pts[self._ia], tan[self._ia],
+            pts[self._ib], tan[self._ib],
+            self.minimum_distance,
+        ))
+
+    def _compute(self):
+        """Evaluate J and its gradients from the single ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        cdofs, sdofs = self._read_dofs()
+        J_val, (grad_cdofs, grad_sdofs) = self._jit_vg(cdofs, sdofs)
+        self._J_cache = float(J_val)
+        self._grad_curves = [np.asarray(g) for g in grad_cdofs]
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """Beam-to-beam hinge penalty (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the coil and support DOFs.
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+
+        d = Derivative({})
+        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+            d = d + Derivative({curve: g})
+        return d + Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def shortest_distance(self):
+        """Smallest sampled-point-to-chord distance among paired beams [m].
+
+        Returns
+        -------
+        float
+            Minimum over pairs of the distance from one beam's quadrature
+            samples to the other's exact chord (both directions).  Returns
+            ``+inf`` when there are no pairs.
+        """
+        if self._ia.size == 0:
+            return float(np.inf)
+        cdofs, sdofs = self._read_dofs()
+        curves_jax = self._curves_jax(cdofs)
+        geom = self._support.beam_geometry(curves_jax, sdofs)
+        x_s, x_e = _pooled_endpoints(geom, self._support)
+        pts, _ = _chord_quadrature(x_s, x_e, self.n_quad)
+
+        def _one_way(xs, xe, pts_other):
+            return jnp.min(_segment_point_dists(xs[None], xe[None], pts_other))
+
+        d_ab = jax.vmap(_one_way)(x_s[self._ia], x_e[self._ia], pts[self._ib])
+        d_ba = jax.vmap(_one_way)(x_s[self._ib], x_e[self._ib], pts[self._ia])
+        return float(jnp.min(jnp.minimum(d_ab, d_ba)))
 
 
 def _beam_curve_angle_hinge(abs_dot, cos_min, mask):
@@ -1242,3 +1613,690 @@ class BeamCurveAngle(Optimizable):
         if not np.isfinite(smallest):
             return 0.5 * math.pi
         return smallest
+
+
+# ============================================================================
+# CSR volume
+# ============================================================================
+
+
+class CSRVolume(Optimizable):
+    r"""Estimate the central support ring volume as a rectangular prism sweep.
+
+    .. math::
+        J = w_1 \, w_2 \, L,
+        \qquad
+        L = \bigl\langle \|\gamma'(\phi)\| \bigr\rangle_{\phi}
+
+    where :math:`w_1` and :math:`w_2` are the static CSR cross-section widths
+    and :math:`L` is the full-turn length of the live CSR
+    :class:`~coil_fem.geo.CurveRZFourierJAX` (uniform quadrature over
+    ``[0, 1)``).
+
+    Parameters
+    ----------
+    coil_support : CoilSupportBeamsCSR
+        Provides the CSR curve DOFs and the underlying
+        :class:`~coil_fem.coupling.SupportBeamsCSR` (for ``w1``, ``w2``, and
+        the curve template).
+
+    Notes
+    -----
+    The CSR FEM mesh spans only one field period; this objective still uses
+    the full-turn centreline length so ``J`` is the physical ring volume.
+
+    Examples
+    --------
+    >>> Jvol = CSRVolume(coil_support)  # doctest: +SKIP
+    >>> Jvol.length()  # doctest: +SKIP
+    6.28...
+    """
+
+    def __init__(self, coil_support):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for CSRVolume.")
+
+        support = coil_support.support
+        if not isinstance(support, SupportBeamsCSR):
+            raise TypeError(
+                "CSRVolume requires coil_support.support to be a "
+                f"SupportBeamsCSR; got {type(support).__name__}."
+            )
+
+        self._coil_support = coil_support
+        self._support = support
+        self._w1 = float(support._csr_a)
+        self._w2 = float(support._csr_b)
+        self._tmpl = support._csr_curve_template
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=0))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _csr_curve(self, sdofs):
+        """Rebuild the live CSR curve from ``sdofs['csr_curve_dofs']``."""
+        tmpl = self._tmpl
+        return CurveRZFourierJAX(
+            tmpl.quadpoints, sdofs['csr_curve_dofs'],
+            tmpl.order, tmpl.nfp, tmpl.stellsym,
+        )
+
+    def _J_pure(self, sdofs):
+        """Rectangular-section CSR volume estimate (traced scalar)."""
+        L = jnp.mean(self._csr_curve(sdofs).incremental_arclength())
+        return self._w1 * self._w2 * L
+
+    def _compute(self):
+        """Evaluate J and its support gradient from ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        sdofs = self._coil_support.support_dofs
+        J_val, grad_sdofs = self._jit_vg(sdofs)
+        self._J_cache = float(J_val)
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """Estimated CSR volume [m³]."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the support DOFs (CSR curve coefficients).
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+        return Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def length(self):
+        """Full-turn CSR centreline length [m].
+
+        Returns
+        -------
+        float
+            ``mean(||γ'||)`` over the CSR curve quadrature.
+        """
+        sdofs = self._coil_support.support_dofs
+        return float(jnp.mean(self._csr_curve(sdofs).incremental_arclength()))
+
+
+# ============================================================================
+# CSR–coil curve distance
+# ============================================================================
+
+
+def _csr_curve_distance_pure(
+    gamma_csr, dash_csr, gammas, dashes, minimum_distance, downsample,
+):
+    r"""Simsopt ``cc_distance_pure`` summed over CSR–coil pairs only.
+
+    .. math::
+        J = \sum_c \frac{1}{N_{\mathrm{csr}} N_c}
+            \sum_{i,j} \|\gamma'_{\mathrm{csr}}(i)\|\,\|\gamma'_c(j)\|
+            \max(0,\, d_{\min} - \|\gamma_{\mathrm{csr}}(i)-\gamma_c(j)\|)^2
+    """
+    gamma_csr = gamma_csr[::downsample, :]
+    dash_csr = dash_csr[::downsample, :]
+    n_csr = gamma_csr.shape[0]
+    alen_csr = jnp.linalg.norm(dash_csr, axis=1)
+    J = jnp.array(0.0)
+    for gamma_c, dash_c in zip(gammas, dashes):
+        gamma_c = gamma_c[::downsample, :]
+        dash_c = dash_c[::downsample, :]
+        dists = jnp.sqrt(jnp.sum(
+            (gamma_csr[:, None, :] - gamma_c[None, :, :]) ** 2, axis=2,
+        ))
+        alen = alen_csr[:, None] * jnp.linalg.norm(dash_c, axis=1)[None, :]
+        J = J + jnp.sum(
+            alen * jnp.maximum(minimum_distance - dists, 0.0) ** 2,
+        ) / (n_csr * gamma_c.shape[0])
+    return J
+
+
+class CSRCurveDistance(Optimizable):
+    r"""Penalise a CSR centreline that comes closer than ``minimum_distance``
+    to any base coil.
+
+    The hinge matches :class:`simsopt.geo.CurveCurveDistance`, but the only
+    pairs are CSR–coil.  Coil–coil pairs are omitted.  Live CSR geometry is
+    rebuilt from ``support_dofs['csr_curve_dofs']``; coils come from
+    :attr:`~coil_fem.simsopt.CoilSupport.base_curves`.
+
+    .. math::
+        J = \sum_{c \in \mathrm{base}}
+            \frac{1}{N_{\mathrm{csr}} N_c}
+            \sum_{i,j}
+            \|\gamma'_{\mathrm{csr}}(i)\|\,\|\gamma'_c(j)\|
+            \max\bigl(0,\, d_{\min} - \|\gamma_{\mathrm{csr}}(i)-\gamma_c(j)\|\bigr)^2
+
+    Parameters
+    ----------
+    coil_support : CoilSupportBeamsCSR
+        Provides the CSR curve DOFs and the base coil curves.
+    minimum_distance : float
+        Desired minimum CSR–coil centreline clearance [m].
+    downsample : int
+        Quadrature stride, as in :class:`simsopt.geo.CurveCurveDistance`.
+
+    Notes
+    -----
+    Only the base coils are used; stellarator-mirrored partners and
+    field-period rotations are not replicated.
+
+    Examples
+    --------
+    >>> Jcc = CSRCurveDistance(coil_support, minimum_distance=0.3)  # doctest: +SKIP
+    >>> Jcc.shortest_distance()  # doctest: +SKIP
+    0.41...
+    """
+
+    def __init__(
+        self,
+        coil_support,
+        minimum_distance: float,
+        downsample: int = 1,
+    ):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for CSRCurveDistance.")
+
+        support = coil_support.support
+        if not isinstance(support, SupportBeamsCSR):
+            raise TypeError(
+                "CSRCurveDistance requires coil_support.support to be a "
+                f"SupportBeamsCSR; got {type(support).__name__}."
+            )
+        minimum_distance = float(minimum_distance)
+        if minimum_distance < 0.0:
+            raise ValueError(
+                f"minimum_distance must be >= 0; got {minimum_distance}."
+            )
+        downsample = int(downsample)
+        if downsample < 1:
+            raise ValueError(f"downsample must be >= 1; got {downsample}.")
+
+        self._coil_support = coil_support
+        self._support = support
+        self._tmpl = support._csr_curve_template
+        self.minimum_distance = minimum_distance
+        self.downsample = downsample
+
+        self._base_curves_jax = [
+            CurveXYZFourierJAX.from_simsopt(c)
+            for c in coil_support.base_curves
+        ]
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=(0, 1)))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_curves: list | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _read_dofs(self):
+        """Read coil / support DOFs live from the simsopt graph."""
+        base_curves_dofs = [
+            jnp.asarray(c.get_dofs())
+            for c in self._coil_support.base_curves
+        ]
+        return base_curves_dofs, self._coil_support.support_dofs
+
+    def _csr_curve(self, sdofs):
+        """Rebuild the live CSR curve from ``sdofs['csr_curve_dofs']``."""
+        tmpl = self._tmpl
+        return CurveRZFourierJAX(
+            tmpl.quadpoints, sdofs['csr_curve_dofs'],
+            tmpl.order, tmpl.nfp, tmpl.stellsym,
+        )
+
+    def _curves_jax(self, cdofs):
+        """Rebuild traced coil curves from live DOFs."""
+        return [
+            CurveXYZFourierJAX(ref.quadpoints, d, ref.order)
+            for ref, d in zip(self._base_curves_jax, cdofs)
+        ]
+
+    def _J_pure(self, cdofs, sdofs):
+        """CSR–coil centreline hinge penalty (traced scalar)."""
+        csr = self._csr_curve(sdofs)
+        curves = self._curves_jax(cdofs)
+        return _csr_curve_distance_pure(
+            csr.gamma(), csr.gammadash(),
+            [c.gamma() for c in curves],
+            [c.gammadash() for c in curves],
+            self.minimum_distance,
+            self.downsample,
+        )
+
+    def _compute(self):
+        """Evaluate J and its gradients from the single ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        cdofs, sdofs = self._read_dofs()
+        J_val, (grad_cdofs, grad_sdofs) = self._jit_vg(cdofs, sdofs)
+        self._J_cache = float(J_val)
+        self._grad_curves = [np.asarray(g) for g in grad_cdofs]
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """CSR–coil centreline hinge penalty (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the coil and support DOFs.
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+
+        d = Derivative({})
+        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+            d = d + Derivative({curve: g})
+        return d + Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def shortest_distance(self):
+        """Smallest CSR–coil centreline point distance [m].
+
+        Returns
+        -------
+        float
+            Minimum over base coils of the sampled CSR–coil point distance.
+            If there are no base coils, returns ``inf``.
+        """
+        cdofs, sdofs = self._read_dofs()
+        g_csr = np.asarray(self._csr_curve(sdofs).gamma())[::self.downsample]
+        best = np.inf
+        for curve in self._curves_jax(cdofs):
+            g_c = np.asarray(curve.gamma())[::self.downsample]
+            dists = np.linalg.norm(
+                g_csr[:, None, :] - g_c[None, :, :], axis=-1,
+            )
+            best = min(best, float(np.min(dists)))
+        return best
+
+
+class CSRSurfaceDistance(Optimizable):
+    r"""Penalise a CSR centreline that comes closer than ``minimum_distance``
+    to a surface.
+
+    The hinge matches :class:`simsopt.geo.CurveSurfaceDistance`, but the
+    CSR is sampled only on the first field period, or the first half
+    period when the CSR is stellarator-symmetric.
+
+    .. math::
+        J = \bigl\langle
+            \|\gamma'_{\mathrm{csr}}(\varphi_i)\|\,\|\mathbf{n}_s(j)\|
+            \max\bigl(0,\, d_{\min} - \|\gamma_{\mathrm{csr}}(\varphi_i)
+            - s_j\|\bigr)^2
+        \bigr\rangle_{i,j}
+
+    Parameters
+    ----------
+    coil_support : CoilSupportBeamsCSR
+        Provides the CSR curve DOFs.
+    surface : simsopt.geo.Surface
+        Target surface.  It is *not* a DOF parent.
+    minimum_distance : float
+        Desired minimum CSR–surface clearance [m].
+    """
+
+    def __init__(self, coil_support, surface, minimum_distance: float):
+        if not _HAS_SIMSOPT:
+            raise ImportError("simsopt is required for CSRSurfaceDistance.")
+
+        support = coil_support.support
+        if not isinstance(support, SupportBeamsCSR):
+            raise TypeError(
+                "CSRSurfaceDistance requires coil_support.support to be a "
+                f"SupportBeamsCSR; got {type(support).__name__}."
+            )
+        minimum_distance = float(minimum_distance)
+        if minimum_distance < 0.0:
+            raise ValueError(
+                f"minimum_distance must be >= 0; got {minimum_distance}."
+            )
+
+        self._coil_support = coil_support
+        self._support = support
+        self._tmpl = support._csr_curve_template
+        self.surface = surface
+        self.minimum_distance = minimum_distance
+
+        phi_max = 1.0 / float(self._tmpl.nfp) / (
+            2.0 if self._tmpl.stellsym else 1.0
+        )
+        qp = np.asarray(self._tmpl.quadpoints)
+        self._qp_sector = jnp.asarray(qp[qp < phi_max])
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=0))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _csr_curve(self, sdofs):
+        """Rebuild the live CSR curve from ``sdofs['csr_curve_dofs']``."""
+        tmpl = self._tmpl
+        return CurveRZFourierJAX(
+            tmpl.quadpoints, sdofs['csr_curve_dofs'],
+            tmpl.order, tmpl.nfp, tmpl.stellsym,
+        )
+
+    def _surface_arrays(self):
+        """Surface quadrature points and unnormalised normals, both ``(M, 3)``."""
+        return (
+            jnp.asarray(self.surface.gamma().reshape((-1, 3))),
+            jnp.asarray(self.surface.normal().reshape((-1, 3))),
+        )
+
+    def _J_pure(self, sdofs, gammas, ns):
+        """CSR–surface hinge penalty on the fundamental-domain samples."""
+        csr = self._csr_curve(sdofs)
+        qp = self._qp_sector
+        gammac = csr.gamma_eval(qp)
+        lc = csr.gamma_eval(qp, 1)
+        dists = jnp.sqrt(jnp.sum(
+            (gammac[:, None, :] - gammas[None, :, :]) ** 2, axis=2,
+        ))
+        integralweight = (
+            jnp.linalg.norm(lc, axis=1)[:, None]
+            * jnp.linalg.norm(ns, axis=1)[None, :]
+        )
+        return jnp.mean(
+            integralweight
+            * jnp.maximum(self.minimum_distance - dists, 0) ** 2
+        )
+
+    def _compute(self):
+        """Evaluate J and its support gradient from ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        sdofs = self._coil_support.support_dofs
+        gammas, ns = self._surface_arrays()
+        J_val, grad_sdofs = self._jit_vg(sdofs, gammas, ns)
+        self._J_cache = float(J_val)
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """CSR–surface hinge penalty (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the support DOFs."""
+        self._compute()
+        return Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def shortest_distance(self):
+        """Smallest sampled CSR–surface point distance [m]."""
+        sdofs = self._coil_support.support_dofs
+        g_csr = np.asarray(self._csr_curve(sdofs).gamma_eval(self._qp_sector))
+        gammas = np.asarray(self.surface.gamma().reshape((-1, 3)))
+        return float(np.min(np.linalg.norm(
+            g_csr[:, None, :] - gammas[None, :, :], axis=-1,
+        )))
+
+
+# ============================================================================
+# Inboard attachment hinge
+# ============================================================================
+
+
+def _inboard_hinge_pure(curves_jax, phis_per_coil):
+    r"""Sum of ``max(r - r_center, 0)^2`` over coils and attachment angles.
+
+    Parameters
+    ----------
+    curves_jax : sequence of CurveXYZFourierJAX
+        One curve per base coil.
+    phis_per_coil : sequence of jax.Array
+        Attachment angles per coil; entry ``i`` has shape ``(n_attach,)``.
+
+    Returns
+    -------
+    jax.Array, shape ()
+        Scalar hinge value.
+    """
+    J = jnp.array(0.0)
+    for curve, phis in zip(curves_jax, phis_per_coil):
+        c = curve.curve_center()
+        r_center = jnp.sqrt(c[0] ** 2 + c[1] ** 2)
+        x = curve.gamma_eval(phis)
+        r = jnp.sqrt(x[:, 0] ** 2 + x[:, 1] ** 2)
+        J = J + jnp.sum(jnp.maximum(r - r_center, 0.0) ** 2)
+    return J
+
+
+class _InboardPenalty(Optimizable):
+    r"""Shared hinge for attachment angles that sit outboard of a coil centre.
+
+    For each base coil :math:`i` with centre radius
+    :math:`r_{\mathrm{center},i} = \sqrt{x_{c0}^2 + y_{c0}^2}` and
+    attachment angles ``phis_i``,
+
+    .. math::
+        J = \sum_i \sum_j
+            \max\bigl(r_{ij} - r_{\mathrm{center},i},\, 0\bigr)^2,
+
+    where :math:`r_{ij} = \sqrt{x_{ij}^2 + y_{ij}^2}` at
+    ``gamma_eval(phis_i[j])``.
+
+    Subclasses set ``_dof_key`` to the ``support_dofs`` key that holds the
+    rectangular ``(n_coils, n_attach)`` angle array.
+
+    Parameters
+    ----------
+    coil_support : CoilSupport
+        Provides the base curves and the attachment-angle DOFs.
+    """
+
+    _dof_key: str = ''
+    _what: str = 'attachment angles'
+
+    def __init__(self, coil_support):
+        if not _HAS_SIMSOPT:
+            raise ImportError(
+                f"simsopt is required for {type(self).__name__}."
+            )
+
+        sdofs = coil_support.support_dofs
+        key = self._dof_key
+        if key not in sdofs:
+            raise TypeError(
+                f"{type(self).__name__} requires support_dofs[{key!r}] "
+                f"({self._what}); got keys {sorted(sdofs)}."
+            )
+        phis = sdofs[key]
+        if np.ndim(phis) != 2 or int(np.shape(phis)[0]) != coil_support.n_coils:
+            raise ValueError(
+                f"support_dofs[{key!r}] must have shape "
+                f"(n_coils={coil_support.n_coils}, n_attach); "
+                f"got {np.shape(phis)}."
+            )
+
+        self._coil_support = coil_support
+        self._base_curves_jax = [
+            CurveXYZFourierJAX.from_simsopt(c)
+            for c in coil_support.base_curves
+        ]
+
+        self._jit_vg = jax.jit(value_and_grad(self._J_pure, argnums=(0, 1)))
+
+        self._needs_update: bool = True
+        self._J_cache: float | None = None
+        self._grad_curves: list | None = None
+        self._grad_support: dict | None = None
+
+        Optimizable.__init__(self, depends_on=[coil_support])
+
+    def recompute_bell(self, child=None, parent=None):
+        """Invalidate cached J / dJ when any ancestor DOFs change."""
+        self._needs_update = True
+
+    def _read_dofs(self):
+        """Read coil / support DOFs live from the simsopt graph."""
+        base_curves_dofs = [
+            jnp.asarray(c.get_dofs())
+            for c in self._coil_support.base_curves
+        ]
+        return base_curves_dofs, self._coil_support.support_dofs
+
+    def _curves_jax(self, cdofs):
+        """Rebuild traced curve pytrees from live DOFs."""
+        return [
+            CurveXYZFourierJAX(ref.quadpoints, d, ref.order)
+            for ref, d in zip(self._base_curves_jax, cdofs)
+        ]
+
+    def _J_pure(self, cdofs, sdofs):
+        """Outboard-attachment hinge (traced scalar)."""
+        return _inboard_hinge_pure(
+            self._curves_jax(cdofs), list(sdofs[self._dof_key]),
+        )
+
+    def _compute(self):
+        """Evaluate J and its gradients from the single ``value_and_grad``."""
+        if not self._needs_update:
+            return
+        cdofs, sdofs = self._read_dofs()
+        J_val, (grad_cdofs, grad_sdofs) = self._jit_vg(cdofs, sdofs)
+        self._J_cache = float(J_val)
+        self._grad_curves = [np.asarray(g) for g in grad_cdofs]
+        self._grad_support = grad_sdofs
+        self._needs_update = False
+
+    def J(self):
+        """Outboard-attachment hinge (scalar)."""
+        self._compute()
+        return self._J_cache
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of J w.r.t. the coil and support DOFs.
+
+        Returns a :class:`~simsopt._core.derivative.Derivative` object.
+        ``@derivative_dec`` contracts it into a flat numpy array aligned with
+        ``self.x`` before returning to the caller.
+        """
+        self._compute()
+
+        d = Derivative({})
+        for curve, g in zip(self._coil_support.base_curves, self._grad_curves):
+            d = d + Derivative({curve: g})
+        return d + Derivative({
+            self._coil_support:
+                self._coil_support.flatten_grad(self._grad_support)
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+    def max_overhang(self):
+        """Largest ``r - r_center`` over attachments [m].
+
+        Returns
+        -------
+        float
+            Positive when at least one attachment is outboard of its coil
+            centre; non-positive when every attachment is inboard or on the
+            centre radius.
+        """
+        cdofs, sdofs = self._read_dofs()
+        curves = self._curves_jax(cdofs)
+        phis_per_coil = list(sdofs[self._dof_key])
+        best = -jnp.inf
+        for curve, phis in zip(curves, phis_per_coil):
+            c = curve.curve_center()
+            r_center = jnp.sqrt(c[0] ** 2 + c[1] ** 2)
+            x = curve.gamma_eval(phis)
+            r = jnp.sqrt(x[:, 0] ** 2 + x[:, 1] ** 2)
+            best = jnp.maximum(best, jnp.max(r - r_center))
+        return float(best)
+
+
+class ClampInboard(_InboardPenalty):
+    r"""Penalise fixed clamps that sit radially outboard of a coil centre.
+
+    Reads ``support_dofs['phis']`` of shape ``(n_coils, n_clamp)``.
+
+    Parameters
+    ----------
+    coil_support : CoilSupport
+        Must expose fixed-clamp angles under ``support_dofs['phis']``
+        (e.g. :class:`~coil_fem.simsopt.CoilSupportFixed`).
+
+    Examples
+    --------
+    >>> Jclamp = ClampInboard(coil_support)  # doctest: +SKIP
+    >>> Jclamp.max_overhang()  # doctest: +SKIP
+    0.12...
+    """
+
+    _dof_key = 'phis'
+    _what = 'fixed-clamp angles'
+
+
+class CRBeamInboard(_InboardPenalty):
+    r"""Penalise CR beam starts that sit radially outboard of a coil centre.
+
+    Reads ``support_dofs['phis_start_cr']`` of shape
+    ``(n_base, n_beam_cr)``.
+
+    Parameters
+    ----------
+    coil_support : CoilSupportBeamsCSR
+        Must expose CR start angles under ``support_dofs['phis_start_cr']``.
+
+    Examples
+    --------
+    >>> Jcr = CRBeamInboard(coil_support)  # doctest: +SKIP
+    >>> Jcr.max_overhang()  # doctest: +SKIP
+    0.08...
+    """
+
+    _dof_key = 'phis_start_cr'
+    _what = 'CR beam start angles'

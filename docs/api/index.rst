@@ -22,3 +22,4 @@ being defined in each package's ``__init__.py``.
    problems
    simsopt
    solvers.cudss
+   io.gmsh

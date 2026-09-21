@@ -5,8 +5,8 @@ pure-functional :class:`~coil_fem.coupling.Support` instance.  Optimisable
 parameters live in the simsopt DOF store; :attr:`CoilSupport.support_dofs`
 reconstructs them from ``local_full_x``.
 
-Also provides shared helpers used by Fixed/Beams subclasses (angle broadcast,
-``k_clamp`` defaults, and incremental ``dphis*`` encode/decode).
+Also provides shared clamp-construction helpers used by Fixed/Beams
+subclasses (angle broadcast and ``k_clamp`` defaults).
 """
 
 from __future__ import annotations
@@ -24,93 +24,6 @@ from ..utils import estimate_k
 from ..coupling import Support
 
 
-
-# ============================================================================
-# Sorted (incremental) angle DOFs: dphis* ↔ phis*
-# ============================================================================
-
-_DPHI_TO_PHI = {
-    'dphis': 'phis',
-    'dphis_start_cc': 'phis_start_cc',
-    'dphis_end_cc': 'phis_end_cc',
-    'dphis_start_cf': 'phis_start_cf',
-}
-_PHI_TO_DPHI = {v: k for k, v in _DPHI_TO_PHI.items()}
-_ANGLE_UNIT_KEYS = frozenset(_DPHI_TO_PHI) | frozenset(_PHI_TO_DPHI)
-
-
-def _diff_last(x):
-    """Encode absolute angles as non-negative increments along the last axis."""
-    return jnp.diff(x, axis=-1, prepend=jnp.zeros_like(x[..., :1]))
-
-
-def _cumsum_last(x):
-    """Decode increments to absolute angles along the last axis."""
-    return jnp.cumsum(x, axis=-1)
-
-
-def _cumsum_last_vjp(g):
-    """VJP of :func:`_cumsum_last`: ``g_d[..., j] = sum_{k>=j} g_phi[..., k]``."""
-    return jnp.cumsum(g[..., ::-1], axis=-1)[..., ::-1]
-
-
-def _tree_diff_last(tree):
-    return tree_map(_diff_last, tree)
-
-
-def _tree_cumsum_last(tree):
-    return tree_map(_cumsum_last, tree)
-
-
-def _tree_cumsum_last_vjp(g_tree):
-    return tree_map(_cumsum_last_vjp, g_tree)
-
-
-def _encode_dphis(phi_dofs: dict) -> dict:
-    """Functional ``phis*`` pytree → stored ``dphis*`` pytree (diff + rename)."""
-    out = {}
-    for k, v in phi_dofs.items():
-        if k in _PHI_TO_DPHI:
-            out[_PHI_TO_DPHI[k]] = _tree_diff_last(v)
-        else:
-            out[k] = v
-    return out
-
-
-def _decode_dphis(raw_dofs: dict) -> dict:
-    """Stored ``dphis*`` pytree → functional ``phis*`` pytree (cumsum + rename)."""
-    out = {}
-    for k, v in raw_dofs.items():
-        if k in _DPHI_TO_PHI:
-            out[_DPHI_TO_PHI[k]] = _tree_cumsum_last(v)
-        else:
-            out[k] = v
-    return out
-
-
-def _vjp_dphis(grad_phi_dofs: dict) -> dict:
-    """Grad w.r.t. ``phis*`` → grad w.r.t. ``dphis*`` (cumsum VJP + rename)."""
-    out = {}
-    for k, v in grad_phi_dofs.items():
-        if k in _PHI_TO_DPHI:
-            out[_PHI_TO_DPHI[k]] = _tree_cumsum_last_vjp(v)
-        else:
-            out[k] = v
-    return out
-
-
-class _SortedDphisMixin:
-    """Decode stored ``dphis*`` for the FEM; pull grads back in ``flatten_grad``."""
-
-    @property
-    def support_dofs(self) -> dict:
-        return _decode_dphis(self._unravel(jnp.asarray(self.local_full_x)))
-
-    def flatten_grad(self, grad_dofs: dict) -> np.ndarray:
-        return np.asarray(ravel_pytree(_vjp_dphis(grad_dofs))[0], dtype=float)
-
-
-# ============================================================================
 def _generate_k_clamp(base_coils, fixed_clamp_options):
     """ Defaults for the fixed clamp's Robin/Winkler spring coefficients.
     
@@ -149,6 +62,17 @@ def _generate_k_clamp(base_coils, fixed_clamp_options):
             f"the auto-generated value is      {k_clamp:.4e} N/m3."
         )
         return k_clamp
+
+
+def _broadcast_phis(phis, n_coils, n_clamp):
+    if phis is None:
+        row = jnp.linspace(0.0, 1.0, n_clamp, endpoint=False)
+        phis_arr = jnp.broadcast_to(row, (n_coils, n_clamp))
+    else:
+        phis_arr = jnp.asarray(phis, dtype=float)
+        if phis_arr.ndim == 1:
+            phis_arr = jnp.broadcast_to(phis_arr, (n_coils, n_clamp))
+    return phis_arr
 
 
 try:
@@ -368,16 +292,5 @@ class CoilSupport(Optimizable):
         lb, _ = ravel_pytree(lb_tree)
         ub, _ = ravel_pytree(ub_tree)
         return np.asarray(lb, dtype=float), np.asarray(ub, dtype=float)
-
-
-def _broadcast_phis(phis, n_coils, n_clamp):
-    if phis is None:
-        row = jnp.linspace(0.0, 1.0, n_clamp, endpoint=False)
-        phis_arr = jnp.broadcast_to(row, (n_coils, n_clamp))
-    else:
-        phis_arr = jnp.asarray(phis, dtype=float)
-        if phis_arr.ndim == 1:
-            phis_arr = jnp.broadcast_to(phis_arr, (n_coils, n_clamp))
-    return phis_arr
 
 

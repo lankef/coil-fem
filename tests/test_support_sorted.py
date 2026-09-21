@@ -6,20 +6,23 @@ import numpy as np
 import pytest
 from jax.flatten_util import ravel_pytree
 
-from coil_fem.simsopt.coil_support import (
-    CoilSupport,
+from coil_fem.simsopt.coil_support import CoilSupport
+from coil_fem.simsopt.sorted_dphis import (
     _SortedDphisMixin,
     _cumsum_last_vjp,
     _decode_dphis,
-    _encode_dphis,
-    _vjp_dphis,
-)
-from coil_fem.simsopt.coil_support_beams import (
     _decode_end_cc,
+    _decode_end_cr,
+    _encode_dphis,
     _encode_end_cc,
-    _uniform_list,
+    _encode_end_cr,
+    _fold_into_interval,
+    _sector_width,
+    _vjp_dphis,
     _vjp_end_cc,
+    _vjp_end_cr,
 )
+from coil_fem.simsopt.coil_support_beams import _uniform_list
 
 
 def _make_names(tree):
@@ -363,3 +366,285 @@ def test_sorted_wrap_end_flatten_grad_fd():
     g_full['phis_end_cc'] = [2.0 * p for p in pe]
     g_flat = cs.flatten_grad(g_full)
     assert abs(fd - g_flat[idx]) < 1e-4, (fd, g_flat[idx], names[idx])
+
+
+def _csr_beam_options(n_beam_cc=2, n_beam_cf=0, n_beam_cr=2):
+    return {
+        'n_beam_cc': n_beam_cc,
+        'n_beam_cf': n_beam_cf,
+        'n_beam_cr': n_beam_cr,
+        'E': 200e9,
+        'nu': 0.3,
+        'cross_section_type': 'solid_circle',
+        'attachment_type': 'direct',
+    }
+
+
+def _csr_options(nfp=2, order=1, n_phi=4):
+    return {
+        'order': order,
+        'w1': 0.08,
+        'w2': 0.08,
+        'n_phi': n_phi,
+        'n_grid_1': 1,
+        'n_grid_2': 1,
+        'E': 200e9,
+        'nu': 0.3,
+    }
+
+
+def test_csr_sorted_defaults_inside_box_bounds():
+    """CoilSupportBeamsCSRSorted defaults must satisfy dphis box bounds."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import create_equally_spaced_curves
+    from coil_fem.simsopt import CoilSupportBeamsCSRSorted
+
+    n_base, nfp = 2, 2
+    curves = create_equally_spaced_curves(
+        n_base, nfp, stellsym=True, R0=1.0, R1=0.5, order=2, numquadpoints=16,
+    )
+    cs = CoilSupportBeamsCSRSorted(
+        base_coils=[Coil(c, Current(1e5)) for c in curves],
+        nfp=nfp,
+        stellsym=True,
+        beam_options=_csr_beam_options(n_beam_cc=4, n_beam_cr=2),
+        csr_options=_csr_options(nfp=nfp),
+        problem_options={'solver': 'umfpack'},
+        r_beam=0.05,
+    )
+    x = np.asarray(cs.local_x)
+    lb, ub = cs.local_bounds
+    assert np.all(x >= np.asarray(lb) - 1e-14)
+    assert np.all(x <= np.asarray(ub) + 1e-14)
+
+    sd = cs.support_dofs
+    assert 'phis_start_cr' in sd and 'phis_end_cr' in sd
+    ps = np.asarray(sd['phis_start_cr'])
+    pe = np.asarray(sd['phis_end_cr'])
+    # Start: first beam of each coil may be negative after fold; later beams >= 0.
+    if ps.size:
+        assert np.all((-0.5 - 1e-14 <= ps[:, 0]) & (ps[:, 0] <= 0.5 + 1e-14))
+    if ps.shape[1] > 1:
+        assert np.all(np.diff(ps, axis=1) >= -1e-15)
+    # End: coil 0 (all beams) in the first-increment box; later coils ascend.
+    s = 1.0 / nfp / 2.0
+    if pe.size:
+        assert np.all((-0.5 * s - 1e-14 <= pe[0]) & (pe[0] <= 0.5 * s + 1e-14))
+    if pe.shape[0] > 1:
+        assert np.all(np.diff(pe, axis=0) >= -1e-15)
+
+
+def test_csr_default_phis_end_cr_at_coil_center():
+    """Default phis_end_cr is each coil's cylindrical angle, cumsummed over coils."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import create_equally_spaced_curves
+    from coil_fem.geo import CurveXYZFourierJAX
+    from coil_fem.simsopt import CoilSupportBeamsCSRSorted
+    from coil_fem.simsopt.sorted_dphis import _encode_dphis
+
+    n_base, nfp, n_cr = 2, 2, 2
+    curves = create_equally_spaced_curves(
+        n_base, nfp, stellsym=False, R0=1.0, R1=0.5, order=2, numquadpoints=16,
+    )
+    base_coils = [Coil(c, Current(1e5)) for c in curves]
+    expected = []
+    for coil in base_coils:
+        c = CurveXYZFourierJAX.from_simsopt(coil.curve).curve_center()
+        phi_i = float((np.arctan2(c[1], c[0]) / (2.0 * np.pi)) % 1.0)
+        expected.append(np.full((n_cr,), phi_i))
+    expected = np.stack(expected, axis=0)
+
+    # Sorted constructs via base CoilSupportBeamsCSR defaults, then encodes.
+    cs = CoilSupportBeamsCSRSorted(
+        base_coils=base_coils,
+        nfp=nfp,
+        stellsym=False,
+        beam_options=_csr_beam_options(n_beam_cc=0, n_beam_cr=n_cr),
+        csr_options=_csr_options(nfp=nfp),
+        problem_options={'solver': 'umfpack'},
+        r_beam=0.05,
+    )
+    s = _sector_width(nfp, False)
+    sd = cs.support_dofs
+    pe = np.asarray(sd['phis_end_cr'])
+    folded0 = float(_fold_into_interval(expected[0, 0], -0.5 * s, 0.5 * s))
+    expected_phi = folded0 + (expected - expected[0])
+    np.testing.assert_allclose(pe, expected_phi, atol=1e-12)
+
+    encoded = _encode_dphis({'phis_end_cr': sd['phis_end_cr']})
+    d = np.asarray(encoded['dphis_end_cr'])
+    expected_d = np.diff(
+        expected_phi, axis=0, prepend=np.zeros_like(expected_phi[:1]),
+    )
+    np.testing.assert_allclose(d, expected_d, atol=1e-12)
+
+
+def test_csr_default_phis_start_cr_inboard_midplane_window():
+    """phis_start_cr in the default inboard-midplane window."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import create_equally_spaced_curves
+    from coil_fem.simsopt import CoilSupportBeamsCSRSorted
+    from coil_fem.simsopt.coil_support_beams import _inboard_midplane_phi
+    from coil_fem.simsopt.sorted_dphis import _encode_dphis
+
+    n_base, nfp, n_cr = 1, 2, 3
+    curves = create_equally_spaced_curves(
+        n_base, nfp, stellsym=False, R0=1.0, R1=0.5, order=2, numquadpoints=32,
+    )
+    base_coils = [Coil(c, Current(1e5)) for c in curves]
+    from coil_fem.geo import CurveXYZFourierJAX
+    curve = CurveXYZFourierJAX.from_simsopt(base_coils[0].curve)
+    phi0 = float(_inboard_midplane_phi(curve))
+
+    cs = CoilSupportBeamsCSRSorted(
+        base_coils=base_coils,
+        nfp=nfp,
+        stellsym=False,
+        beam_options=_csr_beam_options(n_beam_cc=0, n_beam_cr=n_cr),
+        csr_options=_csr_options(nfp=nfp),
+        problem_options={'solver': 'umfpack'},
+        r_beam=0.05,
+    )
+    sd = cs.support_dofs
+    ps = np.asarray(sd['phis_start_cr'][0])
+    assert ps.shape == (n_cr,)
+    # Circular distance to phi0 ≤ half-width (+ tiny tol).
+    half = 0.125
+    dcirc = np.minimum(np.abs(ps - phi0) % 1.0, 1.0 - (np.abs(ps - phi0) % 1.0))
+    assert np.all(dcirc <= half + 1e-9), (ps, phi0, dcirc)
+
+    # Remaining increments stay non-negative; first may be folded into [-0.5, 0.5].
+    assert np.all(np.diff(ps) >= -1e-15)
+    encoded = _encode_dphis({'phis_start_cr': sd['phis_start_cr']})
+    dphis = np.asarray(encoded['dphis_start_cr'][0])
+    assert -0.5 - 1e-14 <= dphis[0] <= 0.5 + 1e-14
+    assert np.all(dphis[1:] >= -1e-15)
+    np.testing.assert_allclose(np.cumsum(dphis), ps, atol=1e-12)
+
+
+def test_csr_default_phis_start_cr_phase_shifted_differs_from_min_R():
+    """CR window centres on midplane-inboard, not argmin R, for a tilted circle."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import CurveXYZFourier
+    from coil_fem.geo import CurveXYZFourierJAX
+    from coil_fem.simsopt import CoilSupportBeamsCSR
+    from coil_fem.simsopt.coil_support_beams import _inboard_midplane_phi
+
+    R0, R1, delta = 1.0, 0.5, np.pi / 4
+    qp = np.linspace(0.0, 1.0, 64, endpoint=False)
+    c = CurveXYZFourier(qp, 1)
+    dofs = np.zeros(9)
+    dofs[0] = R0
+    dofs[2] = R1
+    dofs[7] = R1 * np.cos(delta)
+    dofs[8] = R1 * np.sin(delta)
+    c.set_dofs(dofs)
+    base_coils = [Coil(c, Current(1e5))]
+
+    curve = CurveXYZFourierJAX.from_simsopt(base_coils[0].curve)
+    gamma = np.asarray(curve.gamma())
+    r = np.hypot(gamma[:, 0], gamma[:, 1])
+    phi_min_R = float(np.asarray(curve.quadpoints)[np.argmin(r)] % 1.0)
+    phi_mid = float(_inboard_midplane_phi(curve))
+    assert abs(phi_mid - phi_min_R) > 1e-3
+
+    cs = CoilSupportBeamsCSR(
+        base_coils=base_coils,
+        nfp=2,
+        stellsym=False,
+        beam_options=_csr_beam_options(n_beam_cc=0, n_beam_cr=1),
+        csr_options=_csr_options(nfp=2),
+        problem_options={'solver': 'umfpack'},
+        r_beam=0.05,
+    )
+    ps = float(np.asarray(cs.support_dofs['phis_start_cr'][0, 0]))
+    np.testing.assert_allclose(ps, phi_mid, atol=1e-10)
+    assert abs(ps - phi_min_R) > 1e-3
+
+
+def test_csr_sorted_dphis_cr_flatten_grad_fd():
+    """flatten_grad VJP matches FD on dphis_start_cr / dphis_end_cr DOFs."""
+    pytest.importorskip("simsopt")
+    from simsopt.field import Coil, Current
+    from simsopt.geo import create_equally_spaced_curves
+    from coil_fem.simsopt import CoilSupportBeamsCSRSorted
+
+    n_base, nfp = 1, 2
+    curves = create_equally_spaced_curves(
+        n_base, nfp, stellsym=False, R0=1.0, R1=0.5, order=2, numquadpoints=16,
+    )
+    cs = CoilSupportBeamsCSRSorted(
+        base_coils=[Coil(c, Current(1e5)) for c in curves],
+        nfp=nfp,
+        stellsym=False,
+        beam_options=_csr_beam_options(n_beam_cc=0, n_beam_cr=3),
+        csr_options=_csr_options(nfp=nfp),
+        problem_options={'solver': 'umfpack'},
+        r_beam=0.05,
+    )
+
+    flat0 = np.asarray(cs.local_full_x, dtype=float).copy()
+    names = list(cs.local_full_dof_names)
+
+    def _find(target):
+        matches = [
+            i for i, n in enumerate(names)
+            if n.endswith(':' + target) or n == target or target in n
+        ]
+        assert matches, (target, names)
+        return matches[0]
+
+    idx_start = _find('dphis_start_cr(0,0)')
+    idx_end = _find('dphis_end_cr(0,0)')
+
+    def J_from_full(x_full):
+        cs.local_full_x = np.asarray(x_full, dtype=float)
+        sd = cs.support_dofs
+        return float(
+            jnp.sum(sd['phis_start_cr'] ** 2)
+            + jnp.sum(sd['phis_end_cr'] ** 2)
+        )
+
+    j0 = J_from_full(flat0)
+    eps = 1e-6
+
+    sd = cs.support_dofs
+    g_full = {k: jax.tree_util.tree_map(jnp.zeros_like, v) for k, v in sd.items()}
+    g_full['phis_start_cr'] = 2.0 * sd['phis_start_cr']
+    g_full['phis_end_cr'] = 2.0 * sd['phis_end_cr']
+    g_flat = cs.flatten_grad(g_full)
+
+    for idx in (idx_start, idx_end):
+        e = np.zeros_like(flat0)
+        e[idx] = eps
+        j1 = J_from_full(flat0 + e)
+        fd = (j1 - j0) / eps
+        cs.local_full_x = flat0
+        assert abs(fd - g_flat[idx]) < 1e-4, (fd, g_flat[idx], names[idx])
+
+
+def test_encode_decode_end_cr_roundtrip():
+    """Cross-coil CR-end codec inverts on a (n_coil, n_beam) array."""
+    phi = jnp.array([[0.01, 0.02], [0.04, 0.06], [0.09, 0.11]])
+    d = _encode_end_cr(phi)
+    np.testing.assert_allclose(d[0], phi[0])
+    np.testing.assert_allclose(d[1], phi[1] - phi[0])
+    np.testing.assert_allclose(d[2], phi[2] - phi[1])
+    np.testing.assert_allclose(_decode_end_cr(d), phi, atol=1e-12)
+
+
+def test_vjp_end_cr_matches_decode():
+    """Analytic VJP of coil-axis decode matches reverse-mode AD."""
+    d = jnp.array([[0.1, 0.2], [0.05, 0.1], [0.02, 0.03]])
+
+    def J(d_arr):
+        return jnp.sum(_decode_end_cr(d_arr) ** 2)
+
+    g_ad = jax.grad(J)(d)
+    phi = _decode_end_cr(d)
+    g_manual = _vjp_end_cr(2.0 * phi)
+    np.testing.assert_allclose(g_manual, g_ad, atol=1e-12)
