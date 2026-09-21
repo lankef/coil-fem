@@ -37,10 +37,10 @@ def _make_coilfem() -> CoilFEM:
     )
 
 
-def test_save_run_vtu_writes_files(tmp_path):
-    """save_run_vtu should run end-to-end and write one VTU per coil."""
+def test_to_vtu_run_writes_files(tmp_path):
+    """to_vtu(run=True) should run end-to-end and write one merged coils VTU."""
     fem = _make_coilfem()
-    written = fem.save_run_vtu(str(tmp_path))
+    written = fem.to_vtu(str(tmp_path))
     assert len(written) == 1
     for path in written:
         assert (tmp_path / path.split('/')[-1]).exists()
@@ -49,9 +49,30 @@ def test_save_run_vtu_writes_files(tmp_path):
     for key in ('w_clamp', 'w_attach', 'k_clamp_Npm3', 'k_attach_Npm3'):
         assert key in mesh.point_data, f"missing VTU point field {key!r}"
 
+    # Merged conductor mesh carries an owner_coil cell label (all 0 here).
+    assert 'owner_coil' in mesh.cell_data, "missing owner_coil cell field"
+    assert np.all(mesh.cell_data['owner_coil'][0] == 0)
+
+
+def test_to_vtu_no_run_writes_support_only(tmp_path):
+    """to_vtu(run=False) writes {prefix}_coils.vtu with weights, no solve fields."""
+    fem = _make_coilfem()
+    written = fem.to_vtu(str(tmp_path), run=False)
+    assert len(written) == 1
+    coils_path = written[0]
+    assert coils_path.endswith('_coils.vtu')
+
+    mesh = meshio.read(tmp_path / coils_path.split('/')[-1])
+    for key in ('w_clamp', 'w_attach', 'k_clamp_Npm3', 'k_attach_Npm3'):
+        assert key in mesh.point_data, f"missing VTU point field {key!r}"
+    assert 'owner_coil' in mesh.cell_data
+    # No forward solve => no deformed-state fields.
+    assert 'displacement_m' not in mesh.point_data
+    assert 'von_mises_MPa' not in mesh.cell_data
+
 
 # ============================================================================
-# save_run_vtu beam-displacement file (SupportBeams only)
+# to_vtu beam-displacement file (SupportBeams only)
 # ============================================================================
 
 def _section_fn(sdofs):
@@ -110,15 +131,15 @@ def _make_coilfem_with_beams() -> tuple[CoilFEM, CurveXYZFourierJAX, dict]:
     return fem, curve, sdofs
 
 
-def test_save_run_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
-    """save_run_vtu writes {prefix}_beams.vtu with per-point displacement_m.
+def test_to_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
+    """to_vtu writes {prefix}_beams.vtu with per-point displacement_m.
 
     ``SupportBeams`` is coupled and ``solve_staggered`` is retired (GPU-only
     ``solve_monolithic`` remains), so a real coupled forward solve isn't
     available on this backend. ``CoilFEM.run`` is monkeypatched to return a
     shape-correct but otherwise arbitrary result (zero mesh fields, a fixed
     nonzero ``u_s``) so this test exercises only the VTU-writing logic added
-    to ``save_run_vtu`` -- ``SupportBeams.beam_displacement`` itself is
+    to ``to_vtu`` -- ``SupportBeams.beam_displacement`` itself is
     covered directly in ``tests/test_beam_networks.py``.
     """
     fem, curve, sdofs = _make_coilfem_with_beams()
@@ -144,7 +165,7 @@ def test_save_run_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(fem, 'run', lambda **kwargs: fake_result)
 
-    written = fem.save_run_vtu(str(tmp_path), base_support_dofs=sdofs, n_sub=n_sub)
+    written = fem.to_vtu(str(tmp_path), base_support_dofs=sdofs, n_sub=n_sub)
     assert len(written) == 2
     beams_path = next(p for p in written if p.endswith('_beams.vtu'))
     assert (tmp_path / beams_path.split('/')[-1]).exists()
@@ -181,7 +202,7 @@ def test_save_run_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
 
 
 # ============================================================================
-# save_run_vtu CSR file (SupportBeamsCSR)
+# to_vtu CSR file (SupportBeamsCSR)
 # ============================================================================
 
 def _section_fn_with_cr(sdofs):
@@ -254,8 +275,8 @@ def _make_coilfem_with_csr() -> tuple[CoilFEM, CurveXYZFourierJAX, dict]:
     return fem, curve, sdofs
 
 
-def test_save_run_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
-    """save_run_vtu writes {prefix}_csr.vtu with w_attach and displacement."""
+def test_to_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
+    """to_vtu writes {prefix}_csr.vtu with w_attach and displacement."""
     fem, curve, sdofs = _make_coilfem_with_csr()
     support = fem.support
 
@@ -282,7 +303,7 @@ def test_save_run_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(fem, 'run', lambda **kwargs: fake_result)
 
-    written = fem.save_run_vtu(str(tmp_path), base_support_dofs=sdofs)
+    written = fem.to_vtu(str(tmp_path), base_support_dofs=sdofs)
     csr_path = next(p for p in written if p.endswith('_csr.vtu'))
     mesh = meshio.read(csr_path)
     for key in (
@@ -297,8 +318,8 @@ def test_save_run_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
         assert np.all(np.asarray(mesh.point_data[key])[end_nodes] == 0.0), key
 
 
-def test_save_run_vtu_writes_csr_von_mises(tmp_path, monkeypatch):
-    """save_run_vtu includes von_mises_MPa cell data on the CSR mesh."""
+def test_to_vtu_writes_csr_von_mises(tmp_path, monkeypatch):
+    """to_vtu includes von_mises_MPa cell data on the CSR mesh."""
     fem, curve, sdofs = _make_coilfem_with_csr()
     support = fem.support
 
@@ -325,7 +346,7 @@ def test_save_run_vtu_writes_csr_von_mises(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(fem, 'run', lambda **kwargs: fake_result)
 
-    written = fem.save_run_vtu(str(tmp_path), base_support_dofs=sdofs)
+    written = fem.to_vtu(str(tmp_path), base_support_dofs=sdofs)
     csr_path = next(p for p in written if p.endswith('_csr.vtu'))
     mesh = meshio.read(csr_path)
     assert 'von_mises_MPa' in mesh.cell_data
@@ -343,6 +364,6 @@ if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         fem = _make_coilfem()
-        out = fem.save_run_vtu(d)
+        out = fem.to_vtu(d)
         assert len(out) == 1, out
         print("OK:", out)

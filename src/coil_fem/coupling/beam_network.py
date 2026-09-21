@@ -1378,7 +1378,7 @@ class SupportBeams(Support):
         """Start/end positions of every base-coil beam.
 
         Plotting and VTU export live in :class:`~coil_fem.coil_fem.CoilFEM`
-        (``plot_support`` / ``save_support_vtu``), which call this method to
+        (``plot_support`` / ``to_vtu``), which call this method to
         get the beam line segments; no stellarator reflections or
         field-period rotations are added, only the base-coil beams.
 

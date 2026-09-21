@@ -379,15 +379,25 @@ class CoilFEMObjective(Optimizable):
             'strain_energy_J':    strain_energy,
         }
 
-    def save_run_vtu(self, out_dir: str = ".", *, prefix: str = "coil"):
-        """Export per-coil FEM results as VTU files at the *current* DOFs.
+    def to_vtu(self, out_dir: str = ".", *, run: bool = True,
+               prefix: str = "coil", n_sub: int = 20):
+        """Export coil / support / beam VTU files at the *current* DOFs.
+
+        Thin wrapper over :meth:`coil_fem.CoilFEM.to_vtu` that reads the
+        current simsopt DOFs.  With ``run=True`` (default) a forward FEM solve
+        is performed and the deformed-state fields are written; with
+        ``run=False`` only geometry and Winkler-support weights are exported.
 
         Parameters
         ----------
         out_dir : str
             Output directory.
+        run : bool
+            Whether to run the forward solve (default ``True``).
         prefix : str
             File-name prefix.
+        n_sub : int
+            Beam sub-segments in ``{prefix}_beams.vtu`` when ``run``.
 
         Returns
         -------
@@ -395,35 +405,14 @@ class CoilFEMObjective(Optimizable):
             Paths of all files written.
         """
         cdofs, idofs, sdofs = self._read_dofs()
-        return self.fem.save_run_vtu(
+        return self.fem.to_vtu(
             out_dir,
+            run=run,
             prefix=prefix,
             base_curves_dofs=cdofs,
             base_currents_dofs=idofs,
             base_support_dofs=sdofs,
-        )
-
-    def save_support_vtu(self, out_dir: str = ".", *, prefix: str = "coil"):
-        """Export per-coil Winkler support weights as VTU files at the *current* DOFs.
-
-        Parameters
-        ----------
-        out_dir : str
-            Output directory.
-        prefix : str
-            File-name prefix.
-
-        Returns
-        -------
-        list[str]
-            Paths of all files written.
-        """
-        cdofs, _, sdofs = self._read_dofs()
-        return self.fem.save_support_vtu(
-            out_dir,
-            prefix=prefix,
-            base_curves_dofs=cdofs,
-            base_support_dofs=sdofs,
+            n_sub=n_sub,
         )
 
     def compute_strain_tensors(self):

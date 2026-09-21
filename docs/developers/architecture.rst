@@ -11,7 +11,7 @@ fed to ``CoilFEM`` and ``Support`` are constants/shapes that are known at compil
 time, and kept static throughout an optimization. After initialization, ``CoilFEM``
 exposes functional interfaces such as :meth:`~coil_fem.CoilFEM.objective` (for
 optimisation) and :meth:`~coil_fem.CoilFEM.run` /
-:meth:`~coil_fem.CoilFEM.save_run_vtu` (for diagnostics and visualisation).
+:meth:`~coil_fem.CoilFEM.to_vtu` (for diagnostics and visualisation).
 
 The code performs integrated coil-support optimization via simsopt. 
 ``coil-fem`` provides two main simsopt classes:

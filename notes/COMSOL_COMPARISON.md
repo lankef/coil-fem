@@ -25,10 +25,11 @@ fem = CoilFEM(
     problem_options = problem_options,     # winkler_k
 )
 
-fem.save_run_vtu(out_dir="vtu_out", prefix="coil")
+fem.to_vtu(out_dir="vtu_out", prefix="coil")
 ```
 
-This writes `vtu_out/coil00_run.vtu` (one file per base coil) containing:
+This writes a single merged `vtu_out/coil_coils.vtu` containing all base coils
+(cell field `owner_coil` gives the base-coil index per cell) with:
 
 | Field | Type | Unit | Description |
 |---|---|---|---|
@@ -55,7 +56,7 @@ print("gravity  =", fem.gravity_options)   # None if not set
 ## 2. Import the mesh into COMSOL
 
 1. **File → Import → CAD / Mesh** (or *Mesh → Import*).
-2. Select `coil00_run.vtu`.  COMSOL reads VTU natively (VTK unstructured grid).
+2. Select `coil_coils.vtu`.  COMSOL reads VTU natively (VTK unstructured grid).
    - Element type: **Tet 4** (linear tetrahedra) or **Tet 10** if you built the
      mesh with `mesh_type='TET10'`.
 3. After import, COMSOL creates a geometry domain from the imported mesh.
