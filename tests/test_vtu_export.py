@@ -37,10 +37,10 @@ def _make_coilfem() -> CoilFEM:
     )
 
 
-def test_save_run_vtu_writes_files(tmp_path):
-    """save_run_vtu should run end-to-end and write one VTU per coil."""
+def test_to_vtu_run_writes_files(tmp_path):
+    """to_vtu(run=True) should run end-to-end and write one merged coils VTU."""
     fem = _make_coilfem()
-    written = fem.save_run_vtu(str(tmp_path))
+    written = fem.to_vtu(str(tmp_path))
     assert len(written) == 1
     for path in written:
         assert (tmp_path / path.split('/')[-1]).exists()
@@ -49,9 +49,30 @@ def test_save_run_vtu_writes_files(tmp_path):
     for key in ('w_clamp', 'w_attach', 'k_clamp_Npm3', 'k_attach_Npm3'):
         assert key in mesh.point_data, f"missing VTU point field {key!r}"
 
+    # Merged conductor mesh carries an owner_coil cell label (all 0 here).
+    assert 'owner_coil' in mesh.cell_data, "missing owner_coil cell field"
+    assert np.all(mesh.cell_data['owner_coil'][0] == 0)
+
+
+def test_to_vtu_no_run_writes_support_only(tmp_path):
+    """to_vtu(run=False) writes {prefix}_coils.vtu with weights, no solve fields."""
+    fem = _make_coilfem()
+    written = fem.to_vtu(str(tmp_path), run=False)
+    assert len(written) == 1
+    coils_path = written[0]
+    assert coils_path.endswith('_coils.vtu')
+
+    mesh = meshio.read(tmp_path / coils_path.split('/')[-1])
+    for key in ('w_clamp', 'w_attach', 'k_clamp_Npm3', 'k_attach_Npm3'):
+        assert key in mesh.point_data, f"missing VTU point field {key!r}"
+    assert 'owner_coil' in mesh.cell_data
+    # No forward solve => no deformed-state fields.
+    assert 'displacement_m' not in mesh.point_data
+    assert 'von_mises_MPa' not in mesh.cell_data
+
 
 # ============================================================================
-# save_run_vtu beam-displacement file (SupportBeams only)
+# to_vtu beam-displacement file (SupportBeams only)
 # ============================================================================
 
 def _section_fn(sdofs):
@@ -110,15 +131,15 @@ def _make_coilfem_with_beams() -> tuple[CoilFEM, CurveXYZFourierJAX, dict]:
     return fem, curve, sdofs
 
 
-def test_save_run_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
-    """save_run_vtu writes {prefix}_beams.vtu with per-point displacement_m.
+def test_to_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
+    """to_vtu writes {prefix}_beams.vtu with per-point displacement_m.
 
     ``SupportBeams`` is coupled and ``solve_staggered`` is retired (GPU-only
     ``solve_monolithic`` remains), so a real coupled forward solve isn't
     available on this backend. ``CoilFEM.run`` is monkeypatched to return a
     shape-correct but otherwise arbitrary result (zero mesh fields, a fixed
     nonzero ``u_s``) so this test exercises only the VTU-writing logic added
-    to ``save_run_vtu`` -- ``SupportBeams.beam_displacement`` itself is
+    to ``to_vtu`` -- ``SupportBeams.beam_displacement`` itself is
     covered directly in ``tests/test_beam_networks.py``.
     """
     fem, curve, sdofs = _make_coilfem_with_beams()
@@ -144,7 +165,7 @@ def test_save_run_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(fem, 'run', lambda **kwargs: fake_result)
 
-    written = fem.save_run_vtu(str(tmp_path), base_support_dofs=sdofs, n_sub=n_sub)
+    written = fem.to_vtu(str(tmp_path), base_support_dofs=sdofs, n_sub=n_sub)
     assert len(written) == 2
     beams_path = next(p for p in written if p.endswith('_beams.vtu'))
     assert (tmp_path / beams_path.split('/')[-1]).exists()
@@ -180,10 +201,169 @@ def test_save_run_vtu_writes_beams_displacement_file(tmp_path, monkeypatch):
     )
 
 
+# ============================================================================
+# to_vtu CSR file (SupportBeamsCSR)
+# ============================================================================
+
+def _section_fn_with_cr(sdofs):
+    """Ragged cross-section including CR beams."""
+    phi_cc = sdofs['phis_start_cc']
+    phi_cf = sdofs['phis_start_cf']
+    phi_cr = sdofs.get('phis_start_cr', [jnp.zeros(0)] * len(phi_cc))
+    A, Iy, Iz, J = [], [], [], []
+    for g in range(len(phi_cc)):
+        n_cf = phi_cf[g].shape[0] if g < len(phi_cf) else 0
+        n_cr = phi_cr[g].shape[0] if g < len(phi_cr) else 0
+        n_per = phi_cc[g].shape[0] + n_cf + n_cr
+        A.append(jnp.full((n_per,), 1e-4))
+        Iy.append(jnp.full((n_per,), 1e-8))
+        Iz.append(jnp.full((n_per,), 1e-8))
+        J.append(jnp.full((n_per,), 2e-8))
+    return A, Iy, Iz, J
+
+
+def _make_coilfem_with_csr() -> tuple[CoilFEM, CurveXYZFourierJAX, dict]:
+    """Single coil + one CR beam + CSR ring (CPU / umfpack)."""
+    from coil_fem.coupling import SupportBeamsCSR
+
+    quadpoints = jnp.linspace(0.0, 1.0, 8, endpoint=False)
+    dofs = jnp.array([0.0, 1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2])
+    curve = CurveXYZFourierJAX(quadpoints, dofs, order=1)
+
+    support = SupportBeamsCSR(
+        nfp=2,
+        stellsym=False,
+        beam_options={
+            'n_beam_cc': 0, 'n_beam_cf': 0, 'n_beam_cr': 1,
+            'E': 200e9, 'nu': 0.3, 'k_attachment': 1e8,
+        },
+        n_base=1,
+        cross_section_fn=_section_fn_with_cr,
+        attachment_fn=_uniform_clamp_fn,
+        csr_options={
+            'order': 1, 'w1': 0.08, 'w2': 0.08, 'n_phi': 4,
+            'n_grid_1': 1, 'n_grid_2': 1, 'E': 200e9, 'nu': 0.3,
+        },
+        problem_options={'solver': 'umfpack'},
+    )
+    fem = CoilFEM(
+        base_curves_jax=[curve],
+        base_currents_jax=jnp.array([1.0]),
+        nfp=2,
+        stellsym=False,
+        mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
+                      'n_grid_1': 1, 'n_grid_2': 1},
+        support=support,
+        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        problem_options={'solver': 'umfpack'},
+        coupling='staggered',
+    )
+    csr_dofs = jnp.zeros(support._csr_curve_template.dofs.shape)
+    csr_dofs = csr_dofs.at[0].set(1.0)
+    sdofs = {
+        'phis_start_cc': [jnp.zeros(0)],
+        'phis_end_cc': [jnp.zeros(0)],
+        'phis_start_cf': [jnp.zeros(0)],
+        'x_foundation': [jnp.zeros((0, 3))],
+        'thetas_orientation_cc': [jnp.zeros(0)],
+        'thetas_orientation_cf': [jnp.zeros(0)],
+        'phis_start_cr': [jnp.array([0.25])],
+        'phis_end_cr': [jnp.array([0.1])],
+        'thetas_orientation_cr': [jnp.array([0.0])],
+        'csr_curve_dofs': csr_dofs,
+    }
+    return fem, curve, sdofs
+
+
+def test_to_vtu_writes_csr_attachment_weights(tmp_path, monkeypatch):
+    """to_vtu writes {prefix}_csr.vtu with w_attach and displacement."""
+    fem, curve, sdofs = _make_coilfem_with_csr()
+    support = fem.support
+
+    pipeline = fem.pipelines[0]
+    n_quads = pipeline.problem.fes[0].num_quads
+    n_cells = pipeline.problem.num_cells
+    pts = fem.meshes[0].mesh_points_from_dofs(curve.dofs)
+    n_nodes = pts.shape[0]
+    rng = np.random.default_rng(0)
+    u_s = jnp.zeros(support.n_support_dofs)
+    u_s = u_s.at[support._csr_dof_offset:].set(
+        jnp.asarray(1e-4 * rng.normal(size=(support._n_csr_dofs,)))
+    )
+
+    fake_result = {
+        'mesh_points': [pts],
+        'displacements': [jnp.zeros((n_nodes, 3))],
+        'von_mises': [jnp.zeros((n_cells, n_quads))],
+        'f_vol': [jnp.zeros((n_cells, n_quads, 3))],
+        'B_self': [jnp.zeros((n_cells, n_quads, 3))],
+        'B_ext': [jnp.zeros((n_cells, n_quads, 3))],
+        'u_s': u_s,
+        'support_continuum': [],
+    }
+    monkeypatch.setattr(fem, 'run', lambda **kwargs: fake_result)
+
+    written = fem.to_vtu(str(tmp_path), base_support_dofs=sdofs)
+    csr_path = next(p for p in written if p.endswith('_csr.vtu'))
+    mesh = meshio.read(csr_path)
+    for key in (
+        'displacement_m',
+        'w_clamp', 'w_attach', 'k_clamp_Npm3', 'k_attach_Npm3',
+    ):
+        assert key in mesh.point_data, f"missing CSR VTU point field {key!r}"
+    assert float(np.max(mesh.point_data['w_attach'])) > 0.0
+    phi_idx = support.csr_mesh.phi_idx_per_node
+    end_nodes = (phi_idx == 0) | (phi_idx == int(phi_idx.max()))
+    for key in ('w_clamp', 'w_attach', 'k_clamp_Npm3', 'k_attach_Npm3'):
+        assert np.all(np.asarray(mesh.point_data[key])[end_nodes] == 0.0), key
+
+
+def test_to_vtu_writes_csr_von_mises(tmp_path, monkeypatch):
+    """to_vtu includes von_mises_MPa cell data on the CSR mesh."""
+    fem, curve, sdofs = _make_coilfem_with_csr()
+    support = fem.support
+
+    pipeline = fem.pipelines[0]
+    n_quads = pipeline.problem.fes[0].num_quads
+    n_cells = pipeline.problem.num_cells
+    pts = fem.meshes[0].mesh_points_from_dofs(curve.dofs)
+    n_nodes = pts.shape[0]
+    rng = np.random.default_rng(0)
+    u_s = jnp.zeros(support.n_support_dofs)
+    u_s = u_s.at[support._csr_dof_offset:].set(
+        jnp.asarray(1e-4 * rng.normal(size=(support._n_csr_dofs,)))
+    )
+
+    fake_result = {
+        'mesh_points': [pts],
+        'displacements': [jnp.zeros((n_nodes, 3))],
+        'von_mises': [jnp.zeros((n_cells, n_quads))],
+        'f_vol': [jnp.zeros((n_cells, n_quads, 3))],
+        'B_self': [jnp.zeros((n_cells, n_quads, 3))],
+        'B_ext': [jnp.zeros((n_cells, n_quads, 3))],
+        'u_s': u_s,
+        'support_continuum': [],
+    }
+    monkeypatch.setattr(fem, 'run', lambda **kwargs: fake_result)
+
+    written = fem.to_vtu(str(tmp_path), base_support_dofs=sdofs)
+    csr_path = next(p for p in written if p.endswith('_csr.vtu'))
+    mesh = meshio.read(csr_path)
+    assert 'von_mises_MPa' in mesh.cell_data
+    assert float(np.max(mesh.cell_data['von_mises_MPa'][0])) > 0.0
+
+
+def test_continuum_members_empty_for_base_and_beams():
+    """Support and SupportBeams publish no continuum members."""
+    assert Support(k_clamp=1.0).continuum_members == ()
+    fem, _curve, _sdofs = _make_coilfem_with_beams()
+    assert fem.support.continuum_members == ()
+
+
 if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         fem = _make_coilfem()
-        out = fem.save_run_vtu(d)
+        out = fem.to_vtu(d)
         assert len(out) == 1, out
         print("OK:", out)

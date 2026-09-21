@@ -49,7 +49,9 @@ factorized in a single step.
 The global stiffness matrix is assembled by collecting COO triplets from every
 pipeline
 (:meth:`ElasticPipeline.assemble_coo() <coil_fem.pipelines.ElasticPipeline.assemble_coo>`)
-and from the support (:meth:`Support.coo() <coil_fem.coupling.supports.Support.coo>`),
+and from the support
+(:meth:`~coil_fem.coupling.supports.Support.support_pattern` /
+:meth:`~coil_fem.coupling.supports.Support.support_values`),
 inserting global DOF offsets and coupling blocks at the interface.  The merged
 system is factorized once with cuDSS and solved directly — there is no
 iteration.
@@ -73,7 +75,7 @@ surface.
        Driver --> MergedSolver["Single merged factorization (cuDSS)"]
        MergedSolver -->|"assemble_coo()"| P0["ElasticPipeline (coil 0)"]
        MergedSolver -->|"assemble_coo()"| P1["ElasticPipeline (coil 1)"]
-       MergedSolver -->|"coo()"| Sup[Support]
+       MergedSolver -->|"support_values()"| Sup[Support]
        P0 --> M0[FramedCurveMesh]
        P0 --> L0[LinearElasticity3D]
        P1 --> M1[FramedCurveMesh]
@@ -176,14 +178,19 @@ The three key objects are:
   model.  Owns ``k_clamp`` / ``k_attachment`` and exposes
   :meth:`~coil_fem.coupling.supports.Support.solve`,
   :meth:`~coil_fem.coupling.supports.Support.compute_weights`,
-  :meth:`~coil_fem.coupling.supports.Support.stiffness`, and optionally
-  :meth:`~coil_fem.coupling.supports.Support.coo`.
+  :meth:`~coil_fem.coupling.supports.Support.stiffness`,
+  :meth:`~coil_fem.coupling.supports.Support.support_pattern` /
+  :meth:`~coil_fem.coupling.supports.Support.support_values`, and
+  :meth:`~coil_fem.coupling.supports.Support.coupling_pattern` /
+  :meth:`~coil_fem.coupling.supports.Support.coupling_values`.
 
-- **Coupling drivers** (``src/coil_fem/coupling/drivers.py``) — pure functions
-  ``solve_uncoupled``, ``solve_staggered``, and ``solve_monolithic`` that
-  orchestrate iteration between pipelines and supports.  They are functions,
-  not classes: all persistent state (factorizations, meshes) lives inside the
-  pipelines and supports they receive as arguments.
+- **Coupling drivers** (``src/coil_fem/coupling/drivers.py``) —
+  :func:`~coil_fem.coupling.drivers.build_monolithic_static` builds the
+  :class:`~coil_fem.coupling.drivers.MonolithicStatic` bundle once in
+  :class:`~coil_fem.CoilFEM` ``__init__`` (CSR patterns, cuDSS handles, and
+  the ``custom_vjp`` ``merged_solve``).  :func:`~coil_fem.coupling.drivers.solve_monolithic`
+  and :func:`~coil_fem.coupling.drivers.solve_uncoupled` orchestrate solves.
+  :func:`~coil_fem.coupling.drivers.solve_staggered` is retired.
 
 The :class:`Support <coil_fem.coupling.supports.Support>` ABC standardises the
 interface so that coupling strategies and support implementations are
@@ -250,23 +257,28 @@ remain for a future staggered driver; the production path is monolithic.
        # ... assemble K_ss / RHS from inputs, solve ...
        return {"u_s": u_s}
 
-Step 4 — Implement ``coo()`` / coupling blocks for monolithic coupling
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Step 4 — Implement ``support_pattern`` / ``support_values`` and coupling blocks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Override :meth:`~coil_fem.coupling.supports.Support.coo` to return
-``(I, J, V, n_dofs)`` — the COO triplets of the support stiffness matrix in
-its local DOF numbering — plus ``coupling_pattern`` / ``coupling_values`` for
-the off-diagonal blocks.  See
+Override :meth:`~coil_fem.coupling.supports.Support.support_pattern` and
+:meth:`~coil_fem.coupling.supports.Support.support_values` for the support
+``K_ss`` block, plus
+:meth:`~coil_fem.coupling.supports.Support.coupling_pattern` /
+:meth:`~coil_fem.coupling.supports.Support.coupling_values` for the
+off-diagonal blocks.  See
 :meth:`ElasticPipeline.assemble_coo() <coil_fem.pipelines.ElasticPipeline.assemble_coo>`
-for the coil-side equivalent and the docstring of
-:meth:`Support.coo() <coil_fem.coupling.supports.Support.coo>` for the full
-description of the block structure and COO format.
+for the coil-side equivalent.
 
 .. code-block:: python
 
-   def coo(self, curves_jax, support_dofs, surface_pts_by_coil, *, geom=None, jxw_by_coil=None):
-       # Return (I, J, V, n_dofs) for the K_ss block
-       return I, J, V, self.n_support_dofs
+   def support_pattern(self):
+       # Return local COO (I, J) for the K_ss block
+       return I, J
+
+   def support_values(self, curves_jax, support_dofs, surface_pts_by_coil=None,
+                      geom=None, *, jxw_by_coil=None):
+       # Return COO V for the K_ss block
+       return V
 
 Step 5 — Register in ``coupling/__init__.py``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -288,8 +300,9 @@ Add tests in ``tests/test_support_<name>.py``:
   contains finite values.
 - Verify that :meth:`solve` is differentiable by calling ``jax.grad`` on a
   scalar that depends on the returned ``'u_s'``.
-- If :meth:`coo` is implemented, verify that the returned matrix is symmetric
-  and positive semi-definite on a small example.
+- If :meth:`support_pattern` / :meth:`support_values` are implemented, verify
+  that the returned matrix is symmetric and positive semi-definite on a small
+  example.
 
 Step 8 — Integrate with ``CoilFEM``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -301,8 +314,8 @@ Pass an instance to :class:`~coil_fem.CoilFEM`:
    from coil_fem.coupling import MySupport
 
    support = MySupport(...)
-   fem = CoilFEM(..., support=support)
+   fem = CoilFEM(..., support=support, coupling='monolithic')
 
-``CoilFEM`` will call ``solve_staggered`` or ``solve_monolithic`` automatically
-when ``support.is_coupled`` is ``True`` and the appropriate coupling mode is
-selected via ``physics_options``.
+``CoilFEM`` builds :attr:`~coil_fem.CoilFEM.monolithic_static` at construction
+and calls :func:`~coil_fem.coupling.drivers.solve_monolithic` when
+``support.is_coupled`` is ``True`` and ``coupling='monolithic'``.

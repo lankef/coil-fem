@@ -59,7 +59,8 @@ def _constant_section_fn(A_val=1e-4, Iy_val=1e-8, Iz_val=1e-8, J_val=2e-8):
 
     Consumes the ragged (per-group list) support_dofs and returns one array
     of beam properties per group (cc-then-cf order; the stellsym wrap group
-    has no cf part), matching the shape contract of ``SupportBeams.support_values``.
+    has no cf part; optional trailing CS group), matching the shape contract
+    of ``SupportBeams.support_values``.
     """
     def fn(support_dofs):
         phi_cc = support_dofs['phis_start_cc']   # list[g] -> (n_beam_cc[g],)
@@ -72,6 +73,13 @@ def _constant_section_fn(A_val=1e-4, Iy_val=1e-8, Iz_val=1e-8, J_val=2e-8):
             Iy.append(jnp.full((n_per,), Iy_val))
             Iz.append(jnp.full((n_per,), Iz_val))
             J.append(jnp.full((n_per,), J_val))
+        # Trailing CS cross-section group when present.
+        if 'phis_start_cs' in support_dofs:
+            n_cs = int(np.shape(support_dofs['phis_start_cs'])[0])
+            A.append(jnp.full((n_cs,), A_val))
+            Iy.append(jnp.full((n_cs,), Iy_val))
+            Iz.append(jnp.full((n_cs,), Iz_val))
+            J.append(jnp.full((n_cs,), J_val))
         return A, Iy, Iz, J
     return fn
 

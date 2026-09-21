@@ -19,20 +19,12 @@ from ..utils import estimate_k
 from ..geo import CurveXYZFourierJAX
 from ..coupling import SupportBeams
 from .coil_support import (
-    CoilSupport,
-    _ANGLE_UNIT_KEYS,
-    _DPHI_TO_PHI,
-    _PHI_TO_DPHI,
-    _SortedDphisMixin,
-    _broadcast_phis,
-    _cumsum_last,
-    _cumsum_last_vjp,
-    _decode_dphis,
-    _diff_last,
-    _encode_dphis,
-    _generate_k_clamp,
-    _tree_cumsum_last,
-    _vjp_dphis,
+    CoilSupport, _broadcast_phis, _generate_k_clamp,
+)
+from .sorted_dphis import (
+    _ANGLE_UNIT_KEYS, _DPHI_TO_PHI, _PHI_TO_DPHI, _SortedDphisMixin,
+    _apply_sorted_dphi_bounds, _decode_dphis, _decode_end_cc,
+    _encode_dphis, _encode_end_cc, _fold_first_dphis,
 )
 from .coil_support_fixed import CoilSupportFixed
 
@@ -49,6 +41,8 @@ _REQUIRED_BEAM_OPTIONS = (
 _OPTIONAL_BEAM_OPTIONS = (
     'k_attachment',
     'eps_attachment',
+    'i_beam_cs',
+    's_beam_cs',
 )
 
 
@@ -87,62 +81,6 @@ def _uniform_list(counts, cc_stellsym=False, cc_end=False):
     return out
 
 
-# ============================================================================
-# Stellsym wrap-end dphis codec (backward walk from phi = 1)
-# ============================================================================
-
-def _wrap_end_groups(n_groups, stellsym):
-    """Indices of CC groups whose ends walk backward under stellsym.
-
-    Returns the empty set when ``stellsym`` is false or there are fewer than
-    two groups.  Otherwise returns ``{n_groups - 2, n_groups - 1}`` — the
-    ``flip_half`` and ``flip`` wrap groups.
-    """
-    if not stellsym or n_groups < 2:
-        return frozenset()
-    return frozenset({n_groups - 2, n_groups - 1})
-
-
-def _decode_end_cc(d_list, stellsym):
-    """Decode ``dphis_end_cc`` → ``phis_end_cc`` (wrap groups: ``1 - cumsum``)."""
-    wrap = _wrap_end_groups(len(d_list), stellsym)
-    out = []
-    for g, d in enumerate(d_list):
-        d = jnp.asarray(d, dtype=float)
-        if g in wrap:
-            out.append(1.0 - _cumsum_last(d))
-        else:
-            out.append(_cumsum_last(d))
-    return out
-
-
-def _encode_end_cc(phi_list, stellsym):
-    """Encode ``phis_end_cc`` → ``dphis_end_cc`` (wrap: ``diff(1 - phi)``)."""
-    wrap = _wrap_end_groups(len(phi_list), stellsym)
-    out = []
-    for g, phi in enumerate(phi_list):
-        phi = jnp.asarray(phi, dtype=float)
-        if g in wrap:
-            # diff_last(1 - phi), not -diff_last(phi): they differ at j=0.
-            out.append(_diff_last(1.0 - phi))
-        else:
-            out.append(_diff_last(phi))
-    return out
-
-
-def _vjp_end_cc(g_list, stellsym):
-    """VJP of :func:`_decode_end_cc` (wrap groups: negated reverse-cumsum)."""
-    wrap = _wrap_end_groups(len(g_list), stellsym)
-    out = []
-    for g, g_phi in enumerate(g_list):
-        g_phi = jnp.asarray(g_phi, dtype=float)
-        if g in wrap:
-            out.append(-_cumsum_last_vjp(g_phi))
-        else:
-            out.append(_cumsum_last_vjp(g_phi))
-    return out
-
-
 def _zeros_list(counts, trailing=()):
     """Build a per-group list of zero arrays with optional trailing shape."""
     return [jnp.zeros((counts[i],) + trailing) for i in range(len(counts))]
@@ -154,6 +92,9 @@ def _check_ragged_shape(value, counts, name, trailing=()):
     Returns ``None`` when ``value`` is ``None`` (caller should substitute a
     default).  Raises ``ValueError`` when length or per-entry shapes disagree
     with ``counts``.
+
+    Empty arrays from GSON / numpy JSON lose trailing axes
+    (``(0, 3)`` → ``(0,)``); those are reshaped when ``counts[i] == 0``.
     """
     if value is None:
         return None
@@ -168,12 +109,30 @@ def _check_ragged_shape(value, counts, name, trailing=()):
     for i, v in enumerate(seq):
         arr = jnp.asarray(v, dtype=float)
         expected = (counts[i],) + trailing
+        # GSON drops trailing axes of empty arrays: (0, 3) → (0,).
+        if arr.size == 0 and counts[i] == 0 and arr.ndim != len(expected):
+            arr = arr.reshape(expected)
         if arr.shape != expected:
             raise ValueError(
                 f"{name}[{i}] must have shape {expected}; got {arr.shape}."
             )
         out.append(arr)
     return out
+
+
+def _inboard_midplane_phi(curve):
+    """Coil parameter at the inboard midplane quadpoint.
+
+    Among quadpoints with cylindrical radius strictly less than the coil
+    centre radius, pick the one whose ``z`` is closest to the centre's
+    ``z``.  Returns that quadpoint's parameter in ``[0, 1)``.
+    """
+    c = curve.curve_center()
+    r_center = jnp.hypot(c[0], c[1])
+    gamma = curve.gamma()
+    r = jnp.hypot(gamma[:, 0], gamma[:, 1])
+    dz = jnp.where(r < r_center, jnp.abs(gamma[:, 2] - c[2]), jnp.inf)
+    return curve.quadpoints[jnp.argmin(dz)] % 1.0
 
 
 class CoilSupportBeams(CoilSupport):
@@ -244,6 +203,13 @@ class CoilSupportBeams(CoilSupport):
         Initial cross-section roll angles for CF beams (fraction of a turn
         in ``[0, 1]``), a length-``n_base`` sequence with entry ``i`` of
         shape ``(n_beam_cf[i],)``.
+    phis_start_cs, phis_end_cs : array-like or None
+        Initial attachment angles for optional CS beams, shape
+        ``(n_beam_cs,)``.  Defaults place each start at the start-coil
+        inboard midplane (among ``r < r_center``, closest ``z`` to the
+        coil centre) and set ``phi_end = 1 - phi_start``.
+    thetas_orientation_cs : array-like or None
+        Initial CS roll angles, shape ``(n_beam_cs,)``.
     fixed_clamp_options : dict
         Optional additional fixed-sphere Winkler clamps on the coil surface.
         Set ``{'enabled': True, 'k_clamp': ..., 'r_clamp': ..., 'n_clamp': ...}``
@@ -273,9 +239,12 @@ class CoilSupportBeams(CoilSupport):
         phis_start_cc=None,
         phis_end_cc=None,
         phis_start_cf=None,
+        phis_start_cs=None,
+        phis_end_cs=None,
         x_foundation=None,
         thetas_orientation_cc=None,
         thetas_orientation_cf=None,
+        thetas_orientation_cs=None,
         # Clamp info
         fixed_clamp_options=None,
         phis=None,
@@ -297,9 +266,12 @@ class CoilSupportBeams(CoilSupport):
         self._phis_start_cc         = phis_start_cc
         self._phis_end_cc           = phis_end_cc
         self._phis_start_cf         = phis_start_cf
+        self._phis_start_cs         = phis_start_cs
+        self._phis_end_cs           = phis_end_cs
         self._x_foundation          = x_foundation
         self._thetas_orientation_cc = thetas_orientation_cc
         self._thetas_orientation_cf = thetas_orientation_cf
+        self._thetas_orientation_cs = thetas_orientation_cs
         self._phis                  = phis
         self.kwargs                 = kwargs   # GSONable adds **self.kwargs to the dict
         # ─────────────────────────────────────────────────────────────────────────
@@ -465,17 +437,62 @@ class CoilSupportBeams(CoilSupport):
         if phis_arr is not None:
             support_dofs_jax['phis'] = phis_arr
 
+        # CS beams: flat (n_beam_cs,) attachment / roll DOFs when present.
+        n_beam_cs = beams.n_beam_cs
+        if n_beam_cs > 0:
+            if phis_start_cs is not None:
+                _ps_cs = jnp.asarray(phis_start_cs, dtype=float)
+                if _ps_cs.shape != (n_beam_cs,):
+                    raise ValueError(
+                        f"phis_start_cs must have shape ({n_beam_cs},); "
+                        f"got {_ps_cs.shape}."
+                    )
+            else:
+                # One inboard-midplane point per CS beam (start coil).
+                _ps_list = []
+                for i0, _i1 in beams.i_beam_cs:
+                    curve = CurveXYZFourierJAX.from_simsopt(
+                        base_coils[i0].curve,
+                    )
+                    _ps_list.append(_inboard_midplane_phi(curve))
+                _ps_cs = jnp.asarray(_ps_list, dtype=float)
+            if phis_end_cs is not None:
+                _pe_cs = jnp.asarray(phis_end_cs, dtype=float)
+                if _pe_cs.shape != (n_beam_cs,):
+                    raise ValueError(
+                        f"phis_end_cs must have shape ({n_beam_cs},); "
+                        f"got {_pe_cs.shape}."
+                    )
+            else:
+                _pe_cs = 1.0 - _ps_cs
+            if thetas_orientation_cs is not None:
+                _th_cs = jnp.asarray(thetas_orientation_cs, dtype=float)
+                if _th_cs.shape != (n_beam_cs,):
+                    raise ValueError(
+                        f"thetas_orientation_cs must have shape "
+                        f"({n_beam_cs},); got {_th_cs.shape}."
+                    )
+            else:
+                _th_cs = jnp.zeros((n_beam_cs,))
+            support_dofs_jax['phis_start_cs'] = _ps_cs
+            support_dofs_jax['phis_end_cs'] = _pe_cs
+            support_dofs_jax['thetas_orientation_cs'] = _th_cs
+
         # Cross-section DOF keys (e.g. radius for solid_circle).
         # Each key becomes a per-group list so every beam can carry its own
         # cross-section parameter as a DOF: entry i < n_base has shape
         # (n_beam_cc[i] + n_beam_cf[i],); with stellsym an extra entry n_base
-        # has shape (n_beam_cc[n_base],) for the wrap group (no CF part).
+        # has shape (n_beam_cc[n_base],) for the wrap group (no CF part);
+        # with CS beams a trailing entry of length n_beam_cs is appended.
         # Callers may pass a scalar (same value for every beam) or a
         # per-group sequence of arrays.
         _cs_counts = [
             n_beam_cc[i] + (n_beam_cf[i] if i < n_base else 0)
             for i in range(n_groups_cc)
         ]
+        if n_beam_cs > 0:
+            _cs_counts.append(n_beam_cs)
+        n_cs_groups = len(_cs_counts)
         if kwargs is None:
             raise AttributeError(
                 "The cross section shape requires initial values of "
@@ -503,28 +520,31 @@ class CoilSupportBeams(CoilSupport):
                     jnp.broadcast_to(
                         jnp.asarray(val, dtype=float), (_cs_counts[i],)
                     )
-                    for i in range(n_groups_cc)
+                    for i in range(n_cs_groups)
                 ]
             else:
                 seq = list(val)
-                if len(seq) != n_groups_cc:
+                if len(seq) != n_cs_groups:
                     raise ValueError(
                         f"Cross-section DOF '{k}' must be a scalar or a "
-                        f"length-{n_groups_cc} sequence (one entry per CC "
-                        f"group; n_base + 1 when stellsym=True); got length "
-                        f"{len(seq)}."
+                        f"length-{n_cs_groups} sequence (one entry per CC "
+                        f"group plus trailing CS group when present); got "
+                        f"length {len(seq)}."
                     )
                 support_dofs_jax[k] = [
                     jnp.broadcast_to(
                         jnp.asarray(seq[i], dtype=float), (_cs_counts[i],)
                     )
-                    for i in range(n_groups_cc)
+                    for i in range(n_cs_groups)
                 ]
 
         # ── Compute boolean fixed_mask from fixed_dof_names ───────────────────
         if fixed_dof_names is None:
-            fixed_dof_names = list(cross_section_dof_keys) + \
-                ['thetas_orientation_cc', 'thetas_orientation_cf']
+            fixed_dof_names = list(cross_section_dof_keys) + [
+                'thetas_orientation_cc', 'thetas_orientation_cf',
+            ]
+            if n_beam_cs > 0:
+                fixed_dof_names.append('thetas_orientation_cs')
 
         fixed_dof_names = list(fixed_dof_names)
         # When *no* coil has CC (resp. CF) beams, those keys are all zero-size
@@ -577,10 +597,17 @@ class CoilSupportBeams(CoilSupport):
         unit_interval_keys = tuple(
             k for k in support_dofs_jax if k in _ANGLE_UNIT_KEYS
         ) + ('thetas_orientation_cc', 'thetas_orientation_cf')
+        if 'thetas_orientation_cs' in support_dofs_jax:
+            unit_interval_keys = unit_interval_keys + (
+                'phis_start_cs', 'phis_end_cs', 'thetas_orientation_cs',
+            )
         lb, ub = self._make_bounds(
             support_dofs_jax,
             unit_interval_keys=unit_interval_keys,
             nonnegative_keys=tuple(cross_section_dof_keys),
+        )
+        lb, ub = _apply_sorted_dphi_bounds(
+            lb, ub, support_dofs_jax, nfp, stellsym,
         )
 
         # ── Initialize CoilSupport (calls Optimizable.__init__) ───────────────
@@ -614,19 +641,25 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
     (and optional clamp ``dphis``) with absolute angles recovered by
     ``cumsum`` along the last axis — except for the two stellsym wrap
     groups, where ``phis_end_cc`` is recovered as ``1 - cumsum(dphis_end_cc)``
-    (a positive step *backward* from ``phi = 1``).  That keeps every
-    ``dphis_*`` non-negative while preserving the geometric pairing
-    ``phi_end[j] = 1 - phi_start[j]``.  :attr:`support_dofs` exposes
-    ``phis*`` for the FEM; :meth:`flatten_grad` applies the matching VJP.
+    (a positive step *backward* from ``phi = 1``).  Optional CS angles
+    stay absolute ``phis_start_cs`` / ``phis_end_cs`` (independent beams,
+    not increments), boxed to each seed ± 0.5.  The first increment of
+    ``dphis_start_cc``, ``dphis_end_cc``, and ``dphis_start_cf`` is boxed
+    to ``[-0.5, 0.5]`` (later increments stay in ``[0, 1]``) and default
+    first values are folded into that interval.  :attr:`support_dofs`
+    exposes ``phis*`` for the FEM; :meth:`flatten_grad` applies the
+    matching VJP.
 
     Parameters
     ----------
     base_coils, nfp, stellsym, beam_options, x_foundation,
-    thetas_orientation_cc, thetas_orientation_cf, fixed_clamp_options,
+    thetas_orientation_cc, thetas_orientation_cf, thetas_orientation_cs,
+    phis_start_cs, phis_end_cs, fixed_clamp_options,
     fixed_dof_names, names, dofs, **kwargs
-        Same as :class:`CoilSupportBeams`, except angle seeds use ``dphis*``
-        (see below).  ``fixed_dof_names`` may use either ``phis*`` or
-        ``dphis*`` key spellings.
+        Same as :class:`CoilSupportBeams`, except CC/CF angle seeds use
+        ``dphis*`` (see below).  CS angles stay ``phis_*_cs``.
+        ``fixed_dof_names`` may use either ``phis*`` or ``dphis*`` key
+        spellings for the incremental keys.
     dphis_start_cc, dphis_end_cc, dphis_start_cf : sequence of array-like or None
         Initial increments for CC/CF attachment angles (same ragged shapes as
         the corresponding ``phis_*`` arguments of :class:`CoilSupportBeams`).
@@ -644,9 +677,12 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
         dphis_start_cc=None,
         dphis_end_cc=None,
         dphis_start_cf=None,
+        phis_start_cs=None,
+        phis_end_cs=None,
         x_foundation=None,
         thetas_orientation_cc=None,
         thetas_orientation_cf=None,
+        thetas_orientation_cs=None,
         fixed_clamp_options=None,
         dphis=None,
         fixed_dof_names=None,
@@ -655,8 +691,9 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
         **kwargs,
     ):
         # Must precede super().__init__: _encode_angle_dofs runs during
-        # CoilSupportBeams.__init__ and needs this flag.
+        # CoilSupportBeams.__init__ and needs these flags.
         self._sorted_stellsym = bool(stellsym)
+        self._sorted_nfp = int(nfp)
         self._dphis_start_cc = dphis_start_cc
         self._dphis_end_cc = dphis_end_cc
         self._dphis_start_cf = dphis_start_cf
@@ -669,7 +706,7 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
             stellsym,
             beam_options=beam_options,
             phis_start_cc=(
-                _tree_cumsum_last(dphis_start_cc)
+                _decode_dphis({'dphis_start_cc': dphis_start_cc})['phis_start_cc']
                 if dphis_start_cc is not None else None
             ),
             phis_end_cc=(
@@ -677,15 +714,18 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
                 if dphis_end_cc is not None else None
             ),
             phis_start_cf=(
-                _tree_cumsum_last(dphis_start_cf)
+                _decode_dphis({'dphis_start_cf': dphis_start_cf})['phis_start_cf']
                 if dphis_start_cf is not None else None
             ),
+            phis_start_cs=phis_start_cs,
+            phis_end_cs=phis_end_cs,
             x_foundation=x_foundation,
             thetas_orientation_cc=thetas_orientation_cc,
             thetas_orientation_cf=thetas_orientation_cf,
+            thetas_orientation_cs=thetas_orientation_cs,
             fixed_clamp_options=fixed_clamp_options,
             phis=(
-                _cumsum_last(jnp.asarray(dphis, dtype=float))
+                _decode_dphis({'dphis': jnp.asarray(dphis, dtype=float)})['phis']
                 if dphis is not None else None
             ),
             fixed_dof_names=fixed_dof_names,
@@ -694,29 +734,14 @@ class CoilSupportBeamsSorted(_SortedDphisMixin, CoilSupportBeams):
             **kwargs,
         )
 
-    @property
-    def support_dofs(self) -> dict:
-        raw = self._unravel(jnp.asarray(self.local_full_x))
-        out = _decode_dphis(raw)
-        if 'dphis_end_cc' in raw:
-            out['phis_end_cc'] = _decode_end_cc(
-                raw['dphis_end_cc'], self._sorted_stellsym,
-            )
-        return out
-
-    def flatten_grad(self, grad_dofs: dict) -> np.ndarray:
-        g = _vjp_dphis(grad_dofs)
-        if 'phis_end_cc' in grad_dofs:
-            g['dphis_end_cc'] = _vjp_end_cc(
-                grad_dofs['phis_end_cc'], self._sorted_stellsym,
-            )
-        return np.asarray(ravel_pytree(g)[0], dtype=float)
-
     def _encode_angle_dofs(self, support_dofs_jax, fixed_dof_names):
         encoded = _encode_dphis(support_dofs_jax)
         if 'phis_end_cc' in support_dofs_jax:
             encoded['dphis_end_cc'] = _encode_end_cc(
                 support_dofs_jax['phis_end_cc'], self._sorted_stellsym,
             )
+        encoded = _fold_first_dphis(
+            encoded, self._sorted_nfp, self._sorted_stellsym,
+        )
         renamed = [_PHI_TO_DPHI.get(k, k) for k in fixed_dof_names]
         return encoded, renamed

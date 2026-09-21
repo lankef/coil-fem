@@ -10,14 +10,8 @@ import jax.numpy as jnp
 
 from ..utils import clamp_sigmoid
 from ..coupling import Support
-from .coil_support import (
-    CoilSupport,
-    _SortedDphisMixin,
-    _broadcast_phis,
-    _cumsum_last,
-    _diff_last,
-    _generate_k_clamp,
-)
+from .coil_support import CoilSupport, _broadcast_phis, _generate_k_clamp
+from .sorted_dphis import _SortedDphisMixin, _cumsum_last, _diff_last
 
 
 class CoilSupportFixed(CoilSupport):

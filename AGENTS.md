@@ -64,22 +64,28 @@ src/coil_fem/                  # main package (Hatchling src-layout)
   presets/                     # Named material / cross-section factory helpers
     __init__.py
     cross_section_fns.py       # solid/hollow circle & rectangle section factories
+  io/                          # I/O helpers (import coil_fem.io.gmsh, not coil_fem.io)
+    __init__.py                # namespace only; no re-exports
+    gmsh.py                    # to_full_body — OCC + fTetWild full-body VTU export
   geo/                         # Curve geometry and symmetry subpackage
     __init__.py                # re-exports CurveXYZFourierJAX, framed curves, symmetry helpers
     curve_jax.py               # CurveXYZFourierJAX — JAX pytree, simsopt interop
     framed_curve_jax.py        # FramedCurveCentroidJAX / FramedCurveRMFJAX
     symmetries.py              # Stellarator symmetry expansion (pure JAX)
-  coupling/                    # Support structure coupling subpackage
-    __init__.py                # re-exports Support, SupportBeams, solve_staggered, solve_monolithic
+    coupling/                    # Support structure coupling subpackage
+    __init__.py                # re-exports Support, SupportBeams, SupportBeamsCSR, drivers
     supports.py                # Support (concrete grounded Winkler/Robin BC)
     beam_network.py            # SupportBeams — bisymmetric beam-network support (coil-coil + coil-foundation)
+    beam_network_csr.py        # SupportBeamsCSR — central support ring + coil-to-CSR beams
     drivers.py                 # solve_staggered (BG-S + Aitken + IFT grad), solve_monolithic (cuDSS-only)
   simsopt/                     # simsopt Optimizable interop subpackage
-    __init__.py                # re-exports CoilFEMObjective, CoilSupport*, CoilSupportBeams*
-    objectives.py              # CoilFEMObjective — simsopt Optimizable wrapper
-    coil_support.py            # CoilSupport base + shared dphis / k_clamp helpers
+    __init__.py                # re-exports CoilFEMObjective, CoilSupport*, CSR* objectives
+    objectives.py              # CoilFEMObjective + beam/CSR geometric constraints
+    coil_support.py            # CoilSupport base + k_clamp helpers
+    sorted_dphis.py            # Incremental dphis* ↔ phis* codecs for Sorted classes
     coil_support_fixed.py      # CoilSupportFixed, TopBottom, FixedSorted
     coil_support_beams.py      # CoilSupportBeams, CoilSupportBeamsSorted
+    coil_support_beams_csr.py  # CoilSupportBeamsCSR, CoilSupportBeamsCSRSorted
   solvers/                     # Optional GPU solver subpackage
     __init__.py
     cudss.py                   # GPU sparse direct solver (spineax + NVIDIA cuDSS)
@@ -190,13 +196,13 @@ Two kinds of data bundles appear in this codebase; use the correct container for
 - Use plain `dict` or `NamedTuple`.  Both are JAX pytrees.
 - Example: `geom` dict returned by `SupportBeams.beam_geometry(curves_jax, support_dofs)` contains endpoint positions, lengths, DCMs, and (when meshes are bound) `L_eff` — all traced arrays.
 - Example: `support_dofs` passed to solvers and metrics.
-- **Never freeze `beam_geometry` in the monolithic constraint VJP** (`make_merged_solve` `_bwd` in `coupling/drivers.py`). Attachment DOFs (`phis_*`, etc.) enter `K_ss`/`K_cs`/`K_sc` through that geom; freezing it breaks `dJ` / Taylor tests. Forward-only geom sharing in `_solve_all` is fine; for memory use `jax.checkpoint`/remat, not a freeze.
+- **Never freeze `beam_geometry` in the monolithic constraint VJP** (nested `merged_solve` `_bwd` inside `build_monolithic_static` in `coupling/drivers.py`). Attachment DOFs (`phis_*`, etc.) enter `K_ss`/`K_cs`/`K_sc` through that geom; freezing it breaks `dJ` / Taylor tests. Forward-only geom sharing in `_solve_all` is fine; for memory use `jax.checkpoint`/remat, not a freeze.
 
 **Static bundles** (fixed at construction, never traced):
 - Use `@dataclasses.dataclass(frozen=True, eq=False)`.  The `eq=False` flag prevents JAX from treating the dataclass as a pytree leaf during hashing; the `frozen=True` flag enforces immutability.
 - Example: `MonolithicStatic` in `coupling/drivers.py` — holds CSR patterns, cuDSS solver handles, and the pre-built `merged_solve` callable.
 - **Never store traced JAX arrays on `self`.**  Traced values must always be passed as arguments so that JAX's tracing and autodiff machinery can see them.
-- `CoilFEM.build_monolithic_static(solver)` is the canonical construction entry point for the monolithic static bundle; it is called once at `__init__` when `coupling == 'monolithic'` and `support.is_coupled`.
+- `build_monolithic_static(...)` in `coupling/drivers.py` is the canonical construction entry point for the monolithic static bundle; `CoilFEM.__init__` calls it once when `coupling == 'monolithic'` and `support.is_coupled`. Only `solver == 'cudss'` fills `merged_solve`; other solvers leave it `None` and `solve_monolithic` raises.
 
 ## Build and Packaging
 
@@ -245,6 +251,7 @@ The coupling between coil FEM and support structures is split across three layer
 Key constructor arguments (all static; set once at construction):
 
 - `n_beam_cc`, `n_beam_cf` — beam counts. CC beams have one entry per CC *group*: `n_base + 1` when `stellsym=True` (the extra last entry is the coil-0 `phi = 0` wrap group), else `n_base`. CF beams have one entry per base coil.
+- `i_beam_cs`, `s_beam_cs` — optional stellarator-symmetric inter-coil (CS) topology (`stellsym=True` only). `i_beam_cs` is a list of `(i0, i1)` coil-index pairs; `s_beam_cs` is a same-length list of bools (`True` → `flip` about φ=0, `False` → `flip_half` about φ=π/nfp). Each entry is one master beam from `base_coil[i0]` to `Q(base_coil[i1])`; partners are not assembled. Default `None` (no CS beams). Not supported on `SupportBeamsCSR`.
 - `E`, `nu` — Young's modulus and Poisson's ratio.
 - `cross_section_fn(support_dofs) -> (A, Iy, Iz, J)` — cross-section properties.
 - `attachment_fn(surface_pts_beam_frame, dofs, sign_x, beam_options) -> weights` — selects coil surface points for coupling.
@@ -256,32 +263,44 @@ Key constructor arguments (all static; set once at construction):
 Optimisable quantities live in `support_dofs` (passed at solve time, never stored):
 
 - `phis_start_cc`, `phis_end_cc` — attachment angles for CC beams: per-group lists, entry `g` of shape `(n_beam_cc[g],)` (`n_base + 1` entries when `stellsym=True`, else `n_base`).  When `stellsym=True`, `phis_end_cc` is descending on the two wrap groups (`flip_half` / `flip`) so that `phi_end[j] = 1 - phi_start[j]`; :class:`~coil_fem.simsopt.CoilSupportBeamsSorted` stores those ends as nonnegative `dphis_end_cc` that walk backward from `phi = 1`.
+- `phis_start_cs`, `phis_end_cs` — attachment angles for CS beams when present: flat arrays of shape `(n_beam_cs,)`. Defaults place each start at the start-coil inboard midplane (among `r < r_center`, closest `z` to the coil centre) and set `phi_end = 1 - phi_start`. Sorted keeps these as absolute `phis_*` (not `dphis`), boxed to each seed ± 0.5.
 - **Note:** `params['support_k']` is the per-surface-quad stiffness [N/m³] (`(n_surface_quads,)`), obtained via `pipeline.surface_quad_points(pts)` → `support.compute_weights` → `support.stiffness`.
 - `phis_start_cf` — attachment angles for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i],)`.
 - `x_foundation` — foundation anchor positions for CF beams: per-coil list, entry `i` of shape `(n_beam_cf[i], 3)`.
-- `thetas_orientation_cc`, `thetas_orientation_cf` — cross-section roll angle per beam as a fraction of a turn in ``[0, 1]`` (same per-group / per-coil list layout as the attachment angles); applied as ``2π · θ`` in Rodrigues.
+- `thetas_orientation_cc`, `thetas_orientation_cf`, `thetas_orientation_cs` — cross-section roll angle per beam as a fraction of a turn in ``[0, 1]`` (CC/CF ragged lists; CS flat `(n_beam_cs,)`); applied as ``2π · θ`` in Rodrigues.
+
+### `SupportBeamsCSR` (`coupling/beam_network_csr.py`)
+
+`SupportBeamsCSR` extends `SupportBeams` with a one-field-period central support ring (CSR) and coil-to-CSR (CR) beams. The ring lives in the `K_ss` block; `CoilFEM` needs no solve-path changes.
+
+- `n_beam_cr` — scalar int (same CR count on every coil). A sequence is rejected.
+- CR attachment DOFs are rectangular arrays of shape `(n_base, n_beam_cr)`: `phis_start_cr`, `phis_end_cr`, `thetas_orientation_cr`. CR ends sit on the CSR centerline. CC/CF keys stay ragged lists.
+- `phis_end_cr` are angles around the CSR (not on the coil). Sorted encoding increments them along the **coil** axis: `phis_end_cr[i, j] = sum_{k<=i} dphis_end_cr[k, j]`. Other `phis*` still increment along the beam axis.
+- `csr_curve_dofs` — `CurveRZFourierJAX` coefficients for the ring centreline.
 
 ### Solver drivers (`coupling/drivers.py`)
 
-Two module-level driver functions replace the uncoupled per-coil loop in `CoilFEM` when `support.is_coupled=True`:
+Module-level drivers used when `support.is_coupled=True`:
 
-- **`solve_staggered`** — Block Gauss-Seidel with Aitken relaxation.  Works on all backends (CPU and GPU).  Gradients are computed via a `@jax.custom_vjp` that applies the implicit-function theorem (IFT): the GMRES solve of `(I − dT/du_s)ᵀ λ = g` provides the correct adjoint without differentiating through the iteration history.  *Note:* the Python-loop forward pass is concrete (not JIT-compiled); wrapping the caller with `jax.jit` will fail.
-
-- **`solve_monolithic`** — Assembles a single merged block matrix `[K_cc | K_cs; K_sc | K_ss]` and solves it with cuDSS in one shot.  Raises `NotImplementedError` when `solver != 'cudss'`.
+- **`build_monolithic_static`** — Host-side construction of `MonolithicStatic` (layout, optional cuDSS handles, nested `custom_vjp` `merged_solve`). Called once from `CoilFEM.__init__`.
+- **`solve_monolithic`** — Assembles a single merged block matrix `[K_cc | K_cs; K_sc | K_ss]` and solves it with cuDSS in one shot.  Raises `NotImplementedError` when `static.merged_solve is None` (i.e. `solver != 'cudss'`).
+- **`solve_staggered`** — **Retired**; raises `NotImplementedError`. Use `coupling='monolithic'` with `solver='cudss'`.
 
 ### `CoilFEM` dispatch
 
-`CoilFEM.__init__` accepts a `coupling='staggered'|'monolithic'|'uncoupled'` keyword (default `'monolithic'`).  The internal `_solve_all` helper:
+`CoilFEM.__init__` accepts a `coupling='staggered'|'monolithic'` keyword (default `'monolithic'`). When coupled + monolithic it builds `self.monolithic_static` via `build_monolithic_static`. The internal `_solve_all` helper:
 
 1. Builds per-coil mesh points, body forces, and Winkler stiffnesses via `support.stiffness(*support.compute_weights(...))`.
-2. Dispatches to `solve_staggered` or `solve_monolithic` when `support.is_coupled=True`.
+2. Dispatches to `solve_monolithic` when `support.is_coupled=True` and `coupling == 'monolithic'` (staggered raises at solve time).
 3. Falls back to an independent per-coil loop when `support.is_coupled=False`.
 
 `support` is a required `CoilFEM` argument.  Both moduli (`k_clamp`, `k_attachment`) live on `Support`; `problem_options` no longer carries a Winkler modulus.
 
 ### simsopt interop (`simsopt/coil_support*.py`)
 
-`CoilSupport` is the simsopt `Optimizable` base class that holds `base_coils`, `nfp`, `stellsym`, and the `Support` instance.  `CoilSupportFixed` and `CoilSupportTopBottom` are concrete subclasses.  `CoilFEMObjective` takes a single `CoilSupport` as its primary argument.
+`CoilSupport` is the simsopt `Optimizable` base class that holds `base_coils`, `nfp`, `stellsym`, and the `Support` instance.  Concrete subclasses include `CoilSupportFixed` / `TopBottom`, `CoilSupportBeams`, and `CoilSupportBeamsCSR` (plus `*Sorted` variants).  `CoilFEMObjective` takes a single `CoilSupport` as its primary argument.
+
+Sorted classes store incremental `dphis*` DOFs. The codecs live in `sorted_dphis.py`: most keys `cumsum` along the last (beam) axis; `dphis_end_cr` `cumsum`s along the coil axis of the `(n_coil, n_beam_cr)` array. First-increment box bounds follow the same axis choice (beam 0 vs coil 0).
 
 ### Adding a new `Support` subclass
 

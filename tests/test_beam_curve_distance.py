@@ -100,14 +100,24 @@ def test_J_zero_when_clear_and_positive_when_violated():
     assert BeamCurveDistance(cs, DEAD_LENGTH, 4.0 * d_clear).J() > 0.0
 
 
-def test_inactive_free_span_contributes_zero():
-    """When dead_length exceeds L/2, every free span is empty and J is 0."""
+def test_oversized_dead_length_is_capped():
+    """dead_length > L/2 is clipped so the free span stays non-empty and dJ finite."""
     cs = _make_coil_support()
-    # Any finite clearance; empty free spans must still give J = 0.
-    assert BeamCurveDistance(cs, dead_length=1e3, minimum_distance=10.0).J() == 0.0
-    assert not np.isfinite(
-        BeamCurveDistance(cs, dead_length=1e3, minimum_distance=0.0).shortest_distance()
-    )
+    Jb = BeamCurveDistance(cs, dead_length=1e3, minimum_distance=10.0)
+    assert np.isfinite(Jb.J())
+    assert np.all(np.isfinite(np.asarray(Jb.dJ())))
+
+    d = BeamCurveDistance(cs, dead_length=1e3, minimum_distance=0.0).shortest_distance()
+    assert np.isfinite(d)
+    assert d > 0.0
+
+    cdofs, sdofs = Jb._read_dofs()
+    curves_jax = Jb._curves_jax(cdofs)
+    geom = cs.support.beam_geometry(curves_jax, sdofs)
+    x_a, x_b, active = Jb._effective_segments(geom)
+    span = np.linalg.norm(np.asarray(x_b) - np.asarray(x_a), axis=1)
+    assert np.all(np.asarray(active))
+    assert np.all(span > 0.0)
 
 
 def test_cf_omits_end_curve_integral():
@@ -278,12 +288,14 @@ def test_J_independent_of_currents():
     assert np.asarray(Jb.dJ())[i] == 0.0
 
 
-def test_rejects_negative_parameters():
+def test_rejects_nonpositive_dead_length_and_negative_dmin():
     cs = _make_coil_support()
     with pytest.raises(ValueError, match="dead_length"):
         BeamCurveDistance(cs, dead_length=-0.1, minimum_distance=0.0)
+    with pytest.raises(ValueError, match="dead_length"):
+        BeamCurveDistance(cs, dead_length=0.0, minimum_distance=0.0)
     with pytest.raises(ValueError, match="minimum_distance"):
-        BeamCurveDistance(cs, dead_length=0.0, minimum_distance=-0.1)
+        BeamCurveDistance(cs, dead_length=DEAD_LENGTH, minimum_distance=-0.1)
 
 
 # ============================================================================

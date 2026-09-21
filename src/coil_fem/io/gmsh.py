@@ -1,7 +1,8 @@
-"""OCC full-body meshing for a CoilFEMObjective → ``full_body_fields.vtu``.
+"""Full-device TET10 mesh of coils and beams → ``full_body_fields.vtu``.
 
-Beam cross-sections are resolved from ``presets.cross_section_fns`` via
-``cross_section_type``; coil cross-sections must be rectangular
+Coil and beam OCC solids are imprinted with a fragment so the contact
+face is shared, then filled by gmsh.  Beam cross-sections come from
+``presets.cross_section_fns``; coils must be rectangular
 (:class:`~coil_fem.meshing.FramedCurveMeshRectangle`).
 """
 
@@ -10,19 +11,20 @@ from __future__ import annotations
 from pathlib import Path
 
 import gmsh
-import interpax
 import meshio
 import numpy as np
 import pyvista as pv
-from scipy.spatial import cKDTree
 
 from coil_fem.meshing import FramedCurveMeshRectangle
 from coil_fem.presets import cross_section_fns
 
+__all__ = ["to_full_body"]
 
 _N_SLICES = 96
-_N_PHI = 4096
-_UV_TOL = 2e-2
+_TET10 = 11
+# Gmsh tet10 edge mids differ from VTK on the last two slots
+# (meshio ``_gmsh_to_meshio_order``): VTK[i] = gmsh[perm[i]].
+_GMSH_TET10_TO_VTK = np.array([0, 1, 2, 3, 4, 5, 6, 7, 9, 8], dtype=np.int64)
 
 
 def _symmetry_Qs(nfp: int, stellsym: bool) -> np.ndarray:
@@ -68,13 +70,13 @@ def _coil_solid(occ, mesh, n_slices: int = _N_SLICES):
     return out
 
 
-def _beam_solids(occ, support, sdofs, geom, solid_fn):
+def _beam_solids(occ, support, sdofs, geom, solid_fn, length_factor: float = 1.0):
     """Build and place every beam OCC body; return ``(dim, tag)`` list.
 
     Cross-section DOFs are flattened per-group → per-beam in the same order
     as ``geom['x_start']`` / ``geom['gamma3']``.  Each body is created in the
-    beam-local frame by ``solid_fn`` then mapped to global coordinates with
-    ``affineTransform([gamma3 | x_start])``.
+    beam-local frame by ``solid_fn`` with length ``length_factor * L``, then
+    mapped to global coordinates with ``affineTransform([gamma3 | x_start])``.
     """
     x_start = np.asarray(geom['x_start'], dtype=np.float64)
     L = np.asarray(geom['L'], dtype=np.float64)
@@ -89,95 +91,61 @@ def _beam_solids(occ, support, sdofs, geom, solid_fn):
     solids = []
     for b in range(x_start.shape[0]):
         dofs = {k: float(flat[k][b]) for k in support._cross_section_dof_keys}
-        dimtags = solid_fn(occ, dofs, float(L[b]))
+        dimtags = solid_fn(occ, dofs, float(L[b]) * length_factor)
         affine = list(np.hstack([gamma3[b], x_start[b, :, None]]).ravel())
         occ.affineTransform(dimtags, affine)
         solids.extend(dimtags)
     return solids
 
 
-def _classify_nodes(X, meshes, Q_list, w1: float, w2: float):
-    """Inverse-map nodes to base-coil ``(phi, u, v)``; return owner arrays."""
-    N = X.shape[0]
-    n_base = len(meshes)
-    n_sym = Q_list.shape[0]
-    dist_cut = 0.5 * np.hypot(w1, w2) * 1.05
+def _apply_sym_copies(occ, dimtags, Q_list):
+    """Copy ``dimtags`` under each symmetry map; image 0 is the original.
 
-    phi_s = np.linspace(0.0, 1.0, _N_PHI, endpoint=False)
-    gamma_s, p_s, q_s = [], [], []
-    for mesh in meshes:
-        fc = mesh.framed_curve
-        gamma_s.append(np.asarray(fc.curve.gamma_eval(phi_s)))
-        _, p, q = fc.rotated_frame_eval(phi_s)
-        p_s.append(np.asarray(p))
-        q_s.append(np.asarray(q))
+    ``Q`` acts on column vectors (``x_image = Q @ x``), which is the same
+    map as the row form ``x_base @ Q.T``.
+    """
+    copies = [list(dimtags)]
+    for Q in Q_list[1:]:
+        copied = list(occ.copy(dimtags))
+        affine = [
+            float(Q[0, 0]), float(Q[0, 1]), float(Q[0, 2]), 0.0,
+            float(Q[1, 0]), float(Q[1, 1]), float(Q[1, 2]), 0.0,
+            float(Q[2, 0]), float(Q[2, 1]), float(Q[2, 2]), 0.0,
+        ]
+        occ.affineTransform(copied, affine)
+        copies.append(copied)
+    return copies
 
-    sample_pts, sample_lab = [], []
-    for s in range(n_sym):
-        Q = Q_list[s]
-        for i in range(n_base):
-            sample_pts.append(gamma_s[i] @ Q.T)
-            labs = np.empty((_N_PHI, 3), dtype=np.int32)
-            labs[:, 0] = s
-            labs[:, 1] = i
-            labs[:, 2] = np.arange(_N_PHI)
-            sample_lab.append(labs)
-    tree = cKDTree(np.vstack(sample_pts))
-    dist, nn = tree.query(X, k=3)
-    cand_lab = np.vstack(sample_lab)[nn]
 
-    owner_sym = np.full(N, -1, dtype=np.int8)
-    owner_coil = np.full(N, -1, dtype=np.int8)
+def _entity_owner_map(ov_map, owners):
+    """Map fragment output volume tags to ``(owner_coil, owner_sym)``.
 
-    for cand in range(3):
-        unset = owner_coil < 0
-        if not unset.any():
-            break
-        idxs = np.where(unset)[0]
-        s_c = cand_lab[idxs, cand, 0]
-        i_c = cand_lab[idxs, cand, 1]
-        phi0 = phi_s[cand_lab[idxs, cand, 2]]
-        d_c = dist[idxs, cand]
-        keep_mask = d_c <= dist_cut
-
-        for i in range(n_base):
-            m = keep_mask & (i_c == i)
-            if not m.any():
+    ``owners[i]`` labels fragment input ``i``.  Each coil is several
+    volumes (two half-lofts), so labels are per input volume, not per
+    coil.  An output listed under several inputs (the overlap) is
+    claimed by the conductor; beam labels are ``(-1, -1)``.  The first
+    conductor to claim a tag keeps it.
+    """
+    owner_map: dict[int, tuple[int, int]] = {}
+    for src, outs in zip(owners, ov_map):
+        if src[0] >= 0:
+            continue
+        for dim, tag in outs:
+            if dim == 3:
+                owner_map[int(tag)] = (-1, -1)
+    for src, outs in zip(owners, ov_map):
+        if src[0] < 0:
+            continue
+        label = (int(src[0]), int(src[1]))
+        for dim, tag in outs:
+            if dim != 3:
                 continue
-            sel = idxs[m]
-            s_sel = s_c[m]
-            phi_n = phi0[m].astype(np.float64).copy()
-            Qs = Q_list[s_sel]
-            y = np.einsum("ni,nij->nj", X[sel], Qs)
-
-            curve = meshes[i].framed_curve.curve
-            for _ in range(2):
-                g0 = np.asarray(curve.gamma_eval(phi_n, 0))
-                g1 = np.asarray(curve.gamma_eval(phi_n, 1))
-                g2 = np.asarray(curve.gamma_eval(phi_n, 2))
-                dvec = y - g0
-                g = np.sum(dvec * g1, axis=1)
-                gp = -np.sum(g1 * g1, axis=1) + np.sum(dvec * g2, axis=1)
-                phi_n = phi_n - g / np.where(np.abs(gp) < 1e-30, 1e-30, gp)
-            phi_n = np.mod(phi_n, 1.0)
-
-            p_i = np.asarray(interpax.interp1d(
-                phi_n, phi_s, p_s[i], method="cubic2", period=1.0,
-            ))
-            q_i = np.asarray(interpax.interp1d(
-                phi_n, phi_s, q_s[i], method="cubic2", period=1.0,
-            ))
-            g0 = np.asarray(curve.gamma_eval(phi_n, 0))
-            dvec = y - g0
-            u = 2.0 * np.sum(dvec * p_i, axis=1) / w1
-            v = 2.0 * np.sum(dvec * q_i, axis=1) / w2
-            inside = (np.abs(u) <= 1.0 + _UV_TOL) & (np.abs(v) <= 1.0 + _UV_TOL)
-
-            take = sel[inside]
-            owner_sym[take] = s_sel[inside].astype(np.int8)
-            owner_coil[take] = i
-
-    return owner_coil, owner_sym
+            tag = int(tag)
+            prev = owner_map.get(tag)
+            if prev is not None and prev[0] >= 0:
+                continue
+            owner_map[tag] = label
+    return owner_map
 
 
 def _write_vtu(
@@ -196,24 +164,28 @@ def _write_vtu(
     rho,
     g_vec,
 ):
-    # VTU contents for beam_dolfinx2.py:
+    # VTU contents for beam_dolfinx.py:
     #
     # FieldData — REQUIRED by load_vtu_problem / solve:
-    #   clamp_centers, r_clamp, eps_sigmoid, k_clamp, E, nu, rho, g_vec
+    #   r_clamp, eps_sigmoid, k_clamp, E, nu, rho, g_vec
+    #   clamp_centers — omitted when there are no fixed clamps (empty
+    #   arrays are rejected by PyVista FieldData)
     #
-    # PointData — sanity / Paraview only (not read by beam_dolfinx2; Lorentz
+    # CellData — sanity / Paraview only (not read by beam_dolfinx; Lorentz
     # reclassifies quads from Jstress.json; Winkler uses FieldData spheres):
     #   owner_coil, owner_sym
     meshio.Mesh(
         points=points,
         cells=[("tetra10", cells)],
-        point_data={
-            "owner_coil": owner_coil.astype(np.int32),
-            "owner_sym": owner_sym.astype(np.int32),
+        cell_data={
+            "owner_coil": [np.asarray(owner_coil, dtype=np.int32)],
+            "owner_sym": [np.asarray(owner_sym, dtype=np.int32)],
         },
     ).write(path)
     grid = pv.read(str(path))
-    grid.field_data["clamp_centers"] = np.asarray(clamp_centers, dtype=np.float64)
+    clamp_centers = np.asarray(clamp_centers, dtype=np.float64).reshape(-1, 3)
+    if clamp_centers.shape[0]:
+        grid.field_data["clamp_centers"] = clamp_centers
     grid.field_data["r_clamp"] = np.array([r_clamp], dtype=np.float64)
     grid.field_data["eps_sigmoid"] = np.array([eps_sigmoid], dtype=np.float64)
     grid.field_data["k_clamp"] = np.array([k_clamp], dtype=np.float64)
@@ -224,49 +196,94 @@ def _write_vtu(
     grid.save(str(path))
 
 
-def _tet4_to_tet10(V4: np.ndarray, T4: np.ndarray):
-    """Promote TET4 to TET10 by inserting edge midpoints (vectorized).
+def _extract_tet10(owner_map):
+    """Read the order-2 tet mesh and per-cell owners. Returns points, cells, owners."""
+    node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+    node_tags = np.asarray(node_tags, dtype=np.int64)
+    if node_tags.size == 0:
+        raise RuntimeError("to_full_body: gmsh produced no mesh nodes")
+    points = np.asarray(node_coords, dtype=np.float64).reshape(-1, 3)
+    lut = np.full(int(node_tags.max()) + 1, -1, dtype=np.int64)
+    lut[node_tags] = np.arange(node_tags.size)
 
-    Parameters
-    ----------
-    V4 : np.ndarray, shape (N, 3)
-    T4 : np.ndarray, shape (M, 4)
+    cells, owner_coil, owner_sym = [], [], []
+    for dim, tag in gmsh.model.getEntities(3):
+        etypes, _, ntags = gmsh.model.mesh.getElements(dim, tag)
+        etypes = [int(t) for t in etypes]
+        if _TET10 not in etypes:
+            raise RuntimeError(
+                f"to_full_body: volume {tag} has no TET10 elements "
+                f"(types {etypes})"
+            )
+        conn = np.asarray(ntags[etypes.index(_TET10)], dtype=np.int64)
+        conn = conn.reshape(-1, 10)[:, _GMSH_TET10_TO_VTK]
+        conn = lut[conn]
+        if (conn < 0).any():
+            raise RuntimeError(
+                f"to_full_body: tet node missing from getNodes (volume {tag})"
+            )
+        oc, osym = owner_map.get(int(tag), (-1, -1))
+        cells.append(conn)
+        owner_coil.append(np.full(len(conn), oc, dtype=np.int32))
+        owner_sym.append(np.full(len(conn), osym, dtype=np.int32))
+    if not cells:
+        raise RuntimeError("to_full_body: fragment left no volumes to mesh")
+    return (
+        points,
+        np.vstack(cells),
+        np.concatenate(owner_coil),
+        np.concatenate(owner_sym),
+    )
 
-    Returns
-    -------
-    V10 : np.ndarray, shape (N + n_unique_edges, 3)
-    T10 : np.ndarray, shape (M, 10)
-        VTK TET10 node order: corners (0-3), then midpoints along
-        edges (0,1)(1,2)(0,2)(0,3)(1,3)(2,3).
+
+def _fragment_inputs(occ, meshes, Q_list, beam_dimtags):
+    """Full-device coil then beam volumes, with a parallel owner list.
+
+    Coil owners are ``(base_coil, sym_image)``.  Beam owners are
+    ``(-1, -1)``.  Each coil image may contribute more than one volume
+    (the two half-lofts).
     """
-    # VTK TET10 edge pairs: (0,1)(1,2)(0,2)(0,3)(1,3)(2,3)
-    ei = np.array([0, 1, 0, 0, 1, 2], dtype=np.int64)
-    ej = np.array([1, 2, 2, 3, 3, 3], dtype=np.int64)
-    a = np.minimum(T4[:, ei], T4[:, ej])  # (M, 6) normalised so a <= b
-    b = np.maximum(T4[:, ei], T4[:, ej])
-    all_pairs = np.stack([a.ravel(), b.ravel()], axis=1)  # (M*6, 2)
-    unique_pairs, inv = np.unique(all_pairs, axis=0, return_inverse=True)
-    mid_idx = len(V4) + inv.reshape(len(T4), 6)
-    T10 = np.empty((len(T4), 10), dtype=np.int64)
-    T10[:, :4] = T4
-    T10[:, 4:] = mid_idx
-    V_mid = 0.5 * (V4[unique_pairs[:, 0]] + V4[unique_pairs[:, 1]])
-    return np.vstack([V4, V_mid]), T10
+    n_base = len(meshes)
+    n_sym = len(Q_list)
+    coil_vols = [[None] * n_base for _ in range(n_sym)]
+    for i, mesh in enumerate(meshes):
+        copies = _apply_sym_copies(occ, _coil_solid(occ, mesh), Q_list)
+        for s, dts in enumerate(copies):
+            coil_vols[s][i] = dts
+    if beam_dimtags:
+        beam_vols = _apply_sym_copies(occ, beam_dimtags, Q_list)
+    else:
+        beam_vols = [[] for _ in range(n_sym)]
+
+    inputs, owners = [], []
+    for s in range(n_sym):
+        for i in range(n_base):
+            for dim, tag in coil_vols[s][i]:
+                if dim == 3:
+                    inputs.append((3, tag))
+                    owners.append((i, s))
+    for s in range(n_sym):
+        for dim, tag in beam_vols[s]:
+            if dim == 3:
+                inputs.append((3, tag))
+                owners.append((-1, -1))
+    return inputs, owners
 
 
 def to_full_body(
     Jstress,
     mesh_scale: float = 0.5,
     path: str | Path = "full_body_fields.vtu",
-    output_msh: bool = False,
-    epsilon: float = 5e-4,
+    beam_length_factor: float = 0.95,
 ) -> Path:
     """Build a full-device TET10 mesh and write ``full_body_fields.vtu``.
 
-    Uses wildmeshing (fTetWild) to tetrahedralise a triangle soup of the
-    unfused beam and coil surfaces.  No OCC boolean is performed, so
-    sub-mesh-size slivers from beam–coil intersections are absorbed
-    automatically by the fTetWild envelope.
+    OCC ``fragment`` imprints beam–coil (and coil–coil) contacts so gmsh
+    meshes each volume once with shared interface nodes.  CellData
+    ``owner_coil`` / ``owner_sym`` label conductor cells; ``-1`` is
+    support.  Overlap regions are labelled conductor.  When fixed clamps
+    are disabled, ``clamp_centers`` is omitted from FieldData; consumers
+    must treat that key as optional.
 
     Parameters
     ----------
@@ -276,38 +293,36 @@ def to_full_body(
         :mod:`coil_fem.presets.cross_section_fns`, and rectangular coil
         meshes (:class:`~coil_fem.meshing.FramedCurveMeshRectangle`).
     mesh_scale : float
-        Multiplier on gmsh ``MeshSizeMax`` used for the 2D surface mesh.
+        Multiplier on gmsh ``MeshSizeMax``.  The size is
+        ``mesh_scale * 0.5 * w1``.
     path : path-like
         Output VTU path (default ``full_body_fields.vtu``).
-    output_msh : bool
-        Not supported on the fTetWild path; raises ``NotImplementedError``
-        if ``True``.
-    epsilon : float
-        fTetWild relative envelope — fraction of the device bounding-box
-        diagonal.  Features thinner than ``epsilon * diag`` may be
-        absorbed.  Default ``5e-4`` gives ~5 mm on a 10 m device, safely
-        below ``t_beam = 30 mm``.  Decrease if thin walls are lost.
+    beam_length_factor : float
+        Beam solids are built with length ``beam_length_factor * L``
+        (default 0.95) so the far end pulls back from the mating solid.
+        Must be positive.
 
     Returns
     -------
     pathlib.Path
         Path written.
+
+    Raises
+    ------
+    ValueError
+        Rectangular meshes or an OCC solid factory are missing, or
+        ``beam_length_factor`` is not positive.
+    RuntimeError
+        The OCC fragment failed.  Lower ``beam_length_factor``, or use
+        the wildmeshing path in ``gmsh.py.old``.
     """
-    if output_msh:
-        raise NotImplementedError(
-            "output_msh is not supported on the fTetWild path; the volume "
-            "mesh is never held in a gmsh session."
+    if beam_length_factor <= 0.0:
+        raise ValueError(
+            f"beam_length_factor must be positive, got {beam_length_factor}"
         )
 
-    try:
-        import wildmeshing as wm
-    except ImportError as exc:
-        raise ImportError(
-            "to_full_body requires wildmeshing: pip install wildmeshing"
-        ) from exc
-
     path = Path(path)
-    coil_support = Jstress._coil_support
+    coil_support = Jstress.coil_support
     fem = Jstress.fem
     support = fem.support
     meshes = fem.meshes
@@ -333,7 +348,6 @@ def to_full_body(
 
     mesh_opts = fem.mesh_opts[0]
     w1 = float(mesh_opts["w1"])
-    w2 = float(mesh_opts["w2"])
     E = float(fem._E)
     nu = float(fem._nu)
     rho = float(fem._rho)
@@ -349,14 +363,12 @@ def to_full_body(
     k_clamp = float(support.k_clamp)
 
     geom = support.beam_geometry(curves, sdofs)
-
     nfp, stellsym = support.nfp, support.stellsym
     Q_list = _symmetry_Qs(nfp, stellsym)
-
     size_max = mesh_scale * 0.5 * w1
 
     # =========================================================================
-    # Phase 1: 2D surface mesh of the base sector (no boolean)
+    # Phase 1–4: OCC fragment, physical groups, gmsh volume mesh
     # =========================================================================
     try:
         owned = not gmsh.isInitialized()
@@ -369,24 +381,44 @@ def to_full_body(
     try:
         gmsh.model.add("device")
         occ = gmsh.model.occ
+        beam_dimtags = _beam_solids(
+            occ, support, sdofs, geom, solid_fn,
+            length_factor=beam_length_factor,
+        )
+        inputs, owners = _fragment_inputs(occ, meshes, Q_list, beam_dimtags)
+        print(
+            f"to_full_body: fragment {len(inputs)} solids "
+            f"(beam_length_factor={beam_length_factor})"
+        )
+        try:
+            _ov, ov_map = occ.fragment(inputs, [])
+            occ.synchronize()
+        except Exception as exc:
+            raise RuntimeError(
+                "to_full_body: OCC fragment failed (BOPAlgo). "
+                f"Lower beam_length_factor (currently {beam_length_factor}) "
+                "to shrink beam solids away from the coil surface, or use "
+                "the wildmeshing path in gmsh.py.old."
+            ) from exc
+        if len(ov_map) != len(owners):
+            raise RuntimeError(
+                "to_full_body: fragment map length "
+                f"{len(ov_map)} != {len(owners)} inputs"
+            )
 
-        solids = _beam_solids(occ, support, sdofs, geom, solid_fn)
-        coil_solids = [_coil_solid(occ, m) for m in meshes]
-        # Synchronise without fusing — avoids the BOPAlgo sliver failures.
-        occ.synchronize()
+        owner_map = _entity_owner_map(ov_map, owners)
+        conductor_tags = [t for t, (c, _s) in owner_map.items() if c >= 0]
+        support_tags = [t for t, (c, _s) in owner_map.items() if c < 0]
+        if conductor_tags:
+            gmsh.model.addPhysicalGroup(3, conductor_tags, name="conductor")
+        if support_tags:
+            gmsh.model.addPhysicalGroup(3, support_tags, name="support")
 
         gmsh.option.setNumber("Mesh.MeshSizeMax", size_max)
-        gmsh.model.mesh.generate(2)
-
-        _, tri_nodes = gmsh.model.mesh.getElementsByType(2)
-        node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
-        V_base = np.asarray(node_coords, dtype=np.float64).reshape(-1, 3)
-        node_tags = np.asarray(node_tags, dtype=np.int64)
-        lut = np.zeros(int(node_tags.max()) + 1, dtype=np.int64)
-        lut[node_tags] = np.arange(node_tags.size)
-        F_base = lut[
-            np.asarray(tri_nodes, dtype=np.int64).reshape(-1, 3)
-        ].astype(np.int32)
+        gmsh.option.setNumber("Mesh.ElementOrder", 2)
+        print(f"to_full_body: meshing, MeshSizeMax={size_max:.4g}")
+        gmsh.model.mesh.generate(3)
+        points, cells, owner_coil, owner_sym = _extract_tet10(owner_map)
     finally:
         if owned:
             gmsh.finalize()
@@ -394,46 +426,18 @@ def to_full_body(
             gmsh.clear()
 
     # =========================================================================
-    # Phase 2: apply stellarator symmetry to get the full-device soup
+    # Phase 5: counts + VTU
     # =========================================================================
-    n_base_v = len(V_base)
-    V_soup = np.vstack([V_base @ Q.T for Q in Q_list])
-    F_soup = np.vstack(
-        [F_base + i * n_base_v for i in range(len(Q_list))]
-    ).astype(np.int32)
-
-    # =========================================================================
-    # Phase 3: fTetWild volume mesh
-    # =========================================================================
-    diag = float(np.linalg.norm(V_soup.max(axis=0) - V_soup.min(axis=0)))
-    print(
-        f"to_full_body: fTetWild soup {V_soup.shape[0]} verts "
-        f"{F_soup.shape[0]} tris, diag={diag:.3g}, "
-        f"edge_length_r={size_max / diag:.4g}, epsilon={epsilon:.2g}"
-    )
-    tet = wm.Tetrahedralizer(
-        stop_quality=10,
-        epsilon=epsilon,
-        edge_length_r=size_max / diag,
-    )
-    tet.set_mesh(V_soup, F_soup)
-    tet.tetrahedralize()
-    VT, TT, _ = tet.get_tet_mesh()
-    VT = np.asarray(VT, dtype=np.float64)
-    TT = np.asarray(TT, dtype=np.int64)
-
-    X, cells = _tet4_to_tet10(VT, TT)
-
-    owner_coil, owner_sym = _classify_nodes(X, meshes, Q_list, w1, w2)
-
-    n_nodes = int(X.shape[0])
+    n_nodes = int(points.shape[0])
     n_cells = int(cells.shape[0])
-    coil_node = owner_coil >= 0
-    n_coil_nodes = int(np.count_nonzero(coil_node))
-    n_support_nodes = n_nodes - n_coil_nodes
-    coil_cell = coil_node[cells[:, :4]].mean(axis=1) >= 0.5
+    coil_cell = owner_coil >= 0
     n_coil_cells = int(np.count_nonzero(coil_cell))
     n_support_cells = n_cells - n_coil_cells
+    if n_coil_cells:
+        n_coil_nodes = int(np.unique(cells[coil_cell]).size)
+    else:
+        n_coil_nodes = 0
+    n_support_nodes = n_nodes - n_coil_nodes
     print(
         "to_full_body mesh counts:\n"
         f"  all bodies:       {n_nodes} nodes, {n_cells} cells\n"
@@ -457,7 +461,7 @@ def to_full_body(
 
     _write_vtu(
         path,
-        points=X,
+        points=points,
         cells=cells,
         owner_coil=owner_coil,
         owner_sym=owner_sym,
