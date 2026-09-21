@@ -53,15 +53,22 @@ fem = CoilFEM(
     problem_options  = problem_options,
 )
 
-# Forward solve + export — one *_run.vtu per base coil
-paths = fem.save_run_vtu(out_dir="vtu_out", prefix="coil")
+# Forward solve + export — one merged *_coils.vtu for all base coils
+paths = fem.to_vtu(out_dir="vtu_out", prefix="coil")
 ```
 
-This writes, for each base coil `i`:
+This writes a single merged file:
 
 ```
-vtu_out/coil{i:02d}_run.vtu
+vtu_out/coil_coils.vtu
 ```
+
+> **Merged output.**  All base coils now live in one `{prefix}_coils.vtu`
+> mesh, with a cell field `owner_coil` giving the base-coil index of every
+> cell.  The per-coil example scripts below assume the older one-file-per-coil
+> layout; to reproduce them, first split the merged mesh by `owner_coil`
+> (e.g. `grid.threshold([i, i], scalars="owner_coil")` in PyVista) and iterate
+> over the resulting per-coil subsets.
 
 | Field | Type | Unit | Content |
 |---|---|---|---|
@@ -616,9 +623,9 @@ following layout and Python driver streamline repeating the full workflow.
 
 ```
 runs/
-  coarse/          ← coil*_run.vtu from save_run_vtu(mesh_options={aspect_ratio:2})
-  medium/          ← coil*_run.vtu from save_run_vtu(mesh_options={aspect_ratio:1})
-  fine/            ← coil*_run.vtu from save_run_vtu(mesh_options={aspect_ratio:0.5})
+  coarse/          ← coil_coils.vtu from to_vtu(mesh_options={aspect_ratio:2})
+  medium/          ← coil_coils.vtu from to_vtu(mesh_options={aspect_ratio:1})
+  fine/            ← coil_coils.vtu from to_vtu(mesh_options={aspect_ratio:0.5})
 ```
 
 Each subfolder will receive the derived files created by the Python steps above.
