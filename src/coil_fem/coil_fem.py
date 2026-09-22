@@ -1327,7 +1327,7 @@ class CoilFEM:
         out_dir: str = ".",
         *,
         run: bool = True,
-        prefix: str = "coil",
+        prefix: str = "",
         base_curves_dofs: list[jax.Array] | None = None,
         base_currents_dofs: jax.Array | None = None,
         base_support_dofs: dict | None = None,
@@ -1336,7 +1336,7 @@ class CoilFEM:
         """Export the coil meshes (and support / beams) as VTU files.
 
         All base coils are written into a single
-        ``{out_dir}/{prefix}_coils.vtu`` as one unstructured mesh, with an
+        ``{out_dir}/{prefix}coils.vtu`` as one unstructured mesh, with an
         ``owner_coil`` int cell field giving the base-coil index of every cell
         (no ``owner_sym`` — only one field period / half-period is exported).
         When ``run`` is ``True`` a forward FEM solve is performed and the
@@ -1345,7 +1345,7 @@ class CoilFEM:
 
         Files written:
 
-        * ``{out_dir}/{prefix}_coils.vtu`` — merged conductor mesh.
+        * ``{out_dir}/{prefix}coils.vtu`` — merged conductor mesh.
 
           - point fields ``w_clamp``, ``w_attach``, ``k_clamp_Npm3``,
             ``k_attach_Npm3`` — grounded-clamp / beam-attachment weights and
@@ -1360,14 +1360,14 @@ class CoilFEM:
           - cell fields ``B_self_T`` / ``B_ext_T`` — quad-averaged self /
             external field ``(n_cells, 3)`` [T] (``run`` only).
 
-        * ``{out_dir}/{prefix}_beams.vtu`` — beam free-span polyline, written
+        * ``{out_dir}/{prefix}beams.vtu`` — beam free-span polyline, written
           only when ``base_support_dofs`` is given and the support has beams.
           With ``run`` each beam is subdivided into ``n_sub`` segments carrying
           the closed-form ``displacement_m``; without ``run`` a single straight
           segment per beam on ``[ξ_start, ξ_end]`` is written.  Cell fields
           ``beam_type`` (CC=0, CF=1), ``coil_index``, ``beam_length``.
 
-        * ``{out_dir}/{prefix}_{name}.vtu`` — one file per
+        * ``{out_dir}/{prefix}{name}.vtu`` — one file per
           :attr:`~coil_fem.coupling.Support.continuum_members` entry, with the
           support weights (and ``displacement_m`` / ``von_mises_MPa`` when
           ``run``).
@@ -1494,7 +1494,7 @@ class CoilFEM:
         cell_data = {k: [onp.concatenate(v)] for k, v in cell_accum.items() if v}
         cell_data["owner_coil"] = [onp.concatenate(owner_coil)]
 
-        coils_path = os.path.join(out_dir, f"{prefix}_coils.vtu")
+        coils_path = os.path.join(out_dir, f"{prefix}coils.vtu")
         meshio.Mesh(
             points=onp.vstack(all_points),
             cells=[(cell_type, onp.vstack(all_conn))],
@@ -1503,82 +1503,51 @@ class CoilFEM:
         ).write(coils_path)
         written.append(coils_path)
 
-        # Beam free-span mesh (SupportBeams only).
-        if base_support_dofs is not None:
-            if (run and result['u_s'] is not None
-                    and hasattr(self.support, 'beam_displacement')
-                    and self.support.n_beams_total > 0):
-                # Subdivided polyline carrying closed-form beam displacement.
-                geom = self.support.beam_geometry(curves_jax, base_support_dofs)
-                xi_start = geom['xi_start']
-                xi_end = geom['xi_end']
-                t = jnp.linspace(0.0, 1.0, n_sub + 1)
-                xi = xi_start[:, None] + t[None, :] * (
-                    xi_end[:, None] - xi_start[:, None]
-                )
-                disp = onp.asarray(
+        # Beam free-span mesh (SupportBeams only). The no-solve case is just
+        # the solved case with one segment per beam and no displacement.
+        if (base_support_dofs is not None
+                and hasattr(self.support, 'n_beams_total')
+                and self.support.n_beams_total > 0):
+            solved = run and result['u_s'] is not None
+            n_seg = n_sub if solved else 1
+            geom = self.support.beam_geometry(curves_jax, base_support_dofs)
+            x_s = onp.asarray(geom['x_start'], dtype=onp.float64)
+            x_e = onp.asarray(geom['x_end'], dtype=onp.float64)
+
+            t = jnp.linspace(0.0, 1.0, n_seg + 1)
+            xi = geom['xi_start'][:, None] + t[None, :] * (
+                geom['xi_end'] - geom['xi_start']
+            )[:, None]
+            xi_np = onp.asarray(xi, dtype=onp.float64)
+            pts = x_s[:, None, :] + xi_np[..., None] * (x_e - x_s)[:, None, :]
+            n_beams, n_pts_per_beam, _ = pts.shape
+
+            base_idx = (onp.arange(n_beams) * n_pts_per_beam)[:, None]
+            local = onp.arange(n_seg)[None, :]
+            conn = onp.stack([base_idx + local, base_idx + local + 1], axis=-1)
+            conn = conn.reshape(-1, 2).astype(onp.int32)
+
+            point_data = {}
+            if solved:
+                point_data["displacement_m"] = onp.asarray(
                     self.support.beam_displacement(geom, result['u_s'], xi),
                     dtype=onp.float64,
-                )  # (N_beams, n_sub+1, 3)
+                ).reshape(-1, 3)
 
-                x_s = onp.asarray(geom['x_start'], dtype=onp.float64)
-                x_e = onp.asarray(geom['x_end'], dtype=onp.float64)
-                xi_np = onp.asarray(xi, dtype=onp.float64)
-                pts = x_s[:, None, :] + xi_np[..., None] * (x_e - x_s)[:, None, :]
-
-                n_beams, n_pts_per_beam, _ = pts.shape
-                pts_flat = pts.reshape(-1, 3)
-                disp_flat = disp.reshape(-1, 3)
-
-                base_idx = (onp.arange(n_beams) * n_pts_per_beam)[:, None]
-                local = onp.arange(n_sub)[None, :]
-                conn = onp.stack([base_idx + local, base_idx + local + 1], axis=-1)
-                conn = conn.reshape(-1, 2).astype(onp.int32)
-
-                coil_idx_arr, beam_type = self.support.beam_labels()
-                L_eff = onp.asarray(geom['L_eff'], dtype=onp.float64)
-                beam_path = os.path.join(out_dir, f"{prefix}_beams.vtu")
-                meshio.Mesh(
-                    points=pts_flat,
-                    cells=[("line", conn)],
-                    point_data={"displacement_m": disp_flat},
-                    cell_data={
-                        "beam_type":   [onp.repeat(beam_type, n_sub)],
-                        "coil_index":  [onp.repeat(coil_idx_arr, n_sub)],
-                        "beam_length": [onp.repeat(L_eff, n_sub)],
-                    },
-                ).write(beam_path)
-                written.append(beam_path)
-            elif not run and hasattr(self.support, 'beam_segments'):
-                # Straight free-segment endpoints (no solve).
-                geom = self.support.beam_geometry(curves_jax, base_support_dofs)
-                x_s = onp.asarray(geom['x_start'], dtype=onp.float64)
-                x_e = onp.asarray(geom['x_end'], dtype=onp.float64)
-                xi_s = onp.asarray(geom['xi_start'], dtype=onp.float64)[:, None]
-                xi_e = onp.asarray(geom['xi_end'], dtype=onp.float64)[:, None]
-                x_att_s = x_s + xi_s * (x_e - x_s)
-                x_att_e = x_s + xi_e * (x_e - x_s)
-                n_beams = x_s.shape[0]
-
-                pts_beams = onp.concatenate([x_att_s, x_att_e], axis=0)
-                conn = onp.column_stack([
-                    onp.arange(n_beams),
-                    onp.arange(n_beams, 2 * n_beams),
-                ]).astype(onp.int32)
-
-                coil_idx_arr, beam_type = self.support.beam_labels()
-                L_eff = onp.asarray(geom['L_eff'], dtype=onp.float64)
-                beam_path = os.path.join(out_dir, f"{prefix}_beams.vtu")
-                meshio.Mesh(
-                    points=pts_beams,
-                    cells=[("line", conn)],
-                    cell_data={
-                        "beam_type":   [beam_type],
-                        "beam_length": [L_eff],
-                        "coil_index":  [coil_idx_arr],
-                    },
-                ).write(beam_path)
-                written.append(beam_path)
+            coil_idx_arr, beam_type = self.support.beam_labels()
+            L_eff = onp.asarray(geom['L_eff'], dtype=onp.float64)
+            beam_path = os.path.join(out_dir, f"{prefix}beams.vtu")
+            meshio.Mesh(
+                points=pts.reshape(-1, 3),
+                cells=[("line", conn)],
+                point_data=point_data,
+                cell_data={
+                    "beam_type":   [onp.repeat(beam_type, n_seg)],
+                    "coil_index":  [onp.repeat(coil_idx_arr, n_seg)],
+                    "beam_length": [onp.repeat(L_eff, n_seg)],
+                },
+            ).write(beam_path)
+            written.append(beam_path)
 
         # Support continuum members (e.g. CSR ring).
         if base_support_dofs is not None and not (run and result['u_s'] is None):
@@ -1608,7 +1577,7 @@ class CoilFEM:
                         curves_jax, base_support_dofs, None,
                     )
                     cell_data_m = {}
-                member_path = os.path.join(out_dir, f"{prefix}_{member.name}.vtu")
+                member_path = os.path.join(out_dir, f"{prefix}{member.name}.vtu")
                 meshio.Mesh(
                     points=pts_np,
                     cells=[(
