@@ -74,7 +74,7 @@ class TestCurvedMidsides:
         pts = np.asarray(_rect_sweep_points(
             fc, 0.0, 0.0, N_, O_, mesh_type="TET10",
         ))
-        u, v, phi_idx, _ = _rect_sweep_topology(N, N_, O_, "TET10")
+        u, v, phi_idx, _, _ = _rect_sweep_topology(N, N_, O_, "TET10")
 
         M = N
         n_corners = M * N_ * O_
@@ -105,7 +105,7 @@ class TestCurvedMidsides:
         pts = np.asarray(_rect_sweep_points(
             fc, 0.0, 0.0, N_, O_, mesh_type="TET10",
         ))
-        u, v, phi_idx, _ = _rect_sweep_topology(N, N_, O_, "TET10")
+        u, v, phi_idx, _, _ = _rect_sweep_topology(N, N_, O_, "TET10")
 
         M = N
         n_corners = M * N_ * O_
@@ -180,7 +180,7 @@ class TestTopologyConvention:
     @pytest.mark.parametrize("mesh_type", ["TET4", "TET10"])
     def test_corner_index_layout(self, mesh_type):
         M, N, O = 8, 4, 3
-        u, v, phi_idx, cells = _rect_sweep_topology(M, N, O, mesh_type)
+        u, v, phi_idx, cells, _ = _rect_sweep_topology(M, N, O, mesh_type)
         u_grid = np.linspace(-1.0, 1.0, N)
         v_grid = np.linspace(-1.0, 1.0, O)
         stride = 2 if mesh_type == "TET10" else 1
@@ -200,7 +200,7 @@ class TestTopologyConvention:
     @pytest.mark.parametrize("mesh_type", ["TET4", "TET10"])
     def test_cell_corner_indices_in_range(self, mesh_type):
         M, N, O = 8, 4, 3
-        u, v, phi_idx, cells = _rect_sweep_topology(M, N, O, mesh_type)
+        u, v, phi_idx, cells, _ = _rect_sweep_topology(M, N, O, mesh_type)
         num_nodes = u.shape[0]
         assert cells.min() >= 0
         assert cells.max() < num_nodes
@@ -212,7 +212,7 @@ class TestTopologyConvention:
         from coil_fem.meshing import _TET10_VTK_EDGES
 
         M, N, O = 8, 4, 3
-        u, _, _, cells = _rect_sweep_topology(M, N, O, "TET10")
+        u, _, _, cells, _ = _rect_sweep_topology(M, N, O, "TET10")
         n_corners = M * N * O
         edges = np.sort(
             cells[:, :4][:, _TET10_VTK_EDGES].reshape(-1, 2), axis=1
@@ -224,7 +224,7 @@ class TestTopologyConvention:
         """Every midside index in cells should be distinct -- the new
         topology shouldn't accidentally duplicate midpoint slots."""
         M, N, O = 4, 3, 3
-        _, _, _, cells = _rect_sweep_topology(M, N, O, "TET10")
+        _, _, _, cells, _ = _rect_sweep_topology(M, N, O, "TET10")
         # cells[:, 4:] holds the 6 midside indices for every tet.
         # We just check that there are no out-of-range indices and that
         # the per-row indices are unique (no two edges share a midside in
@@ -286,7 +286,7 @@ class TestConformity:
         """Every triangular corner-face is on the boundary (1 tet) or shared
         by exactly 2 tets — never more, and no crossing/dangling faces."""
         M, N, O = 6, 4, 3
-        _, _, _, cells = _rect_sweep_topology(M, N, O, mesh_type)
+        _, _, _, cells, _ = _rect_sweep_topology(M, N, O, mesh_type)
         corners = cells[:, :4]
         local_faces = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
         faces = np.sort(corners[:, local_faces].reshape(-1, 3), axis=1)

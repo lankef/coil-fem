@@ -184,9 +184,7 @@ class SupportBeamsCSR(SupportBeams):
         csr_po = {**self._problem_options, 'solver': 'cudss'}
         self._csr_pipeline = ElasticPipeline(
             self.csr_mesh,
-            float(opt['E']),
-            float(opt['nu']),
-            None,
+            [{'E': float(opt['E']), 'nu': float(opt['nu'])}],
             (0.0, 0.0, 0.0),
             csr_po,
         )

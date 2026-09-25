@@ -693,8 +693,8 @@ class SupportBeams(Support):
                 b.append(float(m.radius))
             elif m.shape == 'rect':
                 is_disk.append(False)
-                a.append(float(m.w1))
-                b.append(float(m.w2))
+                a.append(float(m.w1_outer))
+                b.append(float(m.w2_outer))
             else:
                 raise ValueError(
                     f"bind_coil_meshes: unsupported mesh shape {m.shape!r}."

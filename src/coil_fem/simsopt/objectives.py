@@ -83,8 +83,12 @@ class CoilFEMObjective(Optimizable):
         ``metrics``.
     mesh_options : dict or list[dict]
         Mesh construction options forwarded to :class:`~coil_fem.CoilFEM`.
-    material_options : dict or None
-        Material properties (``'E'``, ``'nu'``, ``'density'``, ``'itc'``).
+    winding_pack_options : dict or None
+        Winding-pack material properties (``'E'``, ``'nu'``, ``'density'``,
+        ``'itc'``).
+    casing_options : dict or None
+        Casing material properties, same keys plus ``'thickness'`` [m].
+        ``None`` means no casing.
     problem_options : dict or None
         Solver options forwarded to :class:`~coil_fem.CoilFEM`
         (including ``'remat_bs'``, default True).
@@ -127,7 +131,8 @@ class CoilFEMObjective(Optimizable):
         metrics: Sequence[str],
         metric_weights: Sequence[float],
         mesh_options,
-        material_options=None,
+        winding_pack_options=None,
+        casing_options=None,
         problem_options=None,
         gravity_options=None,
         physics_options=None,
@@ -155,7 +160,8 @@ class CoilFEMObjective(Optimizable):
 
         # Store constructor args for serialisation introspection.
         self._mesh_options     = mesh_options
-        self._material_options = material_options
+        self._winding_pack_options = winding_pack_options
+        self._casing_options = casing_options
         self._problem_options  = problem_options
         self._gravity_options  = gravity_options
         self._physics_options  = physics_options
@@ -183,7 +189,8 @@ class CoilFEMObjective(Optimizable):
             mesh_options,
             support=coil_support.support,
             gravity_options=gravity_options,
-            material_options=material_options,
+            winding_pack_options=winding_pack_options,
+            casing_options=casing_options,
             problem_options=problem_options,
             physics_options=physics_options,
             coupling=coupling,

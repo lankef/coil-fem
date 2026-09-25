@@ -61,7 +61,7 @@ def _build_prob_dict(mesh_type, N=32, R=1.0, w1=0.05, w2=0.03):
     )
 
     pipeline = ElasticPipeline(
-        mesh, 200e9, 0.3, None, (0., 0., 0.), {'solver': 'umfpack'},
+        mesh, [{'E': 200e9, 'nu': 0.3}], (0., 0., 0.), {'solver': 'umfpack'},
     )
     prob = pipeline.problem
 

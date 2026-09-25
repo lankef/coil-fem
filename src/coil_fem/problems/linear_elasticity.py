@@ -179,18 +179,19 @@ class LinearElasticity3D(DeviceProblem):
 
     Parameters
     ----------
-    ``additional_info`` is a tuple ``(E, nu, body_force[, itc])``:
+    ``additional_info`` is a tuple ``(materials, material_id, g_vec)``:
 
-    E : float
-        Young's modulus [Pa].
-    nu : float
-        Poisson's ratio.
-    body_force : tuple[float, float, float] or callable
-        Body force [N/m³] for forward-only solves.  For the differentiable
-        path supply ``params['body_force']`` instead.
-    itc : float, optional
-        Integral thermal contraction ``ΔL/L`` (positive, dimensionless).
-        Pre-computes eigenstrain ``ε_th = −itc · I`` at construction.
+    materials : list of dict
+        One dict per material index.  Required keys ``'E'`` [Pa] and
+        ``'nu'``.  Optional ``'density'`` [kg/m³] (default 0), ``'itc'``
+        (integral thermal contraction ``ΔL/L``, default 0) and
+        ``'current_weight'`` (default 1).
+    material_id : array, shape (n_cells,)
+        Non-negative integer material index of each cell.
+    g_vec : tuple of float
+        Gravity acceleration [m/s²].  The initial body force is
+        ``density * g_vec``; the differentiable path supplies
+        ``params['body_force']`` instead.
 
     Examples
     --------
@@ -198,7 +199,9 @@ class LinearElasticity3D(DeviceProblem):
 
         problem = LinearElasticity3D(
             mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-            additional_info=(200e9, 0.3, (0., 0., 0.)),
+            additional_info=(
+                [{'E': 200e9, 'nu': 0.3}], mesh.material_id, (0., 0., 0.),
+            ),
         )
         fwd_pred = ad_wrapper(problem)
         params = {
@@ -220,48 +223,41 @@ class LinearElasticity3D(DeviceProblem):
     #: unknown.
     is_linear: bool = True
 
-    def custom_init(
-        self,
-        E: float,
-        nu: float,
-        body_force,
-        itc: float | None = None,
-    ):
+    def custom_init(self, materials, material_id, g_vec):
         """JAX-FEM hook called by ``Problem.__init__`` after mesh setup.
 
-        Stores material constants, pre-computes the thermal eigenstrain (if an
-        ``itc`` fraction is provided), caches static reference-element
-        arrays for use in :meth:`set_params`, and evaluates the initial
-        body-force at quadrature points for forward-only solves.
+        Builds per-material tables and the per-quadrature-point fields used
+        by the weak form, and caches static reference-element arrays for
+        :meth:`set_params`.
 
         Parameters
         ----------
-        E : float
-            Young's modulus [Pa].
-        nu : float
-            Poisson's ratio.
-        body_force : tuple[float, float, float] or callable
-            Body force [N/m³].  A 3-tuple gives a uniform force; a callable
-            ``f(x) -> jnp.array(3)`` gives a position-dependent force.  Used
-            only for forward-only solves; for the differentiable path supply
-            ``params['body_force']`` to :meth:`set_params`.
-        itc : float, optional
-            Integral thermal contraction ``ΔL/L`` on cooldown (positive,
-            dimensionless).  Pre-computes the constant eigenstrain
-            ``ε_th = −itc · I``.
+        materials : list of dict
+            See the class docstring.
+        material_id : array, shape (n_cells,)
+            Material index of each cell.
+        g_vec : tuple of float
+            Gravity acceleration [m/s²] for the initial body force.
         """
-        self.E = float(E)
-        self.nu = float(nu)
-        self.lam, self.mu = lame_parameters(E, nu)
-
-        # Thermal eigenstrain — pre-computed once since the integral thermal
-        # contraction is a fixed scalar (not an optimizable DOF).  Uniform
-        # contraction throughout the coil is assumed: ε_th = −itc · I.
-        self.itc = float(itc) if itc is not None else None
-        if self.itc is not None:
-            self.epsilon_th = itc_strain(self.itc)
-        else:
-            self.epsilon_th = None
+        # ============================================================================
+        # Material tables (one entry per material index)
+        # ============================================================================
+        material_id = onp.asarray(material_id, dtype=onp.int32)
+        n_mat = len(materials)
+        if material_id.min() < 0 or material_id.max() >= n_mat:
+            raise ValueError(
+                f"material_id must lie in [0, {n_mat}); got "
+                f"[{material_id.min()}, {material_id.max()}]."
+            )
+        lame = [lame_parameters(m['E'], m['nu']) for m in materials]
+        self.lam_list = jnp.asarray([l for l, _ in lame])
+        self.mu_list  = jnp.asarray([mu for _, mu in lame])
+        self.rho_list = jnp.asarray([m.get('density', 0.0) for m in materials])
+        self.current_weight_list = jnp.asarray(
+            [m.get('current_weight', 1.0) for m in materials]
+        )
+        self.eps_th_list = jnp.stack([itc_strain(m.get('itc', 0.0)) for m in materials])
+        has_itc = any('itc' in m for m in materials)
 
         # Cache static reference-element data for recompute_fe_geometry.
         fe = self.fes[0]
@@ -356,32 +352,22 @@ class LinearElasticity3D(DeviceProblem):
         # These are built once here and reused in set_params every forward pass.
         self._build_winkler_surface_maps()
 
-        # Build body-force callable for forward-only evaluation.
-        if callable(body_force):
-            bf_fn = body_force
-        else:
-            f = jnp.asarray(body_force, dtype=jnp.float64).reshape(3)
-            bf_fn = lambda x: f
-
-        # Evaluate body force at the initial quad points.  Result used as
-        # internal_vars for forward-only solves; overwritten by set_params.
-        pqp = jnp.asarray(self.physical_quad_points)  # (num_cells, num_quads, dim)
-        bf_at_quads = jax.vmap(jax.vmap(bf_fn))(pqp)  # (num_cells, num_quads, 3)
-
-        # Build initial per-quad material arrays for internal_vars.
-        # set_params overwrites these on every differentiable forward pass.
-        n_cells = fe.num_cells
+        # ============================================================================
+        # Per-quad material fields (static lookups into the material tables)
+        # ============================================================================
         n_quads = int(self._qw.shape[0])
-        lam_q_init = jnp.full((n_cells, n_quads), self.lam)
-        mu_q_init  = jnp.full((n_cells, n_quads), self.mu)
-        if self.epsilon_th is not None:
-            eps_th_q_init = jnp.broadcast_to(
-                self.epsilon_th[None, None], (n_cells, n_quads, 3, 3)
-            )
-        else:
-            eps_th_q_init = jnp.zeros((n_cells, n_quads, 3, 3), dtype=jnp.float64)
+        self.material_id_q = onp.repeat(material_id[:, None], n_quads, axis=1)
+        self.lam_q = self.lam_list[self.material_id_q]            # (n_cells, n_quads)
+        self.mu_q  = self.mu_list[self.material_id_q]
+        self.rho_q = self.rho_list[self.material_id_q]
+        self.current_weight_q = self.current_weight_list[self.material_id_q]
+        self.eps_th_q = self.eps_th_list[self.material_id_q]      # (n_cells, n_quads, 3, 3)
+        # ``None`` keeps the isothermal fast path in metrics._resolve_epsilon_th.
+        self.epsilon_th = self.eps_th_q if has_itc else None
 
-        self.internal_vars = [bf_at_quads, lam_q_init, mu_q_init, eps_th_q_init]
+        # Initial body force (gravity only); overwritten by set_params.
+        bf_at_quads = self.rho_q[..., None] * jnp.asarray(g_vec, dtype=jnp.float64)
+        self.internal_vars = [bf_at_quads, self.lam_q, self.mu_q, self.eps_th_q]
 
     def _build_winkler_surface_maps(self):
         """Build static face-to-surface-node index maps.
@@ -729,29 +715,11 @@ class LinearElasticity3D(DeviceProblem):
         k_at_quad = params['support_k'].reshape(num_sel, num_fq)
         self.nanson_scale[0] = (k_at_quad * ns_geom)[:, None, :]
 
-        # Build per-quad constitutive arrays.  Fall back to uniform scalar
-        # values (broadcast) when not supplied in params — this keeps the
-        # differentiable path lean for the common uniform-material case while
-        # allowing spatially varying fields to be injected via params later.
-        n_cells = self._cells_jnp.shape[0]
-        n_quads = int(self._qw.shape[0])
-
-        lam_q = params.get('lam_q', None)
-        if lam_q is None:
-            lam_q = jnp.full((n_cells, n_quads), self.lam)
-
-        mu_q = params.get('mu_q', None)
-        if mu_q is None:
-            mu_q = jnp.full((n_cells, n_quads), self.mu)
-
-        eps_th_q = params.get('eps_th_q', None)
-        if eps_th_q is None:
-            if self.epsilon_th is not None:
-                eps_th_q = jnp.broadcast_to(
-                    self.epsilon_th[None, None], (n_cells, n_quads, 3, 3)
-                )
-            else:
-                eps_th_q = jnp.zeros((n_cells, n_quads, 3, 3), dtype=jnp.float64)
+        # Per-quad constitutive arrays.  Fall back to the fields built in
+        # custom_init; params may still override them.
+        lam_q    = params.get('lam_q', self.lam_q)
+        mu_q     = params.get('mu_q', self.mu_q)
+        eps_th_q = params.get('eps_th_q', self.eps_th_q)
 
         # internal_vars order matches _INTERNAL_VAR_NAMES exactly.
         self.internal_vars = [params['body_force'], lam_q, mu_q, eps_th_q]
@@ -775,7 +743,7 @@ class LinearElasticity3D(DeviceProblem):
         jnp.ndarray, (num_cells, num_quads)
             Von Mises stress [Pa].
         """
-        return von_mises_on_quadrature(self, sol_list, self.lam, self.mu)
+        return von_mises_on_quadrature(self, sol_list, self.lam_q, self.mu_q)
 
     def strain_tensors(
         self,
@@ -787,8 +755,8 @@ class LinearElasticity3D(DeviceProblem):
         Small-strain additive decomposition ``ε = ε_elastic + ε_th`` (see
         :func:`itc_strain`).  The total strain is purely geometric,
         ``ε = ½(∇u + ∇uᵀ)``, derived from the displacement field; the thermal
-        eigenstrain ``ε_th = −itc · I`` is the spatially-uniform
-        constant pre-computed at construction and stored as ``self.epsilon_th``.
+        eigenstrain ``ε_th = −itc · I`` is pre-computed per material at
+        construction and stored as ``self.epsilon_th``.
         The stress-producing elastic strain is recovered as
         ``ε_total − ε_thermal``.
 
@@ -809,11 +777,9 @@ class LinearElasticity3D(DeviceProblem):
         -------
         eps_total : jnp.ndarray, (num_cells, num_quads, 3, 3)
             Total strain tensor at every quadrature point.
-        eps_thermal : jnp.ndarray, (3, 3)
-            Uniform thermal eigenstrain.  Zeros when no thermal parameters were
-            configured.  Left un-broadcast for memory efficiency; subtract it
-            from ``eps_total`` (broadcasts automatically) to obtain the elastic
-            strain.
+        eps_thermal : jnp.ndarray, (num_cells, num_quads, 3, 3) or (3, 3)
+            Per-quadrature-point thermal eigenstrain, or a ``(3, 3)`` zero
+            tensor when no material has an ``itc``.
         """
         u_grads = displacement_gradient_at_quads(sol_list[0], self, shape_grads=shape_grads)
         eps_total = 0.5 * (u_grads + jnp.swapaxes(u_grads, -1, -2))

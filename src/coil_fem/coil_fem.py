@@ -29,10 +29,7 @@ from .geo import (
 from .meshing import FramedCurveMesh
 from .magnetic import biot_savart, B_self_quadrature, lorentz_body_force
 
-from .problems import (
-    lame_parameters,
-    recompute_fe_geometry,
-)
+from .problems import recompute_fe_geometry
 from .pipelines import ElasticPipeline, ThermoElasticPipeline
 from .coupling import (
     Support,
@@ -213,16 +210,21 @@ class CoilFEM:
     gravity_options : dict or None
         If provided, enables a uniform gravitational body force ``ρ·g``.  May
         contain ``'g_vec'`` (default ``(0, 0, -9.80665)``).  The mass density
-        ``ρ`` is always taken from ``material_options['density']``.
-    material_options : dict or None
-        Elastic and thermal material parameters.  Keys:
+        ``ρ`` is taken per material from ``winding_pack_options`` and, when
+        present, ``casing_options``.
+    winding_pack_options : dict
+        Elastic and thermal material parameters of the winding pack.  Keys:
 
-        * ``'E'`` : float [Pa] — Young's modulus (default 200 GPa).
-        * ``'nu'`` : float — Poisson ratio (default 0.3).
-        * ``'density'`` : float [kg/m³] — mass density (default 7800).
-        * ``'itc'`` : float — isotropic integral thermal contraction ``ΔL/L``
-          on cooldown (positive, dimensionless).  Applied as the eigenstrain
-          ``ε_th = −itc · I``.  Not a differentiable DOF.
+        * ``'E'`` : float [Pa] — Young's modulus.
+        * ``'nu'`` : float — Poisson ratio.
+        * ``'density'`` : float [kg/m³] — mass density.
+        * ``'itc'`` : float, optional — isotropic integral thermal contraction
+          ``ΔL/L`` on cooldown (positive, dimensionless).  Applied as the
+          eigenstrain ``ε_th = −itc · I``.  Not a differentiable DOF.
+    casing_options : dict or None
+        Same keys as ``winding_pack_options``, plus ``'thickness'`` [m].
+        When given, a current-free casing of that thickness is added outside
+        a rectangular winding pack.  ``None`` (default) is no casing.
 
     problem_options : dict or None
         Numerical solver parameters.  Keys:
@@ -254,7 +256,8 @@ class CoilFEM:
         mesh_options: dict | list[dict],
         support: Support,
         gravity_options: dict | None = None,
-        material_options: dict | None = None,
+        winding_pack_options: dict | None = None,
+        casing_options: dict | None = None,
         problem_options: dict | None = None,
         physics_options: dict | None = None,
         coupling: str = 'monolithic',
@@ -282,15 +285,24 @@ class CoilFEM:
         self.mesh_opts = _broadcast_mesh_opts(mesh_options, n_base)
         self.problem_options = _broadcast_problem_options(problem_options)
 
-        # ── 2. Material properties ────────────────────────────────────────────
-        self._E   = material_options['E']
-        self._nu  = material_options['nu']
-        self._rho = material_options['density']
-        self._lam, self._mu = lame_parameters(self._E, self._nu)
-        # Thermal eigenstrain parameter (optional; uniform contraction assumed).
-        # ``itc`` is the positive integral thermal contraction ΔL/L applied
-        # as ε_th = −itc · I.
-        self._itc = float(material_options['itc']) if 'itc' in material_options else None
+        # ============================================================================
+        # 2. Material tables (index 0 = winding pack, 1 = casing)
+        # ============================================================================
+        materials = [{**winding_pack_options, 'current_weight': 1.0}]
+        casing_thickness = None
+        if casing_options is not None:
+            if any(opt['shape'] != 'rect' for opt in self.mesh_opts):
+                raise NotImplementedError("casing_options requires shape='rect'.")
+            casing_thickness = float(casing_options['thickness'])
+            if casing_thickness <= 0.0:
+                raise ValueError("casing_options['thickness'] must be > 0.")
+            casing = {k: v for k, v in casing_options.items() if k != 'thickness'}
+            materials.append({**casing, 'current_weight': 0.0})
+        for i, m in enumerate(materials):
+            missing = {'E', 'nu', 'density'} - m.keys()
+            if missing:
+                raise ValueError(f"material {i} missing keys {sorted(missing)}.")
+        self.materials = materials
 
         # ── 3+4. Build per-coil pipelines (mesh + problem + fwd_pred) ───────────
         # Pipelines replace the separate self.meshes / self._problems /
@@ -300,10 +312,6 @@ class CoilFEM:
             self.gravity_options.get('g_vec', (0.0, 0.0, -9.80665))
             if self.gravity_options else (0.0, 0.0, 0.0)
         )
-        gravity_bf = (
-            self._rho * grav_vec if self.gravity_options else (0.0, 0.0, 0.0)
-        )
-
         _physics_type = (physics_options or {}).get('type', 'elastic')
         _valid_physics = {'elastic', 'thermoelastic'}
         if _physics_type not in _valid_physics:
@@ -317,7 +325,9 @@ class CoilFEM:
             frame_type = opt.get('frame', 'rmf')
             mesh_type  = opt.get('mesh_type', 'TET4')
             fc   = make_framed_curve(curve, frame_type)
-            mesh = FramedCurveMesh.from_options(fc, opt, mesh_type)
+            mesh = FramedCurveMesh.from_options(
+                fc, opt, mesh_type, casing_thickness=casing_thickness,
+            )
 
             pipeline_cls = (
                 ThermoElasticPipeline if _physics_type == 'thermoelastic'
@@ -325,8 +335,7 @@ class CoilFEM:
             )
             self.pipelines.append(
                 pipeline_cls(
-                    mesh, self._E, self._nu, self._itc,
-                    tuple(gravity_bf), self.problem_options,
+                    mesh, self.materials, tuple(grav_vec), self.problem_options,
                 )
             )
 
@@ -464,15 +473,19 @@ class CoilFEM:
         --------
         1. Evaluate tangent ``t_hat`` at FEM quad points via
            ``curve.gamma_eval(..., diff_order=1)`` (exact Fourier derivative).
-        2. Build current density ``J_q = (I / A) * t_hat_q``.
+        2. Build current density ``J_q = (I / A) * current_weight_q * t_hat_q``.
         3. Compute ``B_self_q`` via
            :func:`~coil_fem.magnetic.B_self_quadrature` (rect; raises for disk).
         4. Compute ``B_ext_q`` via :func:`~coil_fem.magnetic.biot_savart` at
            physical quad point positions.
-        5. ``f_vol = J_q × (B_self_q + B_ext_q)  +  rho * g``.
+        5. ``f_vol = J_q × (B_self_q + B_ext_q)  +  rho_q * g``.
         """
-        mesh    = self.meshes[coil_idx]
-        A       = mesh.cross_section_area
+        mesh = self.meshes[coil_idx]
+        prob = self.pipelines[coil_idx].problem
+        # A_conductor = w1 * w2 (winding-pack area).  A more general alternative
+        # is the cross-section integral of current_weight * dA, which would also
+        # cover multiple or partially conducting materials; kept as w1 * w2 for now.
+        A_conductor = mesh.cross_section_area
         n_cells = mesh.n_cells
         n_quads = mesh.n_quads
         phi_q   = mesh.phi_quad   # (n_cells, n_quads) — static
@@ -490,10 +503,7 @@ class CoilFEM:
         )
 
         # ── 2. Current density at FEM quad points (uniform current model) ─────
-        J_q = jnp.broadcast_to(
-            (I / A) * t_hat_q[:, :, :],   # ensure concrete shape
-            (n_cells, n_quads, 3),
-        )
+        J_q = (I / A_conductor) * prob.current_weight_q[..., None] * t_hat_q
 
         # ── 3. B_self at FEM quad points ──────────────────────────────────────
         cross_section: dict = {'shape': mesh.shape}
@@ -503,8 +513,10 @@ class CoilFEM:
         else:
             cross_section['radius'] = mesh.radius
 
+        # LHA self-field is defined for |u|, |v| <= 1; casing points are clipped
+        # to stay finite and are multiplied by J = 0 there.
         B_self_q = B_self_quadrature(
-            fc, I, cross_section, phi_q, mesh.uv_quad,
+            fc, I, cross_section, phi_q, jnp.clip(mesh.uv_quad, -1.0, 1.0),
         )   # (n_cells, n_quads, 3)
 
         # ── 4. B_ext at FEM quad points via Biot-Savart on physical mesh ──────
@@ -529,7 +541,7 @@ class CoilFEM:
                 self.gravity_options.get('g_vec', (0.0, 0.0, -9.80665)),
                 dtype=float,
             )
-            f_vol = f_vol + (self._rho * g)[None, None, :]
+            f_vol = f_vol + prob.rho_q[..., None] * g
 
         return f_vol, B_self_q, B_ext_q
 
@@ -804,7 +816,7 @@ class CoilFEM:
         small-strain additive split ``ε = ε_elastic + ε_th``: the total strain
         ``ε = ½(∇u + ∇uᵀ)`` is purely geometric, while the thermal eigenstrain
         ``ε_th = −itc · I`` is the spatially-uniform constant
-        configured via ``material_options``.  The stress-producing elastic
+        configured via ``winding_pack_options``.  The stress-producing elastic
         strain is ``eps_total - eps_thermal`` (broadcasts automatically).
 
         Intended for diagnostics and post-processing; no gradients are
@@ -965,7 +977,7 @@ class CoilFEM:
 
             for m, fn in zip(metrics, metric_fns):
                 val_i = fn(
-                    prob_i, sol, self._lam, self._mu,
+                    prob_i, sol, prob_i.lam_q, prob_i.mu_q,
                     shape_grads=sg_ext, JxW=jxw_ext,
                 )
                 if m in _METRIC_REGISTRY_MAX:
@@ -1351,6 +1363,7 @@ class CoilFEM:
             ``k_attach_Npm3`` — grounded-clamp / beam-attachment weights and
             stiffnesses [N/m³] (always).
           - cell field ``owner_coil`` — base-coil index per cell (always).
+          - cell field ``material_id`` — material index per cell (always).
           - point field ``displacement_m`` — nodal displacement
             ``(n_nodes, 3)`` [m] (``run`` only).
           - cell field ``von_mises_MPa`` — quad-averaged von Mises stress
@@ -1427,6 +1440,7 @@ class CoilFEM:
         }
         cell_accum: dict[str, list] = {
             "von_mises_MPa": [], "f_vol_Npm3": [], "B_self_T": [], "B_ext_T": [],
+            "material_id": [],
         }
         node_offset = 0
         cell_type = self.meshes[0].meshio_cell_type
@@ -1488,6 +1502,7 @@ class CoilFEM:
             all_points.append(pts_np)
             all_conn.append(conn)
             owner_coil.append(onp.full(conn.shape[0], i, dtype=onp.int32))
+            cell_accum["material_id"].append(onp.asarray(coil_mesh.material_id))
             node_offset += n_nodes
 
         point_data = {k: onp.concatenate(v) for k, v in pt_accum.items() if v}

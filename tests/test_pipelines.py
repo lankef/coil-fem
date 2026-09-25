@@ -44,10 +44,8 @@ def _make_tiny_pipeline(R: float = 1.0) -> ElasticPipeline:
         'TET4',
     )
     return ElasticPipeline(
-        mesh,
-        E=200e9, nu=0.3, itc=None,
-        gravity_bf=(0.0, 0.0, 0.0),
-        problem_options={'solver': 'umfpack'},
+        mesh, [{'E': 200e9, 'nu': 0.3}], (0.0, 0.0, 0.0),
+        {'solver': 'umfpack'},
     )
 
 
@@ -153,7 +151,7 @@ def test_coil_fem_has_pipelines_and_support():
         mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                       'n_grid_1': 1, 'n_grid_2': 1},
         support=support,
-        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
         verbose=0,
     )
 
@@ -190,7 +188,7 @@ def test_coil_fem_objective_finite():
         mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                       'n_grid_1': 1, 'n_grid_2': 1},
         support=support,
-        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
         verbose=0,
     )
 
@@ -217,9 +215,8 @@ def test_thermo_elastic_pipeline_solve_raises():
         'TET4',
     )
     stub = ThermoElasticPipeline(
-        mesh, E=200e9, nu=0.3, itc=None,
-        gravity_bf=(0.0, 0.0, 0.0),
-        problem_options={'solver': 'umfpack'},
+        mesh, [{'E': 200e9, 'nu': 0.3}], (0.0, 0.0, 0.0),
+        {'solver': 'umfpack'},
     )
     points     = jnp.asarray(mesh.points)
     body_force = jnp.zeros((mesh.n_cells, mesh.n_quads, 3))
