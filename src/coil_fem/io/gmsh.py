@@ -53,8 +53,8 @@ def _coil_solid(occ, mesh, n_slices: int = _N_SLICES):
     wires = []
     for k in range(n_slices):
         pts = [
-            occ.addPoint(*(r0[k] + 0.5 * mesh.w1 * u * p[k]
-                                 + 0.5 * mesh.w2 * v * q[k]))
+            occ.addPoint(*(r0[k] + 0.5 * mesh.w1_outer * u * p[k]
+                                 + 0.5 * mesh.w2_outer * v * q[k]))
             for (u, v) in corners
         ]
         lines = [occ.addLine(pts[a], pts[(a + 1) % 4]) for a in range(4)]

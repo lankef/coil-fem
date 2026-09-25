@@ -48,10 +48,8 @@ def _make_tiny_pipeline(R: float = 1.0) -> ElasticPipeline:
         'TET4',
     )
     return ElasticPipeline(
-        mesh,
-        E=200e9, nu=0.3, itc=None,
-        gravity_bf=(0.0, 0.0, 0.0),
-        problem_options={'solver': 'umfpack'},
+        mesh, [{'E': 200e9, 'nu': 0.3}], (0.0, 0.0, 0.0),
+        {'solver': 'umfpack'},
     )
 
 
@@ -71,7 +69,7 @@ def _make_coilfem(
         stellsym=False,
         mesh_options=mesh_opts,
         support=support if support is not None else Support(k_clamp=1e9),
-        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
         problem_options={'solver': 'umfpack'},
         coupling=coupling,
     )
@@ -177,7 +175,7 @@ def test_coilfem_invalid_coupling_raises():
             mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                           'n_grid_1': 1, 'n_grid_2': 1},
             support=Support(k_clamp=1e9),
-            material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+            winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
             problem_options={'solver': 'umfpack'},
             coupling='invalid_option',
         )

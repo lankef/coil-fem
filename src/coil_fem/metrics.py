@@ -109,12 +109,13 @@ def von_mises_on_quadrature(
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
         ``ad_wrapper`` output; ``sol_list[0]`` has shape ``(n_nodes, 3)``.
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
         Lamé parameters.
     shape_grads : jnp.ndarray or None
         Physical shape-function gradients; see module docstring.
     epsilon_th : jnp.ndarray or None
-        Thermal eigenstrain ``(3, 3)``.  Defaults to ``problem.epsilon_th``.
+        Thermal eigenstrain ``(3, 3)`` or ``(n_cells, n_quads, 3, 3)``.
+        Defaults to ``problem.epsilon_th``.
 
     Returns
     -------

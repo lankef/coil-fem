@@ -31,7 +31,7 @@ def _make_coilfem() -> CoilFEM:
         mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                       'n_grid_1': 1, 'n_grid_2': 1},
         support=Support(k_clamp=1e9),
-        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
         problem_options={'solver': 'umfpack'},
         coupling='staggered',
     )
@@ -116,7 +116,7 @@ def _make_coilfem_with_beams() -> tuple[CoilFEM, CurveXYZFourierJAX, dict]:
         mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                       'n_grid_1': 1, 'n_grid_2': 1},
         support=support,
-        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
         problem_options={'solver': 'umfpack'},
         coupling='staggered',
     )
@@ -254,7 +254,7 @@ def _make_coilfem_with_csr() -> tuple[CoilFEM, CurveXYZFourierJAX, dict]:
         mesh_options={'shape': 'rect', 'w1': 0.01, 'w2': 0.01,
                       'n_grid_1': 1, 'n_grid_2': 1},
         support=support,
-        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
         problem_options={'solver': 'umfpack'},
         coupling='staggered',
     )

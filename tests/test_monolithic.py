@@ -67,10 +67,8 @@ def _tiny_mesh(R: float = 1.0) -> FramedCurveMesh:
 
 def _make_pipeline(mesh: FramedCurveMesh, solver: str):
     return ElasticPipeline(
-        mesh,
-        E=200e9, nu=0.3, itc=None,
-        gravity_bf=(0.0, 0.0, 0.0),
-        problem_options={'solver': solver},
+        mesh, [{'E': 200e9, 'nu': 0.3}], (0.0, 0.0, 0.0),
+        {'solver': solver},
     )
 
 
@@ -82,7 +80,7 @@ def _gpu_problem(mesh: FramedCurveMesh) -> LinearElasticity3D:
     """
     problem = LinearElasticity3D(
         mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-        additional_info=(200e9, 0.3, (0.0, 0.0, 0.0), None),
+        additional_info=([{'E': 200e9, 'nu': 0.3}], mesh.material_id, (0.0, 0.0, 0.0)),
         gpu_assembly=True,
     )
     mesh.attach_ref_coords(problem)
@@ -291,7 +289,7 @@ def _tiny_support_beams_fem():
             'n_grid_1': 1, 'n_grid_2': 1,
         },
         support=support,
-        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
         problem_options={'solver': 'cudss'},
         coupling='monolithic',
     )

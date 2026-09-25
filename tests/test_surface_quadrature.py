@@ -56,10 +56,8 @@ def _make_pipeline(
         'TET4',
     )
     return ElasticPipeline(
-        mesh,
-        E=200e9, nu=0.3, itc=None,
-        gravity_bf=(0.0, 0.0, 0.0),
-        problem_options={'solver': 'umfpack'},
+        mesh, [{'E': 200e9, 'nu': 0.3}], (0.0, 0.0, 0.0),
+        {'solver': 'umfpack'},
     )
 
 

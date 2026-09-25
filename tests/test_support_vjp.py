@@ -90,7 +90,7 @@ def _tiny_support_beams_fem(*, k_attachment: float = 1e8):
             'n_grid_1': 1, 'n_grid_2': 1,
         },
         support=support,
-        material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+        winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
         problem_options={'solver': 'cudss'},
         coupling='monolithic',
     )

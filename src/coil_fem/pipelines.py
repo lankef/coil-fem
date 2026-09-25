@@ -15,7 +15,7 @@ import jax
 import jax.flatten_util
 import jax.numpy as jnp
 
-from .problems import LinearElasticity3D, lame_parameters
+from .problems import LinearElasticity3D
 from .solvers import build_fwd_pred, needs_gpu_assembly
 
 if TYPE_CHECKING:
@@ -33,16 +33,13 @@ class ElasticPipeline:
     Parameters
     ----------
     mesh : FramedCurveMesh
-        Coil cross-section mesh.
-    E : float
-        Young's modulus [Pa].
-    nu : float
-        Poisson's ratio.
-    itc : float or None
-        Integral thermal contraction ``ΔL/L`` (positive, dimensionless).
-        ``None`` for isothermal.
-    gravity_bf : tuple[float, float, float]
-        Constant gravity body-force component ``ρ g_vec`` [N/m³].
+        Coil cross-section mesh.  ``mesh.material_id`` selects the material
+        of each cell.
+    materials : list of dict
+        Per-material properties forwarded to
+        :class:`~coil_fem.problems.LinearElasticity3D`.
+    g_vec : tuple[float, float, float]
+        Gravity acceleration [m/s²].  The body force is ``density * g_vec``.
     problem_options : dict
         Options forwarded to :func:`~coil_fem.solvers.build_fwd_pred`.
     """
@@ -50,25 +47,19 @@ class ElasticPipeline:
     def __init__(
         self,
         mesh: FramedCurveMesh,
-        E: float,
-        nu: float,
-        itc: float | None,
-        gravity_bf: tuple[float, float, float],
+        materials: list[dict],
+        g_vec,
         problem_options: dict,
     ):
         self.mesh = mesh
-        self.lam, self.mu = lame_parameters(E, nu)
-        self.itc = itc
-
-        _use_cudss = needs_gpu_assembly(problem_options)
-        thermal_info = (itc,) if itc is not None else (None,)
 
         self.problem = LinearElasticity3D(
             mesh, vec=3, dim=3, ele_type=mesh.ele_type,
-            additional_info=(E, nu, tuple(gravity_bf)) + thermal_info,
-            gpu_assembly=_use_cudss,
+            additional_info=(materials, mesh.material_id, tuple(g_vec)),
+            gpu_assembly=needs_gpu_assembly(problem_options),
         )
         mesh.attach_ref_coords(self.problem)
+        self.lam, self.mu = self.problem.lam_q, self.problem.mu_q
 
         self.surface_node_indices = self.problem.surface_node_global_indices
         self.problem_options = problem_options
@@ -131,8 +122,8 @@ class ElasticPipeline:
     ) -> dict:
         """Run one differentiable forward FEM solve.
 
-        Builds uniform per-quad material arrays from the scalar ``lam``/``mu``
-        stored at construction and calls ``fwd_pred``.
+        Calls ``fwd_pred``.  Per-quad ``lam``/``mu`` come from the material
+        tables built at construction unless ``params`` overrides them.
 
         Parameters
         ----------

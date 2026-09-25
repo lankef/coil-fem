@@ -182,7 +182,9 @@ def _build_disk_o_grid_topology_np(n_center: int, n_radial: int):
 
 # JIT notes:
 def _rect_sweep_topology(
-    M: int, N: int, O: int, mesh_type: str, *, phi_span: float | None = None,
+    M: int, N: int, O: int, mesh_type: str, *,
+    phi_span: float | None = None,
+    n_casing: int = 0, tu: float = 0.0, tv: float = 0.0,
 ):
     """Build rectangle-sweep mesh topology in (phi, u, v) parametric space.
 
@@ -198,37 +200,52 @@ def _rect_sweep_topology(
         (= ``framed_curve.curve.quadpoints.shape[0]``).  Open sweep: number
         of phi *cells*, so there are ``M + 1`` node slices.
     N : int
-        Number of cross-section grid points in direction 1.
+        Winding-pack node count in direction 1 (``u`` in ``[-1, 1]``).
     O : int
-        Number of cross-section grid points in direction 2.
+        Winding-pack node count in direction 2 (``v`` in ``[-1, 1]``).
     mesh_type : str
         ``'TET4'`` or ``'TET10'``.
     phi_span : float or None
         ``None`` (default) keeps the closed full-turn sweep.  A float opens
         the sweep over ``[0, phi_span]`` with two free end faces.
+    n_casing : int
+        Cells through the casing on each side of the winding pack (default 0).
+    tu, tv : float
+        Normalized casing thickness, ``2 t / w1`` and ``2 t / w2``.  Nodes
+        then reach ``u = ±(1 + tu)`` and ``v = ±(1 + tv)``.
 
     Returns
     -------
     u_per_node : np.ndarray (num_nodes,)
-        Parametric u-coordinate in ``[-1, 1]`` for each node.
+        Parametric u-coordinate for each node.
     v_per_node : np.ndarray (num_nodes,)
-        Parametric v-coordinate in ``[-1, 1]`` for each node.
+        Parametric v-coordinate for each node.
     phi_idx : np.ndarray (num_nodes,) int32
         Index into the phi-grid.  Closed: length ``K = M*stride``.  Open:
         length ``K = M*stride + 1`` (includes both end faces).
     cells : np.ndarray (num_cells, k) int32
         Connectivity.  ``k = 4`` (TET4) or ``k = 10`` (TET10).
+    material_id : np.ndarray (num_cells,) int32
+        ``0`` for winding-pack cells, ``1`` for casing cells.
     """
     if mesh_type not in ('TET4', 'TET10'):
         raise ValueError(
             f"mesh_type must be 'TET4' or 'TET10', got {mesh_type!r}"
         )
     M = int(M); N = int(N); O = int(O)
+    n_casing = int(n_casing)
     closed = phi_span is None
     n_slices = M if closed else M + 1
 
-    u_grid = np.linspace(-1.0, 1.0, N)                       # (N,)
-    v_grid = np.linspace(-1.0, 1.0, O)                       # (O,)
+    # ============================================================================
+    # 1-D cross-section grids (winding pack in [-1, 1], casing outside)
+    # ============================================================================
+    u_cs = tu * np.arange(1, n_casing + 1) / max(n_casing, 1)
+    v_cs = tv * np.arange(1, n_casing + 1) / max(n_casing, 1)
+    u_grid = np.concatenate([-1.0 - u_cs[::-1], np.linspace(-1.0, 1.0, N), 1.0 + u_cs])
+    v_grid = np.concatenate([-1.0 - v_cs[::-1], np.linspace(-1.0, 1.0, O), 1.0 + v_cs])
+    N = u_grid.shape[0]   # total node counts from here on
+    O = v_grid.shape[0]
     stride = 2 if mesh_type == 'TET10' else 1                # phi-grid stride
 
     # ── Corner nodes ──
@@ -261,11 +278,21 @@ def _rect_sweep_topology(
         nidx(mh,     nh + 1, oh + 1),
     ], axis=1)
 
+    # ============================================================================
+    # Material index per cell (0 = winding pack, 1 = casing)
+    # ============================================================================
+    is_casing_hex = (
+        (nh < n_casing) | (nh >= N - 1 - n_casing)
+        | (oh < n_casing) | (oh >= O - 1 - n_casing)
+    )
+    # Each hex splits into 6 consecutive Kuhn tets.
+    material_id = np.repeat(is_casing_hex.astype(np.int32), 6)
+
     if mesh_type == 'TET4':
         cells = hex_corners[:, _KUHN_6].reshape(-1, 4)
         return (
             u_corners, v_corners, phi_corners,
-            cells.astype(np.int32),
+            cells.astype(np.int32), material_id,
         )
 
     # ── TET10: midside nodes by per-edge deduplication ──
@@ -326,13 +353,16 @@ def _rect_sweep_topology(
     base = n_slices * N * O
     mid_idx = (base + inv).reshape(-1, 6)                    # (num_cells, 6)
     cells_10 = np.concatenate([cells4, mid_idx], axis=1)     # (num_cells, 10)
-    return u_per_node, v_per_node, phi_idx, cells_10.astype(np.int32)
+    return u_per_node, v_per_node, phi_idx, cells_10.astype(np.int32), material_id
 
 
-@partial(jax.jit, static_argnames=('mesh_type', 'N', 'O', 'M', 'phi_span'))
+@partial(jax.jit, static_argnames=(
+    'mesh_type', 'N', 'O', 'M', 'phi_span', 'n_casing', 'tu', 'tv',
+))
 def _rect_sweep_points(
     framed_curve, w1, w2, N: int, O: int, *, mesh_type: str,
     M: int | None = None, phi_span: float | None = None,
+    n_casing: int = 0, tu: float = 0.0, tv: float = 0.0,
 ):
     r"""Curved-edge rectangle-sweep mesh points as a pure-JAX expression.
 
@@ -384,8 +414,9 @@ def _rect_sweep_points(
         M = int(framed_curve.curve.quadpoints.shape[0])
     else:
         M = int(M)
-    u_np, v_np, phi_idx_np, _ = _rect_sweep_topology(
+    u_np, v_np, phi_idx_np, _, _ = _rect_sweep_topology(
         M, N, O, mesh_type, phi_span=phi_span,
+        n_casing=n_casing, tu=tu, tv=tv,
     )
     closed = phi_span is None
     if closed:
@@ -499,6 +530,7 @@ def rectangle_sweep(
     mesh_type="TET4",
     phi_span=None,
     n_phi=None,
+    casing_thickness=None,
 ):
     """ Backward-compatible wrapper that builds a :class:`FramedCurveMeshRectangle`.
 
@@ -515,6 +547,7 @@ def rectangle_sweep(
         n_grid_1=n_grid_1, n_grid_2=n_grid_2,
         aspect_ratio=aspect_ratio, mesh_type=mesh_type,
         phi_span=phi_span, n_phi=n_phi,
+        casing_thickness=casing_thickness,
     )
 
 
@@ -583,7 +616,10 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
     # Shared metadata / construction helpers
     # ============================================================================
 
-    def _set_metadata(self, framed_curve, cross_section_area, n_cross, phi_cell_idx):
+    def _set_metadata(
+        self, framed_curve, cross_section_area, n_cross, phi_cell_idx,
+        material_id=None,
+    ):
         """Store the metadata common to every cross-section shape.
 
         Called by subclass constructors after ``super().__init__`` so that
@@ -597,13 +633,17 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
         self.cross_section_area = float(cross_section_area)
         self.n_cross = int(n_cross)
         self.phi_cell_idx = np.asarray(phi_cell_idx, dtype=np.int32)
+        self.material_id = (
+            np.zeros(self.n_cells, np.int32) if material_id is None
+            else np.asarray(material_id, np.int32)
+        )
         # Phase-2 (set by attach_ref_coords once the FEM problem exists).
         self.n_quads = None
         self.phi_quad = None
         self.uv_quad = None
 
     @classmethod
-    def from_options(cls, framed_curve, opt, mesh_type):
+    def from_options(cls, framed_curve, opt, mesh_type, casing_thickness=None):
         """Dispatch ``mesh_options`` to the matching concrete subclass.
 
         Parameters
@@ -626,8 +666,13 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
                 n_grid_2=opt.get('n_grid_2'),
                 aspect_ratio=opt.get('aspect_ratio', 1.0),
                 mesh_type=mesh_type,
+                casing_thickness=casing_thickness,
             )
         elif shape == 'disk':
+            if casing_thickness is not None:
+                raise NotImplementedError(
+                    "casing_thickness is only supported for shape='rect'."
+                )
             return FramedCurveMeshDisk(
                 framed_curve, opt['radius'],
                 n_center=opt.get('n_center'),
@@ -709,9 +754,9 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
         phi_quad_np = np.einsum('qn, cn -> cq', sv_np, phi_ref_local)
         self.phi_quad = jnp.asarray(phi_quad_np)   # (n_cells, n_quads)
 
-        self.uv_quad = self._compute_uv_quad(corners_np, sv_np, is_tet10)
+        self.uv_quad = self._compute_uv_quad(cells_np, sv_np)
 
-    def _compute_uv_quad(self, corners_np, sv_np, is_tet10):
+    def _compute_uv_quad(self, cells_np, sv_np):
         """Cross-section ``(u, v)`` at quadrature points; ``None`` by default.
 
         Overridden by shapes (e.g. :class:`FramedCurveMeshRectangle`) that carry a
@@ -819,9 +864,14 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
     w1, w2 : float
         Full widths of the rectangular cross-section.
     n_grid_1, n_grid_2 : int, optional
-        Number of *cells* per cross-section direction.  The node grid has
-        ``n_grid_1 + 1`` and ``n_grid_2 + 1`` points respectively.  If ``None``
-        the value is chosen from ``aspect_ratio`` and the mean phi-spacing.
+        Number of *cells* per winding-pack direction.  The winding-pack node
+        grid has ``n_grid_1 + 1`` and ``n_grid_2 + 1`` points respectively.
+        If ``None`` the value is chosen from ``aspect_ratio`` and the mean
+        phi-spacing.
+    casing_thickness : float or None
+        Casing thickness [m] added outside the winding pack on every side.
+        ``None`` (default) is no casing.  ``(u, v) = ±1`` stays at the
+        winding-pack edge.
     aspect_ratio : float
         Target cross-section element size relative to the average arclength per
         quadpoint (default 1.0 for roughly cubic elements).
@@ -841,7 +891,7 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
     def __init__(
         self, framed_curve, w1, w2, *,
         n_grid_1=None, n_grid_2=None, aspect_ratio=1.0, mesh_type="TET4",
-        phi_span=None, n_phi=None,
+        phi_span=None, n_phi=None, casing_thickness=None,
     ):
         if phi_span is not None and n_phi is None:
             raise ValueError(
@@ -854,31 +904,44 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
             M = int(framed_curve.curve.quadpoints.shape[0])
         else:
             M = int(n_phi)
-        length_per_quadpoint = arclen / M 
-        if n_grid_1 is None or n_grid_2 is None:
-            target_size = length_per_quadpoint * aspect_ratio
-            if n_grid_1 is None:
-                n_grid_1 = max(1, int(jnp.round(w1 / target_size)))
-            if n_grid_2 is None:
-                n_grid_2 = max(1, int(jnp.round(w2 / target_size)))
+        length_per_quadpoint = arclen / M
+        # ============================================================================
+        # Cross-section grid sizing (winding pack + casing)
+        # ============================================================================
+        target_size = length_per_quadpoint * aspect_ratio
+        if n_grid_1 is None:
+            n_grid_1 = max(1, int(jnp.round(w1 / target_size)))
+        if n_grid_2 is None:
+            n_grid_2 = max(1, int(jnp.round(w2 / target_size)))
+        t = 0.0 if casing_thickness is None else float(casing_thickness)
+        n_casing = 0 if t == 0.0 else max(1, int(jnp.round(t / target_size)))
+        tu, tv = 2.0 * t / w1, 2.0 * t / w2
 
-        N = n_grid_1 + 1   # node counts per cross-section direction
+        N = n_grid_1 + 1   # winding-pack node counts
         O = n_grid_2 + 1
+        N_tot = N + 2 * n_casing
+        O_tot = O + 2 * n_casing
 
         pts = _rect_sweep_points(
             framed_curve, w1, w2, N, O, mesh_type=mesh_type,
-            M=M, phi_span=phi_span,
+            M=M, phi_span=phi_span, n_casing=n_casing, tu=tu, tv=tv,
         )
-        u_per_node, v_per_node, phi_idx, cells = _rect_sweep_topology(
+        u_per_node, v_per_node, phi_idx, cells, material_id = _rect_sweep_topology(
             M, N, O, mesh_type, phi_span=phi_span,
+            n_casing=n_casing, tu=tu, tv=tv,
         )
         super().__init__(pts, cells, ele_type=mesh_type)
 
-        # Rectangle-specific metadata. n_grid_1/n_grid_2 store NODE counts (N, O).
+        # Rectangle-specific metadata. n_grid_1/n_grid_2 store winding-pack NODE counts.
         self.w1 = float(w1)
         self.w2 = float(w2)
         self.n_grid_1 = int(N)
         self.n_grid_2 = int(O)
+        self.casing_thickness = t
+        self.n_casing = int(n_casing)
+        self.tu, self.tv = float(tu), float(tv)
+        self.w1_outer = self.w1 + 2.0 * t
+        self.w2_outer = self.w2 + 2.0 * t
         self.phi_span = None if phi_span is None else float(phi_span)
         self.n_phi_cells = int(M)
         # Parametric node coords for seam pairing (CSR open-sweep reduction).
@@ -886,13 +949,14 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
         self.v_per_node = np.asarray(v_per_node, dtype=np.float64)
         self.phi_idx_per_node = np.asarray(phi_idx, dtype=np.int32)
 
-        n_per_phi = (N - 1) * (O - 1) * 6   # KUHN-6 tets per phi-slice
+        n_per_phi = (N_tot - 1) * (O_tot - 1) * 6   # KUHN-6 tets per phi-slice
         phi_cell_idx = np.repeat(np.arange(M, dtype=np.int32), n_per_phi)
         self._set_metadata(
             framed_curve,
             cross_section_area=w1 * w2,
-            n_cross=N * O,
+            n_cross=N_tot * O_tot,
             phi_cell_idx=phi_cell_idx,
+            material_id=material_id,
         )
 
     def mesh_points_from_dofs(self, dofs_i):
@@ -901,33 +965,15 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
             fc, self.w1, self.w2, self.n_grid_1, self.n_grid_2,
             mesh_type=self.ele_type,
             M=self.n_phi_cells, phi_span=self.phi_span,
+            n_casing=self.n_casing, tu=self.tu, tv=self.tv,
         )
 
-    def _compute_uv_quad(self, corners_np, sv_np, is_tet10):
-        n_cross = self.n_cross
-        n_g1 = self.n_grid_1
-        n_g2 = self.n_grid_2
-
-        # Cross-section node (j, k) index from global node index.
-        node_j = (corners_np % n_cross) // n_g2   # (n_cells, 4)
-        node_k = corners_np % n_g2
-
-        u_corners = (2.0 * node_j / (n_g1 - 1) - 1.0).astype(np.float64)
-        v_corners = (2.0 * node_k / (n_g2 - 1) - 1.0).astype(np.float64)
-
-        if is_tet10:
-            e = self._TET10_MID_EDGES
-            u_mids = 0.5 * (u_corners[:, e[:, 0]] + u_corners[:, e[:, 1]])
-            v_mids = 0.5 * (v_corners[:, e[:, 0]] + v_corners[:, e[:, 1]])
-            u_ref = np.concatenate([u_corners, u_mids], axis=1)
-            v_ref = np.concatenate([v_corners, v_mids], axis=1)
-        else:
-            u_ref = u_corners
-            v_ref = v_corners
-
-        uv_ref_local = np.stack([u_ref, v_ref], axis=-1)   # (n_cells, n_nodes, 2)
-        uv_quad_np = np.einsum('qn, cnd -> cqd', sv_np, uv_ref_local)
-        return jnp.asarray(uv_quad_np)   # (n_cells, n_quads, 2)
+    def _compute_uv_quad(self, cells_np, sv_np):
+        """Cross-section ``(u, v)`` at quadrature points from stored node coords."""
+        uv_ref_local = np.stack(
+            [self.u_per_node[cells_np], self.v_per_node[cells_np]], axis=-1,
+        )                                                   # (n_cells, n_nodes, 2)
+        return jnp.asarray(np.einsum('qn, cnd -> cqd', sv_np, uv_ref_local))
 
 
 class FramedCurveMeshDisk(FramedCurveMesh):

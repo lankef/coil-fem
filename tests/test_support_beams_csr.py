@@ -165,7 +165,7 @@ def _bind_one_coil(sb: SupportBeamsCSR, R: float = 1.2):
     )
     sb.bind_coil_meshes([mesh])
     pipe = ElasticPipeline(
-        mesh, 200e9, 0.3, None, (0.0, 0.0, 0.0),
+        mesh, [{'E': 200e9, 'nu': 0.3}], (0.0, 0.0, 0.0),
         {'solver': 'umfpack'},
     )
     pts = mesh.mesh_points_from_dofs(curve.dofs)
@@ -373,7 +373,7 @@ def test_taylor_objective_csr_curve_dofs():
                 'n_grid_1': 1, 'n_grid_2': 1,
             },
             support=support,
-            material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+            winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
             problem_options={'solver': 'cudss'},
             coupling='monolithic',
         )
@@ -536,7 +536,7 @@ def test_monolithic_csr_forward_finite_and_seam():
                 'n_grid_1': 1, 'n_grid_2': 1,
             },
             support=support,
-            material_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
+            winding_pack_options={'E': 200e9, 'nu': 0.3, 'density': 8900.0},
             problem_options={'solver': 'cudss'},
             coupling='monolithic',
         )
