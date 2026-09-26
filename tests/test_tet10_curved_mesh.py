@@ -32,7 +32,6 @@ import pytest
 from coil_fem.geo import CurveXYZFourierJAX
 from coil_fem.geo import make_centroid_frame, make_rmf_frame
 from coil_fem.meshing import (
-    rectangle_sweep,
     FramedCurveMeshRectangle,
     _rect_sweep_topology,
     _rect_sweep_points,
@@ -271,7 +270,7 @@ class TestConformity:
         N = 24
         curve = _make_circle(N=N)
         fc = make_frame(curve)
-        mesh = rectangle_sweep(
+        mesh = FramedCurveMeshRectangle(
             fc, 0.05, 0.03, n_grid_1=3, n_grid_2=3, mesh_type=mesh_type,
         )
         pts = np.asarray(mesh.points)
@@ -305,7 +304,7 @@ class TestConformity:
         N = 16
         curve = _make_circle(N=N)
         fc = make_frame(curve)
-        mesh = rectangle_sweep(
+        mesh = FramedCurveMeshRectangle(
             fc, 0.05, 0.03, n_grid_1=3, n_grid_2=3, mesh_type=mesh_type,
         )
         vols = _signed_volumes(mesh.points, mesh.cells)

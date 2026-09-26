@@ -1,7 +1,7 @@
 """Metrics for evaluating the FEM solutions.
 
-All public functions accept optional ``shape_grads`` and ``JxW`` keyword
-arguments.  When provided (as recomputed by :meth:`~coil_fem.CoilFEM.objective`
+The volume-integrated metrics accept optional ``shape_grads`` and ``JxW``
+keyword arguments.  When provided (as recomputed by :meth:`~coil_fem.CoilFEM.objective`
 outside the ``ad_wrapper`` boundary), gradients flow through mesh geometry
 correctly.  When ``None``, the function falls back to ``problem.shape_grads``
 / ``problem.JxW``, which is fine for forward-only diagnostics.
@@ -238,11 +238,11 @@ def sq_max_von_mises_lse(
     JxW=None,
     epsilon_th=None,
 ) -> jnp.ndarray:
-    r"""Smooth maximum von Mises stress via log-sum-exp.
+    r"""Squared smooth maximum von Mises stress via log-sum-exp.
 
-    Computes :math:`\frac{1}{\beta}\log\sum_q e^{\beta \sigma_{vm,q}}` over
-    all quadrature points.  Differentiable everywhere; approaches the hard
-    maximum as ``beta`` → ∞.
+    Computes :math:`\left(\frac{1}{\beta}\log\sum_q e^{\beta \sigma_{vm,q}}\right)^2`
+    over all quadrature points.  Differentiable everywhere; approaches the
+    squared hard maximum as ``beta`` → ∞.
 
     Parameters
     ----------
@@ -258,7 +258,7 @@ def sq_max_von_mises_lse(
     Returns
     -------
     jnp.ndarray
-        Scalar smooth-maximum von Mises stress [Pa].
+        Scalar squared smooth-maximum von Mises stress [Pa²].
     """
     vm = von_mises_on_quadrature(
         problem, sol_list, lam, mu, shape_grads=shape_grads, epsilon_th=epsilon_th,

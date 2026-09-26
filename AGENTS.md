@@ -77,7 +77,7 @@ src/coil_fem/                  # main package (Hatchling src-layout)
     supports.py                # Support (concrete grounded Winkler/Robin BC)
     beam_network.py            # SupportBeams — bisymmetric beam-network support (coil-coil + coil-foundation)
     beam_network_csr.py        # SupportBeamsCSR — central support ring + coil-to-CSR beams
-    drivers.py                 # solve_staggered (BG-S + Aitken + IFT grad), solve_monolithic (cuDSS-only)
+    drivers.py                 # solve_uncoupled, solve_monolithic (cuDSS); solve_staggered retired
   simsopt/                     # simsopt Optimizable interop subpackage
     __init__.py                # re-exports CoilFEMObjective, CoilSupport*, CSR* objectives
     objectives.py              # CoilFEMObjective + beam/CSR geometric constraints
@@ -185,7 +185,7 @@ Do **not** use `# ── Title ──────`, `# --- Title ---`, `# ---- #
 
 ### Module Scope
 
-- `__init__.py` re-exports `CoilFEM`, `biot_savart`, `B_self_quadrature`, `lorentz_body_force`. Other modules are imported by explicit submodule path (e.g. `from coil_fem.meshing import rectangle_sweep`, `from coil_fem.geo import CurveXYZFourierJAX`).
+- `__init__.py` re-exports `CoilFEM`, `biot_savart`, `B_self_quadrature`, `lorentz_body_force`. Other modules are imported by explicit submodule path (e.g. `from coil_fem.meshing import FramedCurveMeshRectangle`, `from coil_fem.geo import CurveXYZFourierJAX`).
 - simsopt interop lives in `coil_fem.simsopt` — keep pure-JAX code simsopt-free where possible.
 
 ### Static vs. traced container convention
@@ -224,25 +224,25 @@ Two kinds of data bundles appear in this codebase; use the correct container for
 
 The coupling between coil FEM and support structures is split across three layers.
 
-### `Support` ABC (`coupling/supports.py`)
+### `Support` base class (`coupling/supports.py`)
 
-`Support` is the abstract base class all support models must implement:
+`Support` is the concrete base class all support models extend:
 
 | Method | Required | Description |
 |--------|----------|-------------|
 | `is_coupled` | property | `True` when the support has its own DOFs |
-| `solve(inputs)` | abstract | Advance support state; returns dict with `'u_s'` |
+| `solve(inputs)` | default=`{}` | Advance support state; coupled subclasses return dict with `'u_s'` |
 | `compute_weights(coil_idx, surf_pts, curves_jax, dofs)` | default | Returns `(w_g, w_a)` grounded-clamp and beam-attachment weights; `curves_jax` is the full list of all base-coil curves |
 | `stiffness(w_g, w_a)` | concrete | Per-point Winkler stiffness `k_clamp*w_g + k_attachment*w_a` [N/m³] |
 | `coupling_pattern(coil_dof_offsets, support_dof_offset, surface_node_indices_by_coil)` | default=empty | Static numpy I/J index arrays for K_cs / K_sc coupling blocks |
-| `coupling_values(curves_jax, sdofs, surf_pts_by_coil, *, jxw_by_coil, geom)` | default=empty | Traced V arrays for K_cs / K_sc coupling blocks |
+| `coupling_values(curves_jax, sdofs, surf_pts_by_coil, surf_interp_by_coil=None, *, jxw_by_coil, geom)` | default=empty | Traced V arrays for K_cs / K_sc coupling blocks |
 | `support_pattern()` | default=empty | Static local COO I/J for K_ss (cached globally as `I_ss_pat`/`J_ss_pat` on `MonolithicStatic`) |
 | `support_values(curves_jax, sdofs, surf_pts, *, geom, jxw_by_coil)` | default stub | Traced COO V for K_ss |
 | `n_support_dofs` | attribute | Required when `is_coupled=True` |
 | `k_clamp` | property | Grounded Winkler modulus [N/m³] (constructor arg) |
 | `k_attachment` | property | Beam-attachment modulus [N/m³]; base returns `0.0` |
 
-`Support` is the built-in uncoupled (grounded) support (`is_coupled=False`): it holds attachment points at zero displacement through a Winkler spring field whose spatial distribution is controlled by an optional `fixed_clamp_fn` callable.  Construct with `Support(k_clamp=...)`.
+`Support` is the built-in uncoupled (grounded) support (`is_coupled=False`): it holds attachment points at zero displacement through a Winkler spring field whose spatial distribution is controlled by optional `fixed_clamp_fns` callable(s).  Construct with `Support(k_clamp=...)`.
 
 ### `SupportBeams` (`coupling/beam_network.py`)
 
@@ -304,7 +304,7 @@ Sorted classes store incremental `dphis*` DOFs. The codecs live in `sorted_dphis
 
 ### Adding a new `Support` subclass
 
-1. Subclass `Support` (to inherit the `fixed_clamp_fn` weight logic); pass `k_clamp` to `super().__init__`.
+1. Subclass `Support` (to inherit the `fixed_clamp_fns` weight logic); pass `k_clamp` to `super().__init__`.
 2. Set `is_coupled = True` (property) and declare `n_support_dofs` and `k_attachment`.
 3. Implement `solve(inputs) -> {'u_s': ...}` using any JAX-compatible solver.
 4. Override `compute_weights` to return `(w_g, w_a)` per-surface-quad weight fields.

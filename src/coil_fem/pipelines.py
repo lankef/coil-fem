@@ -1,8 +1,8 @@
 """Per-coil FEM physics pipelines.
 
-Provides :class:`ElasticPipeline`, which encapsulates all per-coil state
-(mesh, problem, forward-prediction callable, and material scalars) previously
-spread across lists in :class:`~coil_fem.CoilFEM`.  A stub
+Provides :class:`ElasticPipeline`, which holds all per-coil state (mesh,
+problem, forward-prediction callable, and material scalars) used by
+:class:`~coil_fem.CoilFEM`.  A stub
 :class:`ThermoElasticPipeline` is included for future thermoelastic coupling.
 """
 
@@ -94,24 +94,6 @@ class ElasticPipeline:
         """
         return self.problem.surface_quad_points(points)
 
-    def u_at_surface_quads(self, sol_list: list) -> jnp.ndarray:
-        """Interpolate coil displacement to surface quadrature points.
-
-        Maps the nodal displacement field ``sol_list[0]`` to the surface quad
-        points using the cached face shape-function values.
-
-        Parameters
-        ----------
-        sol_list : list[jnp.ndarray]
-            Raw ``fwd_pred`` output; ``sol_list[0]`` has shape ``(n_nodes, 3)``.
-
-        Returns
-        -------
-        jnp.ndarray, shape ``(n_surface_quads, 3)``
-        """
-        u_surf_nodes = sol_list[0][self.surface_node_indices]  # (n_surf_nodes, 3)
-        return self.problem.interp_surface_nodal_to_quads(u_surf_nodes)
-
     def solve(
         self,
         points: jnp.ndarray,
@@ -123,7 +105,7 @@ class ElasticPipeline:
         """Run one differentiable forward FEM solve.
 
         Calls ``fwd_pred``.  Per-quad ``lam``/``mu`` come from the material
-        tables built at construction unless ``params`` overrides them.
+        tables built at construction.
 
         Parameters
         ----------
@@ -188,7 +170,7 @@ class ElasticPipeline:
             is the flat load vector ``-R(0)`` on device.  The load is a
             by-product of the same assembly pass (the residual at zero
             displacement), so callers assembling a merged system need not run
-            a separate :meth:`solve_residual`.
+            a separate residual evaluation.
 
         Raises
         ------

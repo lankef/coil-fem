@@ -18,7 +18,7 @@ class CoilSupportFixed(CoilSupport):
     """Support modelled as ``n_clamp`` clamps at optimisable arclengths.
 
     Each clamp is a sphere of radius ``r_clamp`` centred on the coil at
-    curve parameter ``phi``; the per-node weight is the (smooth) union of all
+    curve parameter ``phi``; the weight per surface point is the (smooth) union of all
     clamp indicator spheres.  Only the clamp locations ``phis`` are DOFs;
     ``r_clamp``, ``eps_sigmoid`` and ``n_clamp`` are fixed.
 
@@ -81,7 +81,9 @@ class CoilSupportFixed(CoilSupport):
         self._r_clamp = float(r_clamp)
         self._sig_eps  = float(eps_sigmoid)
 
-        # ── Stored for GSONable serialization ────────────────────────────────────
+        # ============================================================================
+        # Stored for GSONable serialization
+        # ============================================================================
         # GSONable.as_dict requires every __init__ parameter to be present as
         # self.<param> or self._<param>.
         self._fixed_clamp_options = {
@@ -92,7 +94,6 @@ class CoilSupportFixed(CoilSupport):
         # Optimizable dofs object by simsopt on load.
         self._phis  = phis
         self._names = names
-        # ─────────────────────────────────────────────────────────────────────────
 
         support_dofs_jax = self._angle_support_dofs(phis_arr)
         lb, ub = self._make_bounds(
@@ -224,13 +225,14 @@ class CoilSupportTopBottom(CoilSupport):
         self._r_clamp = float(r_clamp)
         self._sig_eps  = float(eps_sigmoid)
 
-        # ── Stored for GSONable serialization ────────────────────────────────────
+        # ============================================================================
+        # Stored for GSONable serialization
+        # ============================================================================
         # GSONable.as_dict requires every __init__ parameter to be present as
         # self.<param> or self._<param>.
         self._fixed_clamp_options = {
             'k_clamp': k_clamp, 'r_clamp': r_clamp, 'eps_sigmoid': eps_sigmoid,
         }
-        # ─────────────────────────────────────────────────────────────────────────
 
         super().__init__(
             base_coils, nfp, stellsym,

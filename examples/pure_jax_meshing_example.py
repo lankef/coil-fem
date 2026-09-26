@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 from coil_fem.geo import CurveXYZFourierJAX
 from coil_fem.geo import make_centroid_frame, make_rmf_frame
-from coil_fem.meshing import rectangle_sweep, disk_sweep
+from coil_fem.meshing import FramedCurveMeshRectangle, FramedCurveMeshDisk
 
 
 def example_rectangle_sweep_pure_jax():
@@ -39,7 +39,7 @@ def example_rectangle_sweep_pure_jax():
     framed = make_centroid_frame(curve)
     
     # Create mesh with automatic sizing
-    mesh = rectangle_sweep(
+    mesh = FramedCurveMeshRectangle(
         framed,
         w_1=0.02,
         w_2=0.02,
@@ -80,7 +80,7 @@ def example_disk_sweep_pure_jax():
     framed = make_rmf_frame(curve)
     
     # Create O-grid mesh
-    mesh = disk_sweep(
+    mesh = FramedCurveMeshDisk(
         framed,
         radius=0.02,
         aspect_ratio=1.0
@@ -107,7 +107,7 @@ def example_differentiable_meshing():
         """Create mesh from curve DOFs - fully differentiable."""
         curve = CurveXYZFourierJAX(quadpoints, dofs, order)
         framed = make_centroid_frame(curve)
-        mesh = rectangle_sweep(
+        mesh = FramedCurveMeshRectangle(
             framed,
             w_1=0.02,
             w_2=0.02,
@@ -161,7 +161,7 @@ def example_jit_compilation():
         """JIT-compiled mesh creation and evaluation."""
         curve = CurveXYZFourierJAX(quadpoints, dofs, order)
         framed = make_rmf_frame(curve)
-        mesh = disk_sweep(
+        mesh = FramedCurveMeshDisk(
             framed,
             radius=0.02,
             n_center=3,
@@ -208,7 +208,7 @@ def example_batch_processing():
         """Compute mesh quality for a single set of DOFs."""
         curve = CurveXYZFourierJAX(quadpoints, dofs, order)
         framed = make_centroid_frame(curve)
-        mesh = rectangle_sweep(
+        mesh = FramedCurveMeshRectangle(
             framed,
             w_1=0.02,
             w_2=0.02,
@@ -253,7 +253,7 @@ def example_optimization_loop():
         """Loss based on mesh regularity."""
         curve = CurveXYZFourierJAX(quadpoints, dofs, order)
         framed = make_centroid_frame(curve)
-        mesh = rectangle_sweep(
+        mesh = FramedCurveMeshRectangle(
             framed,
             w_1=0.02,
             w_2=0.02,
