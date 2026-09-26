@@ -1,9 +1,8 @@
 """Steady-state heat conduction for JAX-FEM (stub).
 
-Will provide :class:`HeatConduction3D`, a JAX-FEM ``Problem`` subclass that
-solves ``−∇·(k ∇T) = Q`` on the coil volume.  The solution temperature field
-feeds into :class:`~coil_fem.problems.LinearElasticity3D` as a spatially varying
-thermal eigenstrain for thermoelastic coupling.
+:class:`HeatConduction3D` is a placeholder for a JAX-FEM ``Problem`` that
+would solve ``−∇·(k ∇T) = Q`` on the coil volume for thermoelastic coupling.
+It is not implemented yet: instantiating it raises ``NotImplementedError``.
 """
 
 from __future__ import annotations

@@ -1,7 +1,8 @@
 """FEM solver helpers for selecting and constructing forward-prediction callables.
 
-Provides :func:`needs_gpu_assembly` and :func:`build_fwd_pred` to centralise the
-CPU/GPU solver selection that was previously inlined in :class:`~coil_fem.CoilFEM`.
+Provides :func:`needs_gpu_assembly` and :func:`build_fwd_pred`, which select
+between the CPU ``ad_wrapper`` and the GPU cuDSS solver used by
+:class:`~coil_fem.CoilFEM`.
 """
 
 from __future__ import annotations

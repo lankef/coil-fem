@@ -173,15 +173,26 @@ class CoilSupportBeams(CoilSupport):
         cross_section_type : str
             Cross section shape. Must choose from the functions available in
             coil_fem.presets.cross_section_fns.
-        attachment_type : callable
-            ``clamp_fn(surface_pts_beam_frame, dofs, sign_x) -> weights``;
-            selects coil surface nodes for beam endpoint coupling.
-        k_attachment : float
+        attachment_type : {'direct', 'wrap'}
+            How beam endpoints select coil surface points: ``'direct'``
+            uses ``<cross_section_type>_attachment`` (points inside the
+            beam volume); ``'wrap'`` uses ``wrap_attachment``.
+        k_attachment : float, optional
             Distributed attachment (Winkler) modulus [N/m³].  Governs both
-            translational and rotational spring coupling.
+            translational and rotational spring coupling.  When omitted it
+            is estimated from ``E`` and ``eps_attachment`` (default
+            ``1e-3``).
         eps_sigmoid : float
             Sigmoid function widths of attachment points. Default is 0.1.
-        and additional options needed by attachment_fn.
+        i_beam_cs : list of (int, int), optional
+            Coil-index pairs ``(i0, i1)`` of stellarator-symmetric
+            inter-coil (CS) beams, from ``base_coil[i0]`` to the mirror
+            image of ``base_coil[i1]``.  Requires ``stellsym=True``.
+        s_beam_cs : list of bool, optional
+            Same length as ``i_beam_cs``; ``True`` mirrors about
+            ``φ = 0``, ``False`` about ``φ = π/nfp``.
+        and additional options needed by the cross-section and attachment
+        functions.
     phis_start_cc : sequence of array-like or None
         Initial start-attachment angles for CC beams, one entry per CC group
         (``n_base + 1`` entries when ``stellsym=True``, else ``n_base``)
@@ -219,14 +230,19 @@ class CoilSupportBeams(CoilSupport):
     fixed_dof_names : iterable of str or None
         Names of ``support_dofs`` keys whose values should be **fixed** (not
         optimised). Some dofs will cause the problem to become ill-posed
-        if not fixed/constrained. If wither of ``n_beam_cc`` or ``n_beam_cf`` 
+        if not fixed/constrained. If either of ``n_beam_cc`` or ``n_beam_cf``
         is 0, then all dofs associated with that type of beam will be fixed.
-        By default, the attachment points of CF beams and the 
-        parameters of each individual beam is fixed.
+        ``None`` (default) fixes the cross-section DOF keys and the
+        ``thetas_orientation_*`` keys.
     names : list[str] or None
         Optional DOF names for the full (free + fixed) DOF vector.
     dofs : DOFs or None
         Simsopt ``DOFs`` object for restoring serialised state.
+    **kwargs
+        Initial values of the cross-section DOFs named by
+        ``<cross_section_type>_dof_keys`` (e.g. ``r_beam`` for
+        ``'solid_circle'``).  Each is a scalar (broadcast to every beam) or
+        a per-group sequence.  All such keys are required.
     """
 
     def __init__(
@@ -254,7 +270,9 @@ class CoilSupportBeams(CoilSupport):
         dofs=None,
         **kwargs,
     ):
-        # ── Stored for GSONable serialization (initial DOF seeds) ─────────────────
+        # ============================================================================
+        # Stored for GSONable serialization (initial DOF seeds)
+        # ============================================================================
         # These are the construction-time seeds for the Optimizable DOF vector.
         # Their actual values are overwritten by the Optimizable dofs object
         # (self._dofs) restored by simsopt on load — these attributes only serve
@@ -274,7 +292,6 @@ class CoilSupportBeams(CoilSupport):
         self._thetas_orientation_cs = thetas_orientation_cs
         self._phis                  = phis
         self.kwargs                 = kwargs   # GSONable adds **self.kwargs to the dict
-        # ─────────────────────────────────────────────────────────────────────────
 
         # Resolve options into local copies; caller-owned dicts are never mutated.
         # Assigned to self.beam_options / self._fixed_clamp_options once resolved
@@ -284,7 +301,9 @@ class CoilSupportBeams(CoilSupport):
 
         n_base = len(base_coils)
 
-        # ── Cross-section presets ─────────────────────────────────────────────
+        # ============================================================================
+        # Cross-section presets
+        # ============================================================================
         # The default cross section is solid circle
         cross_section_type = beam_options.get('cross_section_type', 'solid_circle')
         # The default type of attachment is direct 
@@ -294,7 +313,9 @@ class CoilSupportBeams(CoilSupport):
         cross_section_dof_keys = getattr(cross_section_fns, cross_section_type + '_dof_keys')
         cross_section_option_keys = getattr(cross_section_fns, cross_section_type + '_option_keys')
 
-        # ── Attachment function preset ─────────────────────────────────────────
+        # ============================================================================
+        # Attachment function preset
+        # ============================================================================
         if attachment_type == 'direct':
             attachment_fn = getattr(cross_section_fns, cross_section_type + '_attachment')
         elif attachment_type == 'wrap':
@@ -306,7 +327,9 @@ class CoilSupportBeams(CoilSupport):
                 "must be 'direct' or 'wrap'."
             )
 
-        # ── Load the remaining beam options ───────────────────────────────────
+        # ============================================================================
+        # Load the remaining beam options
+        # ============================================================================
         beam_option_keys_req = _REQUIRED_BEAM_OPTIONS + cross_section_option_keys
         beam_option_keys_allowed = (
             beam_option_keys_req + _OPTIONAL_BEAM_OPTIONS
@@ -346,7 +369,9 @@ class CoilSupportBeams(CoilSupport):
                 f"the auto-generated value is {k_attachment:.4e} N/m3."
             )
 
-        # ── Optional fixed-sphere Winkler clamps ──────────────────────────────
+        # ============================================================================
+        # Optional fixed-sphere Winkler clamps
+        # ============================================================================
         # Resolved before SupportBeams construction because fixed_clamp_fns is
         # a constructor argument.  The "must have >=1 CF beam" fallback check
         # (disabled-clamp branch) needs n_beam_cf, so it is
@@ -383,7 +408,9 @@ class CoilSupportBeams(CoilSupport):
         self.beam_options = beam_options
         self._fixed_clamp_options = fixed_clamp_options
 
-        # ── Build the functional SupportBeams ─────────────────────────────────
+        # ============================================================================
+        # Build the functional SupportBeams
+        # ============================================================================
         # SupportBeams.__init__ is the single owner of the beam-count
         # normalization (including the n_base + 1 stellsym convention); read
         # the final counts back from it instead of recomputing them here.
@@ -414,7 +441,9 @@ class CoilSupportBeams(CoilSupport):
         #             f"{unsupported}."
         #         )
 
-        # ── Build initial support_dofs_jax with defaults (ragged per-group) ────
+        # ============================================================================
+        # Build initial support_dofs_jax with defaults (ragged per-group)
+        # ============================================================================
         # Every DOF is a Python list of per-group JAX arrays (a pytree, so
         # ravel_pytree flattens it deterministically even with ragged sizes).
         # CC keys have len(n_beam_cc) == n_groups_cc entries; CF keys have
@@ -538,7 +567,9 @@ class CoilSupportBeams(CoilSupport):
                     for i in range(n_cs_groups)
                 ]
 
-        # ── Compute boolean fixed_mask from fixed_dof_names ───────────────────
+        # ============================================================================
+        # Compute boolean fixed_mask from fixed_dof_names
+        # ============================================================================
         if fixed_dof_names is None:
             fixed_dof_names = list(cross_section_dof_keys) + [
                 'thetas_orientation_cc', 'thetas_orientation_cf',
@@ -578,7 +609,9 @@ class CoilSupportBeams(CoilSupport):
         }
         fixed_mask, _ = ravel_pytree(probe)
 
-        # ── Summary ───────────────────────────────────────────────────────────
+        # ============================================================================
+        # Summary
+        # ============================================================================
         def _shapes(v):
             if isinstance(v, list):
                 return [tuple(np.shape(leaf)) for leaf in v]
@@ -610,7 +643,9 @@ class CoilSupportBeams(CoilSupport):
             lb, ub, support_dofs_jax, nfp, stellsym,
         )
 
-        # ── Initialize CoilSupport (calls Optimizable.__init__) ───────────────
+        # ============================================================================
+        # Initialize CoilSupport (calls Optimizable.__init__)
+        # ============================================================================
         super().__init__(
             base_coils,
             nfp,

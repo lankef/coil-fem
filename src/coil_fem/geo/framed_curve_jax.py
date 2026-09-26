@@ -1,38 +1,10 @@
-"""
-Pure JAX framed-curve wrappers for :class:`~coil_fem.geo.CurveJAX`.
+"""Pure JAX framed-curve wrappers for :class:`~coil_fem.geo.CurveJAX`.
 
-Provides two reference frames, both fully differentiable through JAX:
-
-* :class:`FramedCurveCentroidJAX` — centroid frame (Singh et al. 2020)
-* :class:`FramedCurveRMFJAX` — rotation-minimizing / Bishop frame
-  (Wang et al. 2008, double-reflection algorithm)
-
-All operations are pure JAX and require **no** simsopt installation.
-
-When simsopt is available, :func:`make_centroid_frame` and
+Provides the centroid frame (:class:`FramedCurveCentroidJAX`, Singh et al. 2020)
+and the rotation-minimizing frame (:class:`FramedCurveRMFJAX`, Wang et al. 2008),
+both fully differentiable and simsopt-free.  :func:`make_centroid_frame` and
 :func:`make_rmf_frame` also accept simsopt ``CurveXYZFourier`` /
-``CurveRZFourier`` objects (converted via :func:`curve_jax_from_simsopt`).
-
-Frame curvatures
-----------------
-Given a rotated frame :math:`(\\mathbf{t}, \\mathbf{p}, \\mathbf{q})`, the
-three curvature scalars :math:`\\kappa_1, \\kappa_2, \\kappa_3` satisfy
-
-.. math::
-
-    \\frac{d}{d\\phi}
-    \\begin{pmatrix} \\mathbf{t} \\\\ \\mathbf{p} \\\\ \\mathbf{q} \\end{pmatrix}
-    = \\left|\\frac{d\\mathbf{r}_c}{d\\phi}\\right|
-    \\begin{pmatrix} 0 & \\kappa_1 & \\kappa_2 \\\\
-                    -\\kappa_1 & 0 & \\kappa_3 \\\\
-                    -\\kappa_2 & -\\kappa_3 & 0 \\end{pmatrix}
-    \\begin{pmatrix} \\mathbf{t} \\\\ \\mathbf{p} \\\\ \\mathbf{q} \\end{pmatrix},
-
-so :math:`\\kappa_1 = (d\\mathbf{t}/dl)\\cdot\\mathbf{p}`,
-:math:`\\kappa_2 = (d\\mathbf{t}/dl)\\cdot\\mathbf{q}` (= simsopt
-``frame_binormal_curvature``), and
-:math:`\\kappa_3 = (d\\mathbf{p}/dl)\\cdot\\mathbf{q}` (= simsopt
-``frame_torsion``).
+``CurveRZFourier`` objects when simsopt is installed.
 """
 
 from __future__ import annotations
@@ -295,8 +267,8 @@ class FramedCurveJAX:
         (default: zeros).
     twist : jax.Array (nquad,) or None
         Frame-specific angle field built once at construction; ``None`` for
-        frames with a closed-form pointwise evaluation (see
-        :class:`FramedCurveRMFJAX`).  Carried as a pytree child so that JAX
+        frames with a closed-form pointwise evaluation (e.g.
+        :class:`FramedCurveCentroidJAX`).  Carried as a pytree child so that JAX
         transformations never rebuild it.
 
     Subclasses implement :meth:`rotated_frame_eval`; everything else — the frame
@@ -548,6 +520,25 @@ class FramedCurveJAX:
         :meth:`frame_binormal_curvature`, and :meth:`frame_torsion`
         separately when more than one is needed.
 
+        For the rotated frame :math:`(\mathbf{t}, \mathbf{p}, \mathbf{q})`
+        the curvatures satisfy
+
+        .. math::
+
+            \frac{d}{d\phi}
+            \begin{pmatrix} \mathbf{t} \\ \mathbf{p} \\ \mathbf{q} \end{pmatrix}
+            = \left|\frac{d\mathbf{r}_c}{d\phi}\right|
+            \begin{pmatrix} 0 & \kappa_1 & \kappa_2 \\
+                            -\kappa_1 & 0 & \kappa_3 \\
+                            -\kappa_2 & -\kappa_3 & 0 \end{pmatrix}
+            \begin{pmatrix} \mathbf{t} \\ \mathbf{p} \\ \mathbf{q} \end{pmatrix},
+
+        so :math:`\kappa_1 = (d\mathbf{t}/dl)\cdot\mathbf{p}`,
+        :math:`\kappa_2 = (d\mathbf{t}/dl)\cdot\mathbf{q}` (simsopt
+        ``frame_binormal_curvature``), and
+        :math:`\kappa_3 = (d\mathbf{p}/dl)\cdot\mathbf{q}` (simsopt
+        ``frame_torsion``).
+
         Returns
         -------
         kappa1, kappa2, kappa3 : jnp.ndarray, each shape (nquad,)
@@ -702,7 +693,7 @@ def make_centroid_frame(curve, alpha=None):
     curve : CurveJAX or simsopt CurveXYZFourier / CurveRZFourier
     alpha : array-like, optional
         Rotation angles at quadrature points (default: zeros).
-        ``d(alpha)/d(phi)`` is derived automatically via FFT differentiation.
+        ``d(alpha)/d(phi)`` comes from autodiff through :meth:`~FramedCurveJAX.alpha_eval`.
 
     Returns
     -------
@@ -719,7 +710,7 @@ def make_rmf_frame(curve, alpha=None):
     curve : CurveJAX or simsopt CurveXYZFourier / CurveRZFourier
     alpha : array-like, optional
         Rotation angles at quadrature points (default: zeros).
-        ``d(alpha)/d(phi)`` is derived automatically via FFT differentiation.
+        ``d(alpha)/d(phi)`` comes from autodiff through :meth:`~FramedCurveJAX.alpha_eval`.
 
     Returns
     -------

@@ -51,6 +51,12 @@ class SupportBeamsCSR(SupportBeams):
     cross_section_dof_keys, fixed_clamp_fns, fixed_clamp_options
         Forwarded to :class:`SupportBeams`.
 
+    Raises
+    ------
+    ValueError
+        If ``beam_options`` sets CS beams (``i_beam_cs`` or ``s_beam_cs``),
+        which are not supported here.
+
     Notes
     -----
     ``cross_section_fn`` must return per-group lists whose entry ``i < n_base``
@@ -1011,10 +1017,6 @@ class SupportBeamsCSR(SupportBeams):
     # ========================================================================
     # Continuum member (CSR ring for metrics / VTU)
     # ========================================================================
-
-    def endpoint_state(self, u_s: jax.Array) -> jax.Array:
-        """Beam endpoint state; ignores the CSR DOF suffix."""
-        return u_s[: 12 * self.n_beams_total].reshape(self.n_beams_total, 2, 6)
 
     def beam_displacement(self, geom: dict, u_s: jax.Array, xi: jax.Array):
         """Centreline displacement using only the beam DOF prefix of ``u_s``."""

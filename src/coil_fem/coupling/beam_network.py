@@ -1,21 +1,11 @@
 """Beam-network support structure.
 
-Provides :class:`SupportBeams`, which models a cage-type support structure
-with two types of support beams: 
-
-1. Coil-coil (CC) beams that link adjacent coils.
-2. Coil-foundation (CF) that link a coil to the foundation (fixed points in space).
-
-All beams are treated as bisymmetric frame elements (McGuire, Gallagher & Ziemian, Eq. 4.34;
-see ``docs/theory/bisymbeam.rst``).  Each beam endpoint couples to coil
-exterior mesh points via translational and torsional springs whose spatial
-distribution is governed by a user-supplied ``attachment_fn``.
-
-:meth:`SupportBeams.support_pattern` / :meth:`SupportBeams.support_values`
-expose the support-local stiffness block ``K_ss`` in COO format
-(differentiable w.r.t. all traced inputs).
-:meth:`SupportBeams.solve` runs a standalone forward solve (batched
-``jnp.linalg.solve``) for the beam DOFs given coil-side mesh displacements.
+Provides :class:`SupportBeams`, a cage-type support built from bisymmetric
+frame elements (see ``docs/theory/bisymbeam.rst``): coil-coil (CC) beams
+between adjacent coils, coil-foundation (CF) beams to fixed anchors, and
+optional stellarator-symmetric inter-coil (CS) beams.  Beam endpoints couple
+to the coil surface through springs weighted by a user-supplied
+``attachment_fn``.
 """
 
 from __future__ import annotations
@@ -146,6 +136,12 @@ class SupportBeams(Support):
 
     Parameters
     ----------
+    nfp : int
+        Number of field periods; sets the ``'rotate'`` / ``'flip_half'``
+        wraparound transforms.
+    stellsym : bool
+        Whether stellarator symmetry is imposed.  Adds the coil-0 ``phi = 0``
+        wrap CC group and is required for CS beams.
     n_base : int
         Number of base coils (before symmetry expansion).
     beam_options : dict
@@ -191,6 +187,10 @@ class SupportBeams(Support):
         ``True`` at the node-1 end (beam extends toward ``+x_local``) and
         ``False`` at node-2, and ``beam_options`` is the options dict.
         ``weights`` is ``(N,)`` in ``[0, 1]``.
+    cross_section_dof_keys : tuple of str
+        Keys of ``support_dofs`` holding per-group lists of per-beam
+        cross-section scalars (e.g. ``'r_beam'``).  Each is sliced to the
+        endpoint's beam before calling ``attachment_fn``.  Default ``()``.
     fixed_clamp_fns : callable or list[callable] or None
         Optional Winkler weight functions forwarded to :class:`Support`.
         When set, the grounded-clamp half of :meth:`compute_weights`
@@ -514,18 +514,18 @@ class SupportBeams(Support):
         return True
     
     @property
-    def nfp(self) -> bool:
-        """``True`` — beams have their own DOFs coupled to coil surface nodes."""
+    def nfp(self) -> int:
+        """Number of field periods."""
         return self._nfp
         
     @property
-    def beam_options(self) -> bool:
-        """``True`` — beams have their own DOFs coupled to coil surface nodes."""
+    def beam_options(self) -> dict:
+        """Beam options dict passed at construction."""
         return self._beam_options
 
     @property
     def stellsym(self) -> bool:
-        """``True`` — beams have their own DOFs coupled to coil surface nodes."""
+        """Whether stellarator symmetry is imposed."""
         return self._stellsym
 
     @property
@@ -627,10 +627,8 @@ class SupportBeams(Support):
 
         Notes
         -----
-        Placeholder retained for a future staggered driver (returns zeros).
-        Monolithic coupling does not call this method.  A Hermite
-        shape-function interpolation along beam elements should replace this
-        when staggered mode is restored.
+        Unused stub that returns zeros.  For displacements along a beam, see
+        :meth:`beam_displacement`.
         """
         return jnp.zeros((points.shape[0], 3), dtype=points.dtype)
 
@@ -1025,7 +1023,9 @@ class SupportBeams(Support):
             # Indices:        0  1  2   3   4   5   6  7  8   9  10  11
             K = jnp.zeros((12, 12))
 
-            # ── Axial (DOFs 0, 6) ───────────────────────────────────────────
+            # ================================================================
+            # Axial (DOFs 0, 6)
+            # ================================================================
             #  [  1  -1 ]
             #  [ -1   1 ] * EAL
             K = K.at[0, 0].set( EAL_b)
@@ -1033,13 +1033,17 @@ class SupportBeams(Support):
             K = K.at[6, 0].set(-EAL_b)
             K = K.at[6, 6].set( EAL_b)
 
-            # ── Torsion (DOFs 3, 9) ─────────────────────────────────────────
+            # ================================================================
+            # Torsion (DOFs 3, 9)
+            # ================================================================
             K = K.at[3, 3].set( GJL_b)
             K = K.at[3, 9].set(-GJL_b)
             K = K.at[9, 3].set(-GJL_b)
             K = K.at[9, 9].set( GJL_b)
 
-            # ── Bending in x–y plane (DOFs 1,5,7,11 — v and θz) ───────────
+            # ================================================================
+            # Bending in x–y plane (DOFs 1,5,7,11 — v and θz)
+            # ================================================================
             # Sub-block [v1, θz1, v2, θz2] with +6EIz/L² coupling terms
             # (positive sign: v = +θz * x in x–y plane)
             c12 = 12.0 * EIz_b / L3_b
@@ -1059,7 +1063,9 @@ class SupportBeams(Support):
             K = K.at[11, 1].set( c6);  K = K.at[11, 5].set( c2)
             K = K.at[11, 7].set(-c6);  K = K.at[11, 11].set( c4)
 
-            # ── Bending in x–z plane (DOFs 2,4,8,10 — w and θy) ───────────
+            # ================================================================
+            # Bending in x–z plane (DOFs 2,4,8,10 — w and θy)
+            # ================================================================
             # Sub-block [w1, θy1, w2, θy2] with –6EIy/L² coupling terms
             # (negative sign: w = –θy * x in x–z plane, per sign convention)
             d12 = 12.0 * EIy_b / L3_b
@@ -1400,16 +1406,18 @@ class SupportBeams(Support):
     def beam_labels(self) -> tuple:
         """Per-beam static metadata for plotting and VTU export.
 
-        Same beam ordering as :meth:`beam_segments` / :attr:`beam_options`
-        (coil-major, cc-then-cf, stellsym wrap group last).
+        Same beam ordering as :meth:`beam_segments`: coil-major CC then CF
+        per coil, then the stellsym wrap group, then the CS beams.
 
         Returns
         -------
         coil_idx_arr : np.ndarray, shape ``(N_beams,)``, int32
             Base-coil index each beam originates from (wrap-group beams are
-            labelled ``0``, matching coil 0's ``phi = 0`` image).
+            labelled ``0``, matching coil 0's ``phi = 0`` image; CS beams use
+            their start coil ``i0``).
         beam_type : np.ndarray, shape ``(N_beams,)``, int32
-            ``0`` for coil-coil (CC) beams, ``1`` for coil-foundation (CF).
+            ``0`` for coil-coil (CC) and CS beams, ``1`` for coil-foundation
+            (CF).
         """
         n_base = self.n_base
         coil_idx_arr = onp.concatenate([
@@ -1439,23 +1447,6 @@ class SupportBeams(Support):
                 beam_type, onp.zeros(self.n_beam_cs, dtype=onp.int32),
             ])
         return coil_idx_arr, beam_type
-
-    def endpoint_state(self, u_s: jax.Array) -> jax.Array:
-        """Reshape the flat solve vector into per-beam, per-node state.
-
-        Parameters
-        ----------
-        u_s : jax.Array, shape ``(n_support_dofs,)``
-            Output of :meth:`solve` (``state['u_s']`` / ``CoilFEM.run()``'s
-            ``'u_s'`` key).
-
-        Returns
-        -------
-        jax.Array, shape ``(n_beams_total, 2, 6)``
-            Global-frame ``[translation(3), rotation(3)]`` at node 1 (index
-            0) and node 2 (index 1) of every beam.
-        """
-        return u_s.reshape(self.n_beams_total, 2, 6)
 
     def beam_displacement(self, geom: dict, u_s: jax.Array, xi: jax.Array) -> jax.Array:
         """Closed-form global-frame centreline displacement along every beam.
@@ -1936,8 +1927,10 @@ class SupportBeams(Support):
         support_dofs : dict
             Traced support DOF pytree containing ``phis_start_cc``,
             ``phis_end_cc``, ``phis_start_cf``, ``x_foundation``,
-            ``thetas_orientation_cc``, ``thetas_orientation_cf``, and any
-            keys required by ``cross_section_fn`` and ``attachment_fn``.
+            ``thetas_orientation_cc``, ``thetas_orientation_cf`` (plus
+            ``phis_start_cs``, ``phis_end_cs`` and ``thetas_orientation_cs``
+            when CS beams are present), and any keys required by
+            ``cross_section_fn`` and ``attachment_fn``.
         surface_pts_by_coil : list[jax.Array] or None
             Current surface quadrature points per coil, shape
             ``(n_surface_quads_i, 3)`` for coil ``i``.  ``None`` skips the

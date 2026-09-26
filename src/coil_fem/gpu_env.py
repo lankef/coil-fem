@@ -1,18 +1,10 @@
 """GPU environment helpers for simsopt's JAX CPU pin and XLA memory policy.
 
-1. Simsopt JAX CPU pin
-
-:mod:`simsopt` pins JAX's default device to the CPU process-wide via
-``jax_platform_name='cpu'``. ``coil_fem`` clears that pin from
-``coil_fem/__init__.py`` after the eager simsopt import in :mod:`coil_fem.magnetic`.
-Call :func:`clear_simsopt_cpu_pin` again if you import simsopt *after*
-``coil_fem``.
-
-2. XLA GPU pre-allocation (opt-in)
-
-:func:`configure_gpu_memory` sets ``XLA_PYTHON_CLIENT_PREALLOCATE`` / mem
-fraction for cuDSS. Call it before any JAX computation; importing this module
-does not change those env vars.
+:func:`clear_simsopt_cpu_pin` undoes simsopt's process-wide
+``jax_platform_name='cpu'`` pin; ``coil_fem`` calls it on import, so call it
+again only if you import simsopt *after* ``coil_fem``.
+:func:`configure_gpu_memory` (opt-in) disables XLA GPU pre-allocation to leave
+memory for cuDSS; call it before any JAX computation.
 """
 from __future__ import annotations
 
@@ -25,7 +17,7 @@ __all__ = ["clear_simsopt_cpu_pin", "configure_gpu_memory"]
 
 
 # ============================================================================
-# Fix 1. Simsopt JAX CPU pin
+# Simsopt JAX CPU pin
 # ============================================================================
 
 
@@ -72,7 +64,7 @@ def _backend_is_initialized() -> bool:
 
 
 # ============================================================================
-# Fix 2. XLA GPU pre-allocation (opt-in)
+# XLA GPU pre-allocation (opt-in)
 # ============================================================================
 
 _VARS = ("XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_MEM_FRACTION")

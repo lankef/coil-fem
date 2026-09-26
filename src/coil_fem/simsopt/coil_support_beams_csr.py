@@ -127,8 +127,10 @@ class CoilSupportBeamsCSR(CoilSupport):
         Forwarded to :class:`~coil_fem.coupling.SupportBeamsCSR`.  Required
         keys: ``order``, ``w1``, ``w2``, ``n_phi``, ``E``, ``nu``.
     problem_options : dict
-        Same dict passed to :class:`~coil_fem.CoilFEM` (controls
-        ``gpu_assembly`` for the CSR pipeline).
+        Same dict passed to :class:`~coil_fem.CoilFEM`, forwarded to
+        :class:`~coil_fem.coupling.SupportBeamsCSR`.  The CSR pipeline
+        always forces ``solver='cudss'``, so this dict cannot switch
+        ``gpu_assembly``.
     phis_start_cc, phis_end_cc, phis_start_cf, x_foundation,
     thetas_orientation_cc, thetas_orientation_cf
         Same as :class:`CoilSupportBeams`.

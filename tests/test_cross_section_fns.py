@@ -99,9 +99,21 @@ def test_solid_rectangle_attachment_weights():
     assert cs.hollow_rectangle_attachment is cs.solid_rectangle_attachment
 
 
+def test_hollow_circle_attachment_uses_outer_radius():
+    """hollow_circle_attachment equals the solid version at max(r_1, r_2)."""
+    opts = {'eps_sigmoid': 0.05}
+    pts = jnp.array([[0.01, 0.0, 0.0], [0.01, 0.015, 0.0], [0.01, 0.0, 0.03]])
+    w_h = cs.hollow_circle_attachment(
+        pts, {'r_1_beam': 0.01, 'r_2_beam': 0.02}, True, opts,
+    )
+    w_s = cs.solid_circle_attachment(pts, {'r_beam': 0.02}, True, opts)
+    assert jnp.allclose(w_h, w_s)
+
+
 if __name__ == "__main__":
     test_hollow_rectangle_A_I_match_grid_quadrature()
     test_hollow_rectangle_J_matches_bredt()
     test_hollow_rectangle_ragged_structure()
     test_solid_rectangle_attachment_weights()
+    test_hollow_circle_attachment_uses_outer_radius()
     print("All cross_section_fns checks passed.")

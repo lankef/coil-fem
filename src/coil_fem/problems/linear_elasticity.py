@@ -3,8 +3,8 @@
 Provides :class:`LinearElasticity3D`, a JAX-FEM ``Problem`` subclass that
 supports fully-differentiable solves via ``ad_wrapper`` with respect to mesh
 node positions (``params['points']``), volumetric body forces
-(``params['body_force']``), and per-node Winkler spring weights
-(``params['support_k']``).  Companion helpers :func:`lame_parameters`,
+(``params['body_force']``), and per-surface-quadrature-point Winkler
+stiffness (``params['support_k']``).  Companion helpers :func:`lame_parameters`,
 :func:`itc_strain`, and :func:`recompute_fe_geometry` cover common setup
 tasks.
 """
@@ -82,7 +82,7 @@ def itc_strain(itc: jnp.ndarray) -> jnp.ndarray:
 
 
 # ============================================================================
-# JAX-native FE geometry (Path C)
+# JAX-native FE geometry
 # ============================================================================
 
 def recompute_fe_geometry(points, cells, shape_grads_ref, shape_vals, quad_weights):
@@ -382,10 +382,8 @@ class LinearElasticity3D(DeviceProblem):
           ``[0, n_surface_nodes)``.
         * ``self._sel_face_sv`` has shape
           ``(num_sel_faces, num_face_quads, nodes_per_face)`` — face shape
-          function values, used to interpolate nodal ``u`` to surface quad
-          points (:meth:`interp_surface_nodal_to_quads`) and to fold
-          quad-point weights back to per-node DOF quantities (monolithic
-          ``coupling_values``).
+          function values, used to fold quad-point weights back to per-node
+          DOF quantities (monolithic ``coupling_values``).
         """
         fe = self.fes[0]
         bi = self.boundary_inds_list[0]   # (num_sel, 2): [cell_idx, local_face_idx]
@@ -452,8 +450,7 @@ class LinearElasticity3D(DeviceProblem):
         """Global node indices of all Winkler surface nodes.
 
         Shape ``(n_surface_nodes,)``.  These are the indices into the full
-        ``(n_nodes, 3)`` mesh-node array used by :meth:`interp_surface_nodal_to_quads`
-        and by the monolithic coupling pattern.  Not related to the shape of
+        ``(n_nodes, 3)`` mesh-node array used by the monolithic coupling pattern.  Not related to the shape of
         ``params['support_k']``, which is per-surface-quad.
         """
         return self._surf_unique_global_nodes
@@ -529,31 +526,6 @@ class LinearElasticity3D(DeviceProblem):
         )  # (num_sel, n_fq)
         sel_weights = self._face_qw[bi[:, 1]]
         return ns_geom * det_J * sel_weights               # (num_sel, n_fq)
-
-    def interp_surface_nodal_to_quads(self, field: jnp.ndarray) -> jnp.ndarray:
-        """Interpolate a compact surface-node field to surface quad points.
-
-        Uses the cached face shape-function values to evaluate ``u(x_q) =
-        Σ_n N_n(x_q) u_n`` for each surface quadrature point, where ``n``
-        ranges over the surface-node compact index.
-
-        Parameters
-        ----------
-        field : jnp.ndarray, shape ``(n_surface_nodes,)`` or ``(n_surface_nodes, d)``
-            Field values at the compact surface nodes (i.e. indexed by
-            :attr:`surface_node_global_indices`).
-
-        Returns
-        -------
-        jnp.ndarray, shape ``(n_surface_quads,)`` or ``(n_surface_quads, d)``
-            Field interpolated to every surface quadrature point.
-        """
-        f_face = field[self._surf_face_to_surf_node]       # (n_sel, n_face_nodes[, d])
-        if field.ndim == 1:
-            interp = jnp.einsum('sqn,sn->sq', self._sel_face_sv, f_face)
-        else:
-            interp = jnp.einsum('sqn,snd->sqd', self._sel_face_sv, f_face)
-        return interp.reshape(self.n_surface_quads, *field.shape[1:])
 
     def get_tensor_map(self):
         """JAX-FEM hook: return the constitutive (stress) closure for volume assembly.
@@ -671,9 +643,8 @@ class LinearElasticity3D(DeviceProblem):
         self.physical_quad_points = pqp
 
         # Recompute surface geometry and fold Winkler stiffness into nanson_scale.
-        # (Surface geometry is inlined here; recompute_fe_surface_geometry was
-        # its only caller and has been removed.)  boundary_inds_list always
-        # holds exactly the one auto-detected exterior surface.
+        # boundary_inds_list always holds exactly the one auto-detected
+        # exterior surface.
         bi = self.boundary_inds_list[0]
         physical_coos = points[self._cells_jnp]           # (num_cells, num_nodes, dim)
         selected_coos = physical_coos[bi[:, 0]]            # (num_sel, num_nodes, dim)
@@ -705,7 +676,9 @@ class LinearElasticity3D(DeviceProblem):
         self.selected_face_shape_grads[0]    = fsg
         self.physical_surface_quad_points[0] = spqp
 
-        # ── Winkler stiffness ──────────────────────────────────────────
+        # ============================================================================
+        # Winkler stiffness
+        # ============================================================================
         # params['support_k'] is (n_surface_quads,) — already at quad points
         # in N/m³, no interpolation or scalar multiply needed.  Reshape to
         # (num_sel, num_fq) and absorb into nanson_scale so that the surface
@@ -724,9 +697,9 @@ class LinearElasticity3D(DeviceProblem):
         # internal_vars order matches _INTERNAL_VAR_NAMES exactly.
         self.internal_vars = [params['body_force'], lam_q, mu_q, eps_th_q]
 
-    # ------------------------------------------------------------------
+    # ============================================================================
     # Post-processing
-    # ------------------------------------------------------------------
+    # ============================================================================
     def von_mises_stress(self, sol_list: list) -> jnp.ndarray:
         """Compute von Mises stress at every quadrature point.
 

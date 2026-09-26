@@ -41,8 +41,12 @@ def _symmetry_Qs(nfp: int, stellsym: bool) -> np.ndarray:
     return np.asarray(out)
 
 
-def _coil_solid(occ, mesh, n_slices: int = _N_SLICES):
-    """Loft one rectangular coil into two half solids; return ``(dim, tag)`` list."""
+def _coil_solid(occ, mesh, w1, w2, n_slices: int = _N_SLICES):
+    """Loft one rectangular box into two half solids; return ``(dim, tag)`` list.
+
+    ``w1`` and ``w2`` are the full cross-section widths.  The winding pack
+    uses ``mesh.w1`` / ``mesh.w2``; the casing uses the outer widths.
+    """
     fc = mesh.framed_curve
     phi = np.linspace(0.0, 1.0, n_slices, endpoint=False)
     r0 = np.asarray(fc.curve.gamma_eval(phi))
@@ -53,8 +57,8 @@ def _coil_solid(occ, mesh, n_slices: int = _N_SLICES):
     wires = []
     for k in range(n_slices):
         pts = [
-            occ.addPoint(*(r0[k] + 0.5 * mesh.w1_outer * u * p[k]
-                                 + 0.5 * mesh.w2_outer * v * q[k]))
+            occ.addPoint(*(r0[k] + 0.5 * w1 * u * p[k]
+                                 + 0.5 * w2 * v * q[k]))
             for (u, v) in corners
         ]
         lines = [occ.addLine(pts[a], pts[(a + 1) % 4]) for a in range(4)]
@@ -118,31 +122,31 @@ def _apply_sym_copies(occ, dimtags, Q_list):
 
 
 def _entity_owner_map(ov_map, owners):
-    """Map fragment output volume tags to ``(owner_coil, owner_sym)``.
+    """Map fragment output volume tags to ``(owner_coil, owner_sym, material_id)``.
 
     ``owners[i]`` labels fragment input ``i``.  Each coil is several
-    volumes (two half-lofts), so labels are per input volume, not per
-    coil.  An output listed under several inputs (the overlap) is
-    claimed by the conductor; beam labels are ``(-1, -1)``.  The first
-    conductor to claim a tag keeps it.
+    volumes (two half-lofts per material), so labels are per input
+    volume, not per coil.  An output listed under several inputs (the
+    overlap) is claimed by the conductor with the lowest ``material_id``
+    (winding pack before casing).  Beam labels are ``(-1, -1, -1)``.
     """
-    owner_map: dict[int, tuple[int, int]] = {}
+    owner_map: dict[int, tuple[int, int, int]] = {}
     for src, outs in zip(owners, ov_map):
         if src[0] >= 0:
             continue
         for dim, tag in outs:
             if dim == 3:
-                owner_map[int(tag)] = (-1, -1)
+                owner_map[int(tag)] = (-1, -1, -1)
     for src, outs in zip(owners, ov_map):
         if src[0] < 0:
             continue
-        label = (int(src[0]), int(src[1]))
+        label = (int(src[0]), int(src[1]), int(src[2]))
         for dim, tag in outs:
             if dim != 3:
                 continue
             tag = int(tag)
             prev = owner_map.get(tag)
-            if prev is not None and prev[0] >= 0:
+            if prev is not None and prev[0] >= 0 and prev[2] <= label[2]:
                 continue
             owner_map[tag] = label
     return owner_map
@@ -155,31 +159,34 @@ def _write_vtu(
     cells,
     owner_coil,
     owner_sym,
+    material_id,
     clamp_centers,
     r_clamp,
     eps_sigmoid,
     k_clamp,
-    E,
-    nu,
-    rho,
+    materials,
     g_vec,
 ):
     # VTU contents for beam_dolfinx.py:
     #
     # FieldData — REQUIRED by load_vtu_problem / solve:
-    #   r_clamp, eps_sigmoid, k_clamp, E, nu, rho, g_vec
+    #   r_clamp, eps_sigmoid, k_clamp, g_vec
+    #   E, nu, rho — arrays indexed by CellData material_id
     #   clamp_centers — omitted when there are no fixed clamps (empty
     #   arrays are rejected by PyVista FieldData)
     #
-    # CellData — sanity / Paraview only (not read by beam_dolfinx; Lorentz
-    # reclassifies quads from Jstress.json; Winkler uses FieldData spheres):
-    #   owner_coil, owner_sym
+    # CellData:
+    #   owner_coil, owner_sym — sanity / Paraview (Lorentz reclassifies
+    #   quads from Jstress.json; Winkler uses FieldData spheres)
+    #   material_id — REQUIRED to index E/nu/rho; -1 is support and does
+    #   not use those arrays
     meshio.Mesh(
         points=points,
         cells=[("tetra10", cells)],
         cell_data={
             "owner_coil": [np.asarray(owner_coil, dtype=np.int32)],
             "owner_sym": [np.asarray(owner_sym, dtype=np.int32)],
+            "material_id": [np.asarray(material_id, dtype=np.int32)],
         },
     ).write(path)
     grid = pv.read(str(path))
@@ -189,15 +196,18 @@ def _write_vtu(
     grid.field_data["r_clamp"] = np.array([r_clamp], dtype=np.float64)
     grid.field_data["eps_sigmoid"] = np.array([eps_sigmoid], dtype=np.float64)
     grid.field_data["k_clamp"] = np.array([k_clamp], dtype=np.float64)
-    grid.field_data["E"] = np.array([E], dtype=np.float64)
-    grid.field_data["nu"] = np.array([nu], dtype=np.float64)
-    grid.field_data["rho"] = np.array([rho], dtype=np.float64)
+    grid.field_data["E"] = np.array([m["E"] for m in materials], dtype=np.float64)
+    grid.field_data["nu"] = np.array([m["nu"] for m in materials], dtype=np.float64)
+    grid.field_data["rho"] = np.array([m["density"] for m in materials], dtype=np.float64)
     grid.field_data["g_vec"] = np.asarray(g_vec, dtype=np.float64)
     grid.save(str(path))
 
 
 def _extract_tet10(owner_map):
-    """Read the order-2 tet mesh and per-cell owners. Returns points, cells, owners."""
+    """Read the order-2 tet mesh and per-cell owners.
+
+    Returns points, cells, owner_coil, owner_sym, material_id.
+    """
     node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
     node_tags = np.asarray(node_tags, dtype=np.int64)
     if node_tags.size == 0:
@@ -206,7 +216,7 @@ def _extract_tet10(owner_map):
     lut = np.full(int(node_tags.max()) + 1, -1, dtype=np.int64)
     lut[node_tags] = np.arange(node_tags.size)
 
-    cells, owner_coil, owner_sym = [], [], []
+    cells, owner_coil, owner_sym, material_id = [], [], [], []
     for dim, tag in gmsh.model.getEntities(3):
         etypes, _, ntags = gmsh.model.mesh.getElements(dim, tag)
         etypes = [int(t) for t in etypes]
@@ -222,10 +232,11 @@ def _extract_tet10(owner_map):
             raise RuntimeError(
                 f"to_full_body: tet node missing from getNodes (volume {tag})"
             )
-        oc, osym = owner_map.get(int(tag), (-1, -1))
+        oc, osym, mat = owner_map.get(int(tag), (-1, -1, -1))
         cells.append(conn)
         owner_coil.append(np.full(len(conn), oc, dtype=np.int32))
         owner_sym.append(np.full(len(conn), osym, dtype=np.int32))
+        material_id.append(np.full(len(conn), mat, dtype=np.int32))
     if not cells:
         raise RuntimeError("to_full_body: fragment left no volumes to mesh")
     return (
@@ -233,23 +244,29 @@ def _extract_tet10(owner_map):
         np.vstack(cells),
         np.concatenate(owner_coil),
         np.concatenate(owner_sym),
+        np.concatenate(material_id),
     )
 
 
 def _fragment_inputs(occ, meshes, Q_list, beam_dimtags):
     """Full-device coil then beam volumes, with a parallel owner list.
 
-    Coil owners are ``(base_coil, sym_image)``.  Beam owners are
-    ``(-1, -1)``.  Each coil image may contribute more than one volume
-    (the two half-lofts).
+    Coil owners are ``(base_coil, sym_image, material_id)``.  Beam owners
+    are ``(-1, -1, -1)``.  Each coil image may contribute more than one
+    volume (the two half-lofts of the winding pack, and of the casing
+    when ``mesh.n_casing > 0``).
     """
     n_base = len(meshes)
     n_sym = len(Q_list)
-    coil_vols = [[None] * n_base for _ in range(n_sym)]
+    coil_vols = [[[] for _ in range(n_base)] for _ in range(n_sym)]
     for i, mesh in enumerate(meshes):
-        copies = _apply_sym_copies(occ, _coil_solid(occ, mesh), Q_list)
-        for s, dts in enumerate(copies):
-            coil_vols[s][i] = dts
+        widths = [(mesh.w1, mesh.w2)]
+        if mesh.n_casing > 0:
+            widths.append((mesh.w1_outer, mesh.w2_outer))
+        for mat, (a, b) in enumerate(widths):
+            copies = _apply_sym_copies(occ, _coil_solid(occ, mesh, a, b), Q_list)
+            for s, dts in enumerate(copies):
+                coil_vols[s][i].append((dts, mat))
     if beam_dimtags:
         beam_vols = _apply_sym_copies(occ, beam_dimtags, Q_list)
     else:
@@ -258,15 +275,16 @@ def _fragment_inputs(occ, meshes, Q_list, beam_dimtags):
     inputs, owners = [], []
     for s in range(n_sym):
         for i in range(n_base):
-            for dim, tag in coil_vols[s][i]:
-                if dim == 3:
-                    inputs.append((3, tag))
-                    owners.append((i, s))
+            for dts, mat in coil_vols[s][i]:
+                for dim, tag in dts:
+                    if dim == 3:
+                        inputs.append((3, tag))
+                        owners.append((i, s, mat))
     for s in range(n_sym):
         for dim, tag in beam_vols[s]:
             if dim == 3:
                 inputs.append((3, tag))
-                owners.append((-1, -1))
+                owners.append((-1, -1, -1))
     return inputs, owners
 
 
@@ -279,11 +297,13 @@ def to_full_body(
     """Build a full-device TET10 mesh and write ``full_body_fields.vtu``.
 
     OCC ``fragment`` imprints beam–coil (and coil–coil) contacts so gmsh
-    meshes each volume once with shared interface nodes.  CellData
-    ``owner_coil`` / ``owner_sym`` label conductor cells; ``-1`` is
-    support.  Overlap regions are labelled conductor.  When fixed clamps
-    are disabled, ``clamp_centers`` is omitted from FieldData; consumers
-    must treat that key as optional.
+    meshes each volume once with shared interface nodes.  A cased coil is
+    two nested lofts (winding pack, then casing); the overlap is labelled
+    winding pack.  CellData ``owner_coil`` / ``owner_sym`` / ``material_id``
+    label cells; ``-1`` is support.  FieldData ``E``, ``nu`` and ``rho``
+    are arrays indexed by ``material_id``.  When fixed clamps are
+    disabled, ``clamp_centers`` is omitted from FieldData; consumers must
+    treat that key as optional.
 
     Parameters
     ----------
@@ -294,7 +314,8 @@ def to_full_body(
         meshes (:class:`~coil_fem.meshing.FramedCurveMeshRectangle`).
     mesh_scale : float
         Multiplier on gmsh ``MeshSizeMax``.  The size is
-        ``mesh_scale * 0.5 * w1``.
+        ``mesh_scale * 0.5 * w1``, capped at the smallest casing
+        thickness when a casing is present.
     path : path-like
         Output VTU path (default ``full_body_fields.vtu``).
     beam_length_factor : float
@@ -346,11 +367,8 @@ def to_full_body(
             "to_full_body requires rectangular coil meshes (FramedCurveMeshRectangle)."
         )
 
-    mesh_opts = fem.mesh_opts[0]
-    w1 = float(mesh_opts["w1"])
-    E = float(fem._E)
-    nu = float(fem._nu)
-    rho = float(fem._rho)
+    w1 = float(meshes[0].w1)
+    materials = fem.materials
     g_vec = np.asarray(
         (fem.gravity_options or {}).get("g_vec", (0.0, 0.0, 0.0)),
         dtype=np.float64,
@@ -366,6 +384,13 @@ def to_full_body(
     nfp, stellsym = support.nfp, support.stellsym
     Q_list = _symmetry_Qs(nfp, stellsym)
     size_max = mesh_scale * 0.5 * w1
+    t_min = min(
+        (m.casing_thickness for m in meshes if m.n_casing > 0), default=None,
+    )
+    if t_min is not None:
+        # ponytail: global cap; a gmsh size Field on the casing volumes
+        # would avoid refining the winding pack
+        size_max = min(size_max, t_min)
 
     # =========================================================================
     # Phase 1–4: OCC fragment, physical groups, gmsh volume mesh
@@ -407,18 +432,20 @@ def to_full_body(
             )
 
         owner_map = _entity_owner_map(ov_map, owners)
-        conductor_tags = [t for t, (c, _s) in owner_map.items() if c >= 0]
-        support_tags = [t for t, (c, _s) in owner_map.items() if c < 0]
-        if conductor_tags:
-            gmsh.model.addPhysicalGroup(3, conductor_tags, name="conductor")
-        if support_tags:
-            gmsh.model.addPhysicalGroup(3, support_tags, name="support")
+        groups = {
+            "winding_pack": [t for t, (_c, _s, mat) in owner_map.items() if mat == 0],
+            "casing": [t for t, (_c, _s, mat) in owner_map.items() if mat == 1],
+            "support": [t for t, (_c, _s, mat) in owner_map.items() if mat < 0],
+        }
+        for name, tags in groups.items():
+            if tags:
+                gmsh.model.addPhysicalGroup(3, tags, name=name)
 
         gmsh.option.setNumber("Mesh.MeshSizeMax", size_max)
         gmsh.option.setNumber("Mesh.ElementOrder", 2)
         print(f"to_full_body: meshing, MeshSizeMax={size_max:.4g}")
         gmsh.model.mesh.generate(3)
-        points, cells, owner_coil, owner_sym = _extract_tet10(owner_map)
+        points, cells, owner_coil, owner_sym, material_id = _extract_tet10(owner_map)
     finally:
         if owned:
             gmsh.finalize()
@@ -432,6 +459,7 @@ def to_full_body(
     n_cells = int(cells.shape[0])
     coil_cell = owner_coil >= 0
     n_coil_cells = int(np.count_nonzero(coil_cell))
+    n_casing_cells = int(np.count_nonzero(material_id == 1))
     n_support_cells = n_cells - n_coil_cells
     if n_coil_cells:
         n_coil_nodes = int(np.unique(cells[coil_cell]).size)
@@ -442,6 +470,7 @@ def to_full_body(
         "to_full_body mesh counts:\n"
         f"  all bodies:       {n_nodes} nodes, {n_cells} cells\n"
         f"  conductor (coil): {n_coil_nodes} nodes, {n_coil_cells} cells\n"
+        f"  casing:           {n_casing_cells} cells\n"
         f"  support:          {n_support_nodes} nodes, {n_support_cells} cells"
     )
 
@@ -465,13 +494,12 @@ def to_full_body(
         cells=cells,
         owner_coil=owner_coil,
         owner_sym=owner_sym,
+        material_id=material_id,
         clamp_centers=clamp_centers,
         r_clamp=r_clamp,
         eps_sigmoid=eps_sigmoid,
         k_clamp=k_clamp,
-        E=E,
-        nu=nu,
-        rho=rho,
+        materials=materials,
         g_vec=g_vec,
     )
     return path

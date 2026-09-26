@@ -105,8 +105,8 @@ jupyter lab ../docs/tutorial/coil_fem_workflow.ipynb
          │
          ▼
 ┌─────────────────┐
-│ rectangle_sweep │  Generate 3D mesh
-│  or disk_sweep  │  (automatic sizing)
+│ FramedCurveMesh │  Generate 3D mesh
+│ Rectangle/Disk  │  (automatic sizing)
 └────────┬────────┘
          │
          ▼
@@ -155,7 +155,7 @@ dofs = dofs.at[14].set(0.5)  # z: linear rise
 
 ```python
 # Rectangular
-mesh = rectangle_sweep(
+mesh = FramedCurveMeshRectangle(
     framed_curve,
     w_1=0.03,  # Wider
     w_2=0.01,  # Narrower
@@ -163,7 +163,7 @@ mesh = rectangle_sweep(
 )
 
 # Circular
-mesh = disk_sweep(
+mesh = FramedCurveMeshDisk(
     framed_curve,
     radius=0.02,
     aspect_ratio=1.0
@@ -174,21 +174,21 @@ mesh = disk_sweep(
 
 ```python
 # Finer mesh (smaller elements)
-mesh = rectangle_sweep(
+mesh = FramedCurveMeshRectangle(
     framed_curve,
     w_1=0.02, w_2=0.02,
     aspect_ratio=0.5  # Finer cross-section
 )
 
 # Coarser mesh (larger elements)
-mesh = rectangle_sweep(
+mesh = FramedCurveMeshRectangle(
     framed_curve,
     w_1=0.02, w_2=0.02,
     aspect_ratio=2.0  # Coarser cross-section
 )
 
 # Explicit control
-mesh = rectangle_sweep(
+mesh = FramedCurveMeshRectangle(
     framed_curve,
     w_1=0.02, w_2=0.02,
     n_grid_1=10,  # Explicit
