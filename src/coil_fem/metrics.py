@@ -144,7 +144,7 @@ def mean_von_mises_volume_weighted(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     shape_grads : jnp.ndarray or None
     JxW : jnp.ndarray or None
         Quadrature weights ``(n_cells, n_quads)``.
@@ -174,7 +174,7 @@ def max_von_mises_hard(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     shape_grads : jnp.ndarray or None
     JxW : jnp.ndarray or None
     epsilon_th : jnp.ndarray or None
@@ -210,7 +210,7 @@ def max_von_mises_lse(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     beta : float
         Smoothing parameter (default 20.0).
     shape_grads : jnp.ndarray or None
@@ -248,7 +248,7 @@ def sq_max_von_mises_lse(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     beta : float
         Smoothing parameter (default 20.0).
     shape_grads : jnp.ndarray or None
@@ -281,7 +281,7 @@ def l2_von_mises(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     shape_grads : jnp.ndarray or None
     JxW : jnp.ndarray or None
     epsilon_th : jnp.ndarray or None
@@ -311,7 +311,7 @@ def strain_energy_density(
     ----------
     u_grad : jnp.ndarray, shape ``(..., 3, 3)``
         Displacement gradient at each quadrature point.
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
         Lamé parameters.
     epsilon_th : jnp.ndarray or None
         Constant thermal eigenstrain ``(3, 3)``; ``None`` for isothermal.
@@ -336,7 +336,7 @@ def total_strain_energy(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     shape_grads : jnp.ndarray or None
     JxW : jnp.ndarray or None
     epsilon_th : jnp.ndarray or None

@@ -333,7 +333,6 @@ class CoilFEMObjective(Optimizable):
         """
         result = self.run()
         fem = self.fem
-        lam, mu = fem._lam, fem._mu
         num_d2 = num_vm2 = num_f2 = vol = 0.0
         max_d = max_vm = max_f = 0.0
         strain_energy = 0.0
@@ -364,7 +363,8 @@ class CoilFEMObjective(Optimizable):
     
             vol += np.sum(jxw)
             strain_energy += float(total_strain_energy(
-                prob, result['solutions'][i], lam, mu, shape_grads=sg, JxW=jxw_j))
+                prob, result['solutions'][i], prob.lam_q, prob.mu_q,
+                shape_grads=sg, JxW=jxw_j))
         return {
             'rms_displacement_m': float(np.sqrt(num_d2 / vol)),
             'max_displacement_m': max_d,
