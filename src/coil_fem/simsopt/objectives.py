@@ -330,11 +330,14 @@ class CoilFEMObjective(Optimizable):
         fields, weighted directly by JxW.  Displacement magnitude is a nodal field
         interpolated to the quadrature points with the element shape functions before
         weighting.  Maxima are taken over the raw (unsmoothed) quantities.
+        von Mises RMS/max are also reported per material (winding pack, and
+        casing when present).
         """
         result = self.run()
         fem = self.fem
-        num_d2 = num_vm2 = num_f2 = vol = 0.0
-        max_d = max_vm = max_f = 0.0
+        num_d2 = num_f2 = vol = 0.0
+        max_d = max_f = 0.0
+        vm2_m, vol_m, max_m = [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]
         strain_energy = 0.0
         for i in range(len(result['von_mises'])):
             prob = fem.pipelines[i].problem
@@ -347,8 +350,13 @@ class CoilFEMObjective(Optimizable):
     
             # von Mises: quadrature field -> weight by JxW directly
             vm = np.asarray(result['von_mises'][i])
-            num_vm2 += np.sum(vm**2 * jxw)
-            max_vm   = max(max_vm, float(np.max(vm)))
+            mid = np.asarray(prob.material_id_q)
+            for m in (0, 1):
+                sel = mid == m
+                if sel.any():
+                    vm2_m[m] += np.sum(vm[sel]**2 * jxw[sel])
+                    vol_m[m] += np.sum(jxw[sel])
+                    max_m[m] = max(max_m[m], float(np.max(vm[sel])))
     
             # |u|: nodal field -> interpolate to quadrature points, then weight
             dmag   = np.linalg.norm(np.asarray(result['displacements'][i]), axis=-1)
@@ -365,15 +373,23 @@ class CoilFEMObjective(Optimizable):
             strain_energy += float(total_strain_energy(
                 prob, result['solutions'][i], prob.lam_q, prob.mu_q,
                 shape_grads=sg, JxW=jxw_j))
-        return {
+        out = {
             'rms_displacement_m': float(np.sqrt(num_d2 / vol)),
             'max_displacement_m': max_d,
-            'rms_von_mises_Pa':   float(np.sqrt(num_vm2 / vol)),
-            'max_von_mises_Pa':   max_vm,
+            'rms_von_mises_Pa':   float(np.sqrt(sum(vm2_m) / vol)),
+            'max_von_mises_Pa':   max(max_m),
+            'rms_von_mises_winding_pack_Pa': float(np.sqrt(vm2_m[0] / vol_m[0])),
+            'max_von_mises_winding_pack_Pa': max_m[0],
+        }
+        if vol_m[1] > 0.0:
+            out['rms_von_mises_casing_Pa'] = float(np.sqrt(vm2_m[1] / vol_m[1]))
+            out['max_von_mises_casing_Pa'] = max_m[1]
+        out.update({
             'rms_body_force_Npm3': float(np.sqrt(num_f2 / vol)),
             'max_body_force_Npm3': max_f,
             'strain_energy_J':    strain_energy,
-        }
+        })
+        return out
 
     def to_vtu(self, out_dir: str = ".", *, run: bool = True,
                prefix: str = "coil", n_sub: int = 20):
