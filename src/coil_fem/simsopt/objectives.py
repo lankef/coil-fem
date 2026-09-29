@@ -217,8 +217,7 @@ class CoilFEMObjective(Optimizable):
             self._jit_vg = _vg
 
         # Caches invalidated via recompute_bell() when any DOFs change.
-        self._needs_J: bool = True
-        self._needs_dJ: bool = True
+        self._needs_update: bool = True
         self._J_cache: float | None = None
         self._grad_curves: list | None = None
         self._grad_currents: np.ndarray | None = None
@@ -232,8 +231,7 @@ class CoilFEMObjective(Optimizable):
 
     def recompute_bell(self, child=None, parent=None):
         """Invalidate cached J / dJ when any ancestor DOFs change."""
-        self._needs_J = True
-        self._needs_dJ = True
+        self._needs_update = True
 
     # ============================================================================
     # Core computation
@@ -256,18 +254,9 @@ class CoilFEMObjective(Optimizable):
         result = self.fem.objective(cdofs, idofs, sdofs, metrics=self._metrics)
         return sum(w * result[m] for w, m in zip(self._metric_weights, self._metrics))
 
-    def _compute_J(self):
-        """Evaluate the forward objective value without an adjoint solve."""
-        if not self._needs_J:
-            return
-        cdofs, idofs, sdofs = self._read_dofs()
-        J_val, _ = self._jit_vg(cdofs, idofs, sdofs)
-        self._J_cache = float(J_val)
-        self._needs_J = False
-
-    def _compute_dJ(self):
-        """Evaluate gradients (and refresh J cache) via value_and_grad."""
-        if not self._needs_dJ:
+    def _compute(self):
+        """Evaluate J and its gradients from the single ``value_and_grad``."""
+        if not self._needs_update:
             return
         cdofs, idofs, sdofs = self._read_dofs()
 
@@ -276,12 +265,10 @@ class CoilFEMObjective(Optimizable):
         )
 
         self._J_cache = float(J_val)
-        self._needs_J = False
-
         self._grad_curves   = [np.asarray(g) for g in grad_cdofs]
         self._grad_currents = np.asarray(grad_idofs)
         self._grad_support  = grad_sdofs   # single dict
-        self._needs_dJ = False
+        self._needs_update = False
 
     # ============================================================================
     # Simsopt interface
@@ -289,7 +276,7 @@ class CoilFEMObjective(Optimizable):
 
     def J(self):
         """Weighted sum of FEM metrics (scalar)."""
-        self._compute_J()
+        self._compute()
         return self._J_cache
 
     @derivative_dec
@@ -300,7 +287,7 @@ class CoilFEMObjective(Optimizable):
         ``@derivative_dec`` contracts it into a flat numpy array aligned with
         ``self.x`` before returning to the caller.
         """
-        self._compute_dJ()
+        self._compute()
 
         d = Derivative({})
         for curve, g in zip(self.coil_support.base_curves, self._grad_curves):
