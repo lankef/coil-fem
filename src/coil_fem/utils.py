@@ -1,7 +1,7 @@
 """General-purpose math helpers shared across the package.
 
-Small, self-contained numerical formulas (clamp weighting, interpolation)
-that don't belong to any single physics module.
+Small, self-contained numerical formulas (clamp weighting, material blending,
+interpolation) that don't belong to any single physics module.
 """
 
 from jax.nn import sigmoid
@@ -10,6 +10,10 @@ from jax.nn import sigmoid
 def clamp_sigmoid(d_sq, r, eps_sigmoid):
     sigmoid_width = eps_sigmoid * r
     return sigmoid((r**2 - d_sq) / (sigmoid_width**2))
+
+
+def step_sigmoid(d, width):
+    return sigmoid(d / width)
 
 
 def cubic_hermite_interp(xi, L, y0, dy0, y1, dy1):
