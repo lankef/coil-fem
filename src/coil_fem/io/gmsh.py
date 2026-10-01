@@ -288,11 +288,193 @@ def _fragment_inputs(occ, meshes, Q_list, beam_dimtags):
     return inputs, owners
 
 
+def _fillet_radius(fillet_options: dict | None) -> float | None:
+    """Return the fillet radius, or None when filleting is disabled."""
+    if fillet_options is None:
+        return None
+    if "fillet_type" not in fillet_options:
+        raise ValueError(
+            "to_full_body: fillet_options must contain 'fillet_type'"
+        )
+    fillet_type = fillet_options["fillet_type"]
+    if fillet_type != "fillet":
+        raise ValueError(f"unrecognized fillet type {fillet_type!r}")
+    if "fillet_radius" not in fillet_options:
+        raise ValueError(
+            "to_full_body: fillet_options must contain 'fillet_radius'"
+        )
+    radius = float(fillet_options["fillet_radius"])
+    if radius <= 0.0:
+        raise ValueError(f"fillet_radius must be positive, got {radius}")
+    return radius
+
+
+def _boundary_curves(dim: int, tag: int) -> list[int]:
+    """Unique curve tags on the boundary of one face or volume."""
+    if dim == 3:
+        faces = gmsh.model.getBoundary(
+            [(3, tag)], combined=False, oriented=False,
+        )
+        dimtags = [(d, int(t)) for d, t in faces if d == 2]
+    else:
+        dimtags = [(dim, tag)]
+    curves: list[int] = []
+    seen: set[int] = set()
+    for fdim, ftag in dimtags:
+        for cdim, ctag in gmsh.model.getBoundary(
+            [(fdim, ftag)], combined=False, oriented=False,
+        ):
+            if cdim != 1:
+                continue
+            ctag = abs(int(ctag))
+            if ctag not in seen:
+                seen.add(ctag)
+                curves.append(ctag)
+    return curves
+
+
+def _junction_curves(owner_map) -> list[int]:
+    """Curves of faces shared by one beam volume and one conductor."""
+    curves: list[int] = []
+    seen: set[int] = set()
+    for dim, tag in gmsh.model.getEntities(2):
+        upward, _down = gmsh.model.getAdjacencies(dim, tag)
+        vols = [int(v) for v in upward]
+        if len(vols) != 2:
+            continue
+        labels = [owner_map.get(v) for v in vols]
+        if any(label is None for label in labels):
+            continue
+        if sum(label[0] < 0 for label in labels) != 1:
+            continue
+        for curve in _boundary_curves(2, int(tag)):
+            if curve not in seen:
+                seen.add(curve)
+                curves.append(curve)
+    return curves
+
+
+def _curve_midpoint(tag: int) -> list[float]:
+    """Parametric midpoint of a curve, as ``[x, y, z]``."""
+    tmin, tmax = gmsh.model.getParametrizationBounds(1, tag)
+    tmid = 0.5 * (float(tmin[0]) + float(tmax[0]))
+    xyz = gmsh.model.getValue(1, tag, [tmid])
+    return [float(xyz[0]), float(xyz[1]), float(xyz[2])]
+
+
+def _near_junction(mid: list[float], jc_tags: list[int], tol: float) -> bool:
+    """True when ``mid`` lies within ``tol`` of a junction curve."""
+    tol2 = tol * tol
+    for tag in jc_tags:
+        closest, _par = gmsh.model.getClosestPoint(1, tag, mid)
+        dx = float(closest[0]) - mid[0]
+        dy = float(closest[1]) - mid[1]
+        dz = float(closest[2]) - mid[2]
+        if dx * dx + dy * dy + dz * dz <= tol2:
+            return True
+    return False
+
+
+def _fillet_joints(occ, owner_map, radius: float):
+    """Fillet coil–beam joints and return an updated volume owner map.
+
+    Fillet-only volumes are labelled support ``(-1, -1, -1)``.  Conductor
+    and beam volumes keep the labels in ``owner_map``.
+    """
+    occ.synchronize()
+    junctions = _junction_curves(owner_map)
+    if not junctions:
+        print("to_full_body: no coil-beam joint to fillet")
+        return owner_map
+
+    vol_tags = [int(t) for t in owner_map]
+    vols = [(3, t) for t in vol_tags]
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    for tag in vol_tags:
+        bb = gmsh.model.getBoundingBox(3, tag)
+        for i in range(3):
+            lo[i] = min(lo[i], bb[i])
+            hi[i] = max(hi[i], bb[i + 3])
+    extent = max(hi[i] - lo[i] for i in range(3))
+    tol = 1e-4 * extent
+
+    jc_copies = list(occ.copy([(1, c) for c in junctions]))
+    keep = list(occ.copy(vols))
+    keep_owners = [owner_map[t] for t in vol_tags]
+    # ponytail: one fuse of every solid; cost and boolean fragility grow
+    # with the solid count. Upgrade path: fuse each connected coil-beam
+    # cluster on its own.
+    fused, _fused_map = occ.fuse(vols[:1], vols[1:])
+    occ.synchronize()
+
+    jc_tags = [int(t) for d, t in jc_copies if d == 1]
+    to_fillet = []
+    to_drop = []
+    for dim, tag in fused:
+        if dim != 3:
+            continue
+        tag = int(tag)
+        edges = [
+            c for c in _boundary_curves(3, tag)
+            if _near_junction(_curve_midpoint(c), jc_tags, tol)
+        ]
+        if edges:
+            to_fillet.append((tag, edges))
+        else:
+            to_drop.append((3, tag))
+    if not to_fillet:
+        raise RuntimeError(
+            "to_full_body: coil-beam junction curves did not match any "
+            "edge of the fused solid"
+        )
+
+    if jc_copies:
+        occ.remove(jc_copies, recursive=True)
+    if to_drop:
+        occ.remove(to_drop, recursive=True)
+
+    filleted = []
+    n_edges = 0
+    for tag, edges in to_fillet:
+        n_edges += len(edges)
+        try:
+            out = occ.fillet([tag], edges, [radius])
+        except Exception as exc:
+            raise RuntimeError(
+                "to_full_body: OCC fillet failed. "
+                f"Lower fillet_radius (currently {radius})."
+            ) from exc
+        vols_out = [(d, int(t)) for d, t in out if d == 3]
+        if not vols_out:
+            raise RuntimeError("to_full_body: OCC fillet returned no volume")
+        filleted.extend(vols_out)
+    print(f"to_full_body: filleted {n_edges} joint edges, radius={radius}")
+
+    inputs = filleted + keep
+    owners = [(-1, -1, -1)] * len(filleted) + keep_owners
+    try:
+        _ov, ov_map = occ.fragment(inputs, [])
+        occ.synchronize()
+    except Exception as exc:
+        raise RuntimeError(
+            "to_full_body: OCC fragment of the filleted solid failed."
+        ) from exc
+    if len(ov_map) != len(owners):
+        raise RuntimeError(
+            "to_full_body: fillet fragment map length "
+            f"{len(ov_map)} != {len(owners)} inputs"
+        )
+    return _entity_owner_map(ov_map, owners)
+
+
 def to_full_body(
     Jstress,
     mesh_scale: float = 0.5,
     path: str | Path = "full_body_fields.vtu",
     beam_length_factor: float = 0.95,
+    save_step: bool = False,
+    fillet_options: dict | None = None,
 ) -> Path:
     """Build a full-device TET10 mesh and write ``full_body_fields.vtu``.
 
@@ -304,6 +486,11 @@ def to_full_body(
     are arrays indexed by ``material_id``.  When fixed clamps are
     disabled, ``clamp_centers`` is omitted from FieldData; consumers must
     treat that key as optional.
+
+    When ``save_step`` is set, the symmetry-expanded coil and beam solids
+    are written to a STEP file before the fragment.  When
+    ``fillet_options`` is set, coil–beam joints are filleted after the
+    fragment and before meshing; the added material is labelled support.
 
     Parameters
     ----------
@@ -322,6 +509,15 @@ def to_full_body(
         Beam solids are built with length ``beam_length_factor * L``
         (default 0.95) so the far end pulls back from the mating solid.
         Must be positive.
+    save_step : bool
+        When True, write the symmetry-expanded coil and beam solids
+        (before the fragment) next to ``path``, with a ``.step`` suffix.
+        Coordinates are metres.  Overlapping solids are expected.
+    fillet_options : dict or None
+        ``None`` (default) skips filleting.  Otherwise must contain
+        ``fillet_type`` (only ``'fillet'`` is supported) and
+        ``fillet_radius``, one positive radius applied at every
+        coil–beam joint.
 
     Returns
     -------
@@ -331,16 +527,30 @@ def to_full_body(
     Raises
     ------
     ValueError
-        Rectangular meshes or an OCC solid factory are missing, or
-        ``beam_length_factor`` is not positive.
+        Rectangular meshes or an OCC solid factory are missing,
+        ``beam_length_factor`` is not positive, or ``fillet_options``
+        has an unrecognized ``fillet_type`` or a missing or
+        non-positive ``fillet_radius``.
     RuntimeError
-        The OCC fragment failed.  Lower ``beam_length_factor``, or use
-        the wildmeshing path in ``gmsh.py.old``.
+        The OCC fragment or fillet failed.  Lower
+        ``beam_length_factor`` or ``fillet_radius``, or use the
+        wildmeshing path in ``gmsh.py.old``.
+
+    Notes
+    -----
+    An OCC fillet on a beam-into-loft intersection curve can fail.  The
+    radius must be well below the beam cross-section size and the local
+    coil width, and ``MeshSizeMax`` is not reduced to resolve it.  A
+    beam end pulled back by ``beam_length_factor`` < 1 does not touch
+    the coil and is not filleted.  The fillet meets the coil and beam
+    tangentially, so the imprint of the fillet solid can leave sliver
+    faces; check the mesh when a joint looks faceted.
     """
     if beam_length_factor <= 0.0:
         raise ValueError(
             f"beam_length_factor must be positive, got {beam_length_factor}"
         )
+    radius = _fillet_radius(fillet_options)
 
     path = Path(path)
     coil_support = Jstress.coil_support
@@ -411,6 +621,13 @@ def to_full_body(
             length_factor=beam_length_factor,
         )
         inputs, owners = _fragment_inputs(occ, meshes, Q_list, beam_dimtags)
+        if save_step:
+            occ.synchronize()
+            # Default STEP units are millimetres; the model is metres.
+            gmsh.option.setString("Geometry.OCCTargetUnit", "M")
+            step_path = path.with_suffix(".step")
+            gmsh.write(str(step_path))
+            print(f"to_full_body: wrote {step_path}")
         print(
             f"to_full_body: fragment {len(inputs)} solids "
             f"(beam_length_factor={beam_length_factor})"
@@ -432,6 +649,8 @@ def to_full_body(
             )
 
         owner_map = _entity_owner_map(ov_map, owners)
+        if radius is not None:
+            owner_map = _fillet_joints(occ, owner_map, radius)
         groups = {
             "winding_pack": [t for t, (_c, _s, mat) in owner_map.items() if mat == 0],
             "casing": [t for t, (_c, _s, mat) in owner_map.items() if mat == 1],

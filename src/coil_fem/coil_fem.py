@@ -223,7 +223,17 @@ class CoilFEM:
           ``ΔL/L`` on cooldown (positive, dimensionless).  Applied as the
           eigenstrain ``ε_th = −itc · I``.  Not a differentiable DOF.
     casing_options : dict or None
-        Same keys as ``winding_pack_options``, plus ``'thickness'`` [m].
+        Same keys as ``winding_pack_options``, plus:
+
+        * ``'thickness'`` : float [m] — casing thickness.
+        * ``'eps_sigmoid'`` : float or None, default 1.0 — width of the
+          winding-pack to casing property transition, in multiples of
+          ``'thickness'``.  A soft transition is the default because a hard
+          material jump causes stress singularities that hurt gradient-based
+          optimisation.  Pass ``None`` for a hard interface.
+        * ``'beta'`` : float, default 20.0 — dimensionless log-sum-exp
+          sharpness for the distance to the winding-pack edge.
+
         When given, a current-free casing of that thickness is added outside
         a rectangular winding pack.  ``None`` (default) is no casing.
 
@@ -300,13 +310,23 @@ class CoilFEM:
         # ============================================================================
         materials = [{**winding_pack_options, 'current_weight': 1.0}]
         casing_thickness = None
+        eps_sigmoid, beta = None, 20.0
         if casing_options is not None:
             if any(opt['shape'] != 'rect' for opt in self.mesh_opts):
                 raise NotImplementedError("casing_options requires shape='rect'.")
             casing_thickness = float(casing_options['thickness'])
             if casing_thickness <= 0.0:
                 raise ValueError("casing_options['thickness'] must be > 0.")
-            casing = {k: v for k, v in casing_options.items() if k != 'thickness'}
+            eps_sigmoid = casing_options.get('eps_sigmoid', 1.0)
+            beta = float(casing_options.get('beta', 20.0))
+            if eps_sigmoid is not None and eps_sigmoid <= 0.0:
+                raise ValueError("casing_options['eps_sigmoid'] must be > 0 or None.")
+            if beta <= 0.0:
+                raise ValueError("casing_options['beta'] must be > 0.")
+            casing = {
+                k: v for k, v in casing_options.items()
+                if k not in ('thickness', 'eps_sigmoid', 'beta')
+            }
             materials.append({**casing, 'current_weight': 0.0})
         for i, m in enumerate(materials):
             missing = {'E', 'nu', 'density'} - m.keys()
@@ -348,6 +368,7 @@ class CoilFEM:
             self.pipelines.append(
                 pipeline_cls(
                     mesh, self.materials, tuple(grav_vec), self.problem_options,
+                    eps_sigmoid=eps_sigmoid, beta=beta,
                 )
             )
 

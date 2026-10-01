@@ -69,8 +69,13 @@ class CoilFEMObjective(Optimizable):
         Winding-pack material properties (``'E'``, ``'nu'``, ``'density'``,
         ``'itc'``).  Required; ``None`` raises.
     casing_options : dict or None
-        Casing material properties, same keys plus ``'thickness'`` [m].
-        ``None`` means no casing.
+        Casing material properties, same keys plus ``'thickness'`` [m],
+        ``'eps_sigmoid'`` (float or None, default 1.0; transition width in
+        multiples of ``'thickness'``) and ``'beta'`` (float, default 20.0;
+        log-sum-exp sharpness).  A soft transition is the default because a
+        hard material jump causes stress singularities that hurt
+        gradient-based optimisation.  Pass ``'eps_sigmoid': None`` for a hard
+        interface.  ``None`` means no casing.
     problem_options : dict or None
         Solver options forwarded to :class:`~coil_fem.CoilFEM`
         (including ``'remat_bs'``, default True).

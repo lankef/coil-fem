@@ -14,9 +14,11 @@ from typing import TYPE_CHECKING
 import jax
 import jax.flatten_util
 import jax.numpy as jnp
+from jax.scipy.special import logsumexp
 
 from .problems import LinearElasticity3D
 from .solvers import build_fwd_pred, needs_gpu_assembly
+from .utils import step_sigmoid
 
 if TYPE_CHECKING:
     from .meshing import FramedCurveMesh
@@ -42,6 +44,13 @@ class ElasticPipeline:
         Gravity acceleration [m/s²].  The body force is ``density * g_vec``.
     problem_options : dict
         Options forwarded to :func:`~coil_fem.solvers.build_fwd_pred`.
+    eps_sigmoid : float or None
+        Width of the winding-pack to casing property transition, in multiples
+        of the casing thickness.  ``None`` (default) keeps a hard interface.
+        :class:`~coil_fem.CoilFEM` passes ``1.0`` unless told otherwise.
+    beta : float
+        Dimensionless sharpness of the log-sum-exp smooth max used for the
+        distance to the winding-pack edge (default 20.0).
     """
 
     def __init__(
@@ -50,6 +59,9 @@ class ElasticPipeline:
         materials: list[dict],
         g_vec,
         problem_options: dict,
+        *,
+        eps_sigmoid=None,
+        beta=20.0,
     ):
         self.mesh = mesh
 
@@ -59,6 +71,17 @@ class ElasticPipeline:
             gpu_assembly=needs_gpu_assembly(problem_options),
         )
         mesh.attach_ref_coords(self.problem)
+        if eps_sigmoid is not None and mesh.n_casing > 0:
+            p, t = self.problem, mesh.casing_thickness
+            dd = (jnp.abs(mesh.uv_quad) - 1.0) * jnp.array([mesh.w1, mesh.w2]) / 2.0
+            d = (t / beta) * logsumexp(beta * dd / t, axis=-1)
+            s = step_sigmoid(d, eps_sigmoid * t)
+            blend = lambda tab: tab[0] + jnp.multiply.outer(s, tab[1] - tab[0])
+            p.lam_q, p.mu_q, p.rho_q = (blend(p.lam_list), blend(p.mu_list), blend(p.rho_list))
+            p.eps_th_q = blend(p.eps_th_list)
+            if p.epsilon_th is not None:
+                p.epsilon_th = p.eps_th_q
+            p.internal_vars = [p.internal_vars[0], p.lam_q, p.mu_q, p.eps_th_q]
         self.lam, self.mu = self.problem.lam_q, self.problem.mu_q
 
         self.surface_node_indices = self.problem.surface_node_global_indices
