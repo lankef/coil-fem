@@ -66,7 +66,7 @@ src/coil_fem/                  # main package (Hatchling src-layout)
     cross_section_fns.py       # solid/hollow circle & rectangle section factories
   io/                          # I/O helpers (import coil_fem.io.gmsh, not coil_fem.io)
     __init__.py                # namespace only; no re-exports
-    gmsh.py                    # to_full_body — OCC + fTetWild full-body VTU export
+    gmsh.py                    # to_full_body — OCC fragment + gmsh TET10 full-body VTU export
   geo/                         # Curve geometry and symmetry subpackage
     __init__.py                # re-exports CurveXYZFourierJAX, framed curves, symmetry helpers
     curve_jax.py               # CurveXYZFourierJAX — JAX pytree, simsopt interop
