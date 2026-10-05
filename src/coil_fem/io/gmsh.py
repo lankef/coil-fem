@@ -8,6 +8,7 @@ face is shared, then filled by gmsh.  Beam cross-sections come from
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import gmsh
@@ -26,6 +27,14 @@ _TET10 = 11
 # (meshio ``_gmsh_to_meshio_order``): VTK[i] = gmsh[perm[i]].
 _GMSH_TET10_TO_VTK = np.array([0, 1, 2, 3, 4, 5, 6, 7, 9, 8], dtype=np.int64)
 
+_SMOOTHING_KEYS = {
+    "joint_type",
+    "joint_fillet_radius",
+    "interface_type",
+    "interface_rounding_radius",
+    "interface_mesh_size",
+}
+
 
 def _symmetry_Qs(nfp: int, stellsym: bool) -> np.ndarray:
     """Orthogonal maps base → image; identity first. Shape ``(n_sym, 3, 3)``."""
@@ -41,11 +50,12 @@ def _symmetry_Qs(nfp: int, stellsym: bool) -> np.ndarray:
     return np.asarray(out)
 
 
-def _coil_solid(occ, mesh, w1, w2, n_slices: int = _N_SLICES):
-    """Loft one rectangular box into two half solids; return ``(dim, tag)`` list.
+def _coil_solid(occ, mesh, w1, w2, radius=None, n_slices: int = _N_SLICES):
+    """Loft one box into two half solids; return ``(dim, tag)`` list.
 
     ``w1`` and ``w2`` are the full cross-section widths.  The winding pack
     uses ``mesh.w1`` / ``mesh.w2``; the casing uses the outer widths.
+    ``radius`` rounds every cross-section corner (winding pack only).
     """
     fc = mesh.framed_curve
     phi = np.linspace(0.0, 1.0, n_slices, endpoint=False)
@@ -56,14 +66,35 @@ def _coil_solid(occ, mesh, w1, w2, n_slices: int = _N_SLICES):
     corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
     wires = []
     for k in range(n_slices):
-        pts = [
-            occ.addPoint(*(r0[k] + 0.5 * w1 * u * p[k]
-                                 + 0.5 * w2 * v * q[k]))
-            for (u, v) in corners
-        ]
-        lines = [occ.addLine(pts[a], pts[(a + 1) % 4]) for a in range(4)]
-        wires.append(occ.addWire(lines))
-
+        if radius is None:
+            pts = [
+                occ.addPoint(*(r0[k] + 0.5 * w1 * u * p[k]
+                                     + 0.5 * w2 * v * q[k]))
+                for (u, v) in corners
+            ]
+            edges = [occ.addLine(pts[a], pts[(a + 1) % 4]) for a in range(4)]
+        else:
+            r = float(radius)
+            centres, on_u, on_v = [], [], []
+            for u, v in corners:
+                centre = (
+                    r0[k] + (0.5 * w1 - r) * u * p[k]
+                    + (0.5 * w2 - r) * v * q[k]
+                )
+                centres.append(occ.addPoint(*centre))
+                on_u.append(occ.addPoint(*(centre + r * u * p[k])))
+                on_v.append(occ.addPoint(*(centre + r * v * q[k])))
+            # Even corners leave along q; odd corners leave along p.
+            edges = []
+            for i in range(4):
+                nxt = (i + 1) % 4
+                if i % 2 == 0:
+                    start, end, nxt_start = on_u[i], on_v[i], on_v[nxt]
+                else:
+                    start, end, nxt_start = on_v[i], on_u[i], on_u[nxt]
+                edges.append(occ.addCircleArc(start, centres[i], end))
+                edges.append(occ.addLine(end, nxt_start))
+        wires.append(occ.addWire(edges))
     half = n_slices // 2
     out = []
     out += occ.addThruSections(wires[: half + 1], makeSolid=True, makeRuled=False)
@@ -248,13 +279,14 @@ def _extract_tet10(owner_map):
     )
 
 
-def _fragment_inputs(occ, meshes, Q_list, beam_dimtags):
+def _fragment_inputs(occ, meshes, Q_list, beam_dimtags, interface_r=None):
     """Full-device coil then beam volumes, with a parallel owner list.
 
     Coil owners are ``(base_coil, sym_image, material_id)``.  Beam owners
     are ``(-1, -1, -1)``.  Each coil image may contribute more than one
     volume (the two half-lofts of the winding pack, and of the casing
-    when ``mesh.n_casing > 0``).
+    when ``mesh.n_casing > 0``).  ``interface_r`` rounds the winding-pack
+    profile only; the casing loft stays a sharp box.
     """
     n_base = len(meshes)
     n_sym = len(Q_list)
@@ -264,7 +296,10 @@ def _fragment_inputs(occ, meshes, Q_list, beam_dimtags):
         if mesh.n_casing > 0:
             widths.append((mesh.w1_outer, mesh.w2_outer))
         for mat, (a, b) in enumerate(widths):
-            copies = _apply_sym_copies(occ, _coil_solid(occ, mesh, a, b), Q_list)
+            radius = interface_r if mat == 0 else None
+            copies = _apply_sym_copies(
+                occ, _coil_solid(occ, mesh, a, b, radius=radius), Q_list,
+            )
             for s, dts in enumerate(copies):
                 coil_vols[s][i].append((dts, mat))
     if beam_dimtags:
@@ -288,91 +323,95 @@ def _fragment_inputs(occ, meshes, Q_list, beam_dimtags):
     return inputs, owners
 
 
-def _fillet_radius(fillet_options: dict | None) -> float | None:
-    """Return the fillet radius, or None when filleting is disabled."""
-    if fillet_options is None:
-        return None
-    if "fillet_type" not in fillet_options:
+def _smoothing_radii(options, meshes):
+    """Return ``(joint_radius, interface_radius, interface_mesh_size)``.
+
+    Each entry is ``None`` when that smoothing family is off.  A family is
+    on only when its ``*_type`` key is set.
+    """
+    if options is None:
+        return None, None, None
+
+    def _positive(key: str) -> float:
+        if key not in options:
+            raise ValueError(
+                f"to_full_body: smoothing_options must contain {key!r}"
+            )
+        value = float(options[key])
+        if value <= 0.0:
+            raise ValueError(f"{key} must be positive, got {value}")
+        return value
+
+    unknown = set(options) - _SMOOTHING_KEYS
+    if unknown:
         raise ValueError(
-            "to_full_body: fillet_options must contain 'fillet_type'"
+            "to_full_body: unrecognized smoothing_options keys "
+            f"{sorted(unknown)}"
         )
-    fillet_type = fillet_options["fillet_type"]
-    if fillet_type != "fillet":
-        raise ValueError(f"unrecognized fillet type {fillet_type!r}")
-    if "fillet_radius" not in fillet_options:
+
+    joint_r = None
+    if "joint_type" in options:
+        joint_type = options["joint_type"]
+        if joint_type != "fillet":
+            raise ValueError(f"unrecognized joint type {joint_type!r}")
+        joint_r = _positive("joint_fillet_radius")
+    elif "joint_fillet_radius" in options:
         raise ValueError(
-            "to_full_body: fillet_options must contain 'fillet_radius'"
+            "to_full_body: 'joint_fillet_radius' requires 'joint_type'"
         )
-    radius = float(fillet_options["fillet_radius"])
-    if radius <= 0.0:
-        raise ValueError(f"fillet_radius must be positive, got {radius}")
-    return radius
 
-
-def _boundary_curves(dim: int, tag: int) -> list[int]:
-    """Unique curve tags on the boundary of one face or volume."""
-    if dim == 3:
-        faces = gmsh.model.getBoundary(
-            [(3, tag)], combined=False, oriented=False,
+    interface_r = None
+    interface_h = None
+    has_interface = (
+        "interface_type" in options
+        or "interface_rounding_radius" in options
+        or "interface_mesh_size" in options
+    )
+    if has_interface and "interface_type" not in options:
+        raise ValueError(
+            "to_full_body: interface smoothing requires 'interface_type'"
         )
-        dimtags = [(d, int(t)) for d, t in faces if d == 2]
-    else:
-        dimtags = [(dim, tag)]
-    curves: list[int] = []
-    seen: set[int] = set()
-    for fdim, ftag in dimtags:
-        for cdim, ctag in gmsh.model.getBoundary(
-            [(fdim, ftag)], combined=False, oriented=False,
-        ):
-            if cdim != 1:
-                continue
-            ctag = abs(int(ctag))
-            if ctag not in seen:
-                seen.add(ctag)
-                curves.append(ctag)
-    return curves
+    if "interface_type" in options:
+        interface_type = options["interface_type"]
+        if interface_type != "rounding":
+            raise ValueError(f"unrecognized interface type {interface_type!r}")
+        if not any(m.n_casing > 0 for m in meshes):
+            raise ValueError(
+                "interface rounding requires a casing (n_casing > 0)"
+            )
+        interface_r = _positive("interface_rounding_radius")
+        for m in meshes:
+            limit = 0.5 * min(float(m.w1), float(m.w2))
+            if interface_r >= limit:
+                raise ValueError(
+                    "interface_rounding_radius must be < half the smaller "
+                    f"winding-pack width ({limit}), got {interface_r}"
+                )
+        if "interface_mesh_size" in options:
+            interface_h = _positive("interface_mesh_size")
+        else:
+            interface_h = interface_r / 8.0
+    return joint_r, interface_r, interface_h
 
 
-def _junction_curves(owner_map) -> list[int]:
-    """Curves of faces shared by one beam volume and one conductor."""
-    curves: list[int] = []
-    seen: set[int] = set()
-    for dim, tag in gmsh.model.getEntities(2):
-        upward, _down = gmsh.model.getAdjacencies(dim, tag)
-        vols = [int(v) for v in upward]
-        if len(vols) != 2:
-            continue
-        labels = [owner_map.get(v) for v in vols]
-        if any(label is None for label in labels):
-            continue
-        if sum(label[0] < 0 for label in labels) != 1:
-            continue
-        for curve in _boundary_curves(2, int(tag)):
-            if curve not in seen:
-                seen.add(curve)
-                curves.append(curve)
-    return curves
+def _fragment(occ, inputs, owners, hint: str):
+    """Fragment ``inputs`` and label each output volume from ``owners``.
 
-
-def _curve_midpoint(tag: int) -> list[float]:
-    """Parametric midpoint of a curve, as ``[x, y, z]``."""
-    tmin, tmax = gmsh.model.getParametrizationBounds(1, tag)
-    tmid = 0.5 * (float(tmin[0]) + float(tmax[0]))
-    xyz = gmsh.model.getValue(1, tag, [tmid])
-    return [float(xyz[0]), float(xyz[1]), float(xyz[2])]
-
-
-def _near_junction(mid: list[float], jc_tags: list[int], tol: float) -> bool:
-    """True when ``mid`` lies within ``tol`` of a junction curve."""
-    tol2 = tol * tol
-    for tag in jc_tags:
-        closest, _par = gmsh.model.getClosestPoint(1, tag, mid)
-        dx = float(closest[0]) - mid[0]
-        dy = float(closest[1]) - mid[1]
-        dz = float(closest[2]) - mid[2]
-        if dx * dx + dy * dy + dz * dz <= tol2:
-            return True
-    return False
+    ``occ.fragment`` cuts the solids against each other so shared contacts
+    become shared faces.  ``owners[i]`` labels input ``i``; the returned
+    map labels each output volume.
+    """
+    try:
+        _ov, ov_map = occ.fragment(inputs, [])
+        occ.synchronize()
+    except Exception as exc:
+        raise RuntimeError(f"to_full_body: OCC fragment failed. {hint}") from exc
+    if len(ov_map) != len(owners):
+        raise RuntimeError(
+            "to_full_body: fragment map length "
+            f"{len(ov_map)} != {len(owners)} inputs"
+        )
+    return _entity_owner_map(ov_map, owners)
 
 
 def _fillet_joints(occ, owner_map, radius: float):
@@ -382,22 +421,36 @@ def _fillet_joints(occ, owner_map, radius: float):
     and beam volumes keep the labels in ``owner_map``.
     """
     occ.synchronize()
-    junctions = _junction_curves(owner_map)
+
+    # ========================================================================
+    # Find junction curves
+    # ========================================================================
+    # Curves of faces shared by one beam volume and one conductor.
+    junctions: list[int] = []
+    seen: set[int] = set()
+    for _dim, tag in gmsh.model.getEntities(2):
+        upward, down = gmsh.model.getAdjacencies(2, int(tag))
+        vols = [int(v) for v in upward]
+        if len(vols) != 2:
+            continue
+        labels = [owner_map.get(v) for v in vols]
+        if any(label is None for label in labels):
+            continue
+        if sum(label[0] < 0 for label in labels) != 1:
+            continue
+        for curve in (abs(int(c)) for c in down):
+            if curve not in seen:
+                seen.add(curve)
+                junctions.append(curve)
     if not junctions:
         print("to_full_body: no coil-beam joint to fillet")
         return owner_map
 
     vol_tags = [int(t) for t in owner_map]
     vols = [(3, t) for t in vol_tags]
-    lo = [float("inf")] * 3
-    hi = [float("-inf")] * 3
-    for tag in vol_tags:
-        bb = gmsh.model.getBoundingBox(3, tag)
-        for i in range(3):
-            lo[i] = min(lo[i], bb[i])
-            hi[i] = max(hi[i], bb[i + 3])
-    extent = max(hi[i] - lo[i] for i in range(3))
-    tol = 1e-4 * extent
+    bb = gmsh.model.getBoundingBox(-1, -1)
+    extent = max(bb[i + 3] - bb[i] for i in range(3))
+    tol2 = (1e-4 * extent) ** 2
 
     jc_copies = list(occ.copy([(1, c) for c in junctions]))
     keep = list(occ.copy(vols))
@@ -408,7 +461,40 @@ def _fillet_joints(occ, owner_map, radius: float):
     fused, _fused_map = occ.fuse(vols[:1], vols[1:])
     occ.synchronize()
 
+    # ========================================================================
+    # Pick fused-solid edges that lie on a junction curve
+    # ========================================================================
     jc_tags = [int(t) for d, t in jc_copies if d == 1]
+
+    def _curves_of(tag: int) -> list[int]:
+        curves: list[int] = []
+        got: set[int] = set()
+        _up, faces = gmsh.model.getAdjacencies(3, tag)
+        for face in faces:
+            _fup, down = gmsh.model.getAdjacencies(2, int(face))
+            for ctag in down:
+                ctag = abs(int(ctag))
+                if ctag not in got:
+                    got.add(ctag)
+                    curves.append(ctag)
+        return curves
+
+    def _midpoint(tag: int) -> list[float]:
+        tmin, tmax = gmsh.model.getParametrizationBounds(1, tag)
+        tmid = 0.5 * (float(tmin[0]) + float(tmax[0]))
+        xyz = gmsh.model.getValue(1, tag, [tmid])
+        return [float(xyz[0]), float(xyz[1]), float(xyz[2])]
+
+    def _on_junction(mid: list[float]) -> bool:
+        for jtag in jc_tags:
+            closest, _par = gmsh.model.getClosestPoint(1, jtag, mid)
+            dx = float(closest[0]) - mid[0]
+            dy = float(closest[1]) - mid[1]
+            dz = float(closest[2]) - mid[2]
+            if dx * dx + dy * dy + dz * dz <= tol2:
+                return True
+        return False
+
     to_fillet = []
     to_drop = []
     for dim, tag in fused:
@@ -416,8 +502,7 @@ def _fillet_joints(occ, owner_map, radius: float):
             continue
         tag = int(tag)
         edges = [
-            c for c in _boundary_curves(3, tag)
-            if _near_junction(_curve_midpoint(c), jc_tags, tol)
+            c for c in _curves_of(tag) if _on_junction(_midpoint(c))
         ]
         if edges:
             to_fillet.append((tag, edges))
@@ -434,6 +519,9 @@ def _fillet_joints(occ, owner_map, radius: float):
     if to_drop:
         occ.remove(to_drop, recursive=True)
 
+    # ========================================================================
+    # Fillet, then fragment against the labelled copies
+    # ========================================================================
     filleted = []
     n_edges = 0
     for tag, edges in to_fillet:
@@ -443,7 +531,7 @@ def _fillet_joints(occ, owner_map, radius: float):
         except Exception as exc:
             raise RuntimeError(
                 "to_full_body: OCC fillet failed. "
-                f"Lower fillet_radius (currently {radius})."
+                f"Lower joint_fillet_radius (currently {radius})."
             ) from exc
         vols_out = [(d, int(t)) for d, t in out if d == 3]
         if not vols_out:
@@ -453,19 +541,89 @@ def _fillet_joints(occ, owner_map, radius: float):
 
     inputs = filleted + keep
     owners = [(-1, -1, -1)] * len(filleted) + keep_owners
-    try:
-        _ov, ov_map = occ.fragment(inputs, [])
-        occ.synchronize()
-    except Exception as exc:
+    return _fragment(
+        occ, inputs, owners,
+        "Fragment of the filleted solid failed; lower joint_fillet_radius.",
+    )
+
+
+def _refine_interface_corners(owner_map, radius: float, h_min: float, h_max: float):
+    """Set a background mesh size on the rounded interface corners.
+
+    Corner faces are winding-pack/casing faces whose curvature matches
+    ``radius``.  The size field measures distance from the low-curvature
+    seam curves of those faces (the generators along the coil), not from
+    the short arcs that close each half-loft.
+
+    Returns
+    -------
+    list of int
+        Tags of the corner faces the field was built from.
+    """
+    lo, hi = 0.5 / radius, 2.0 / radius
+    corner_faces = []
+    for _dim, tag in gmsh.model.getEntities(2):
+        tag = int(tag)
+        upward, _down = gmsh.model.getAdjacencies(2, tag)
+        vols = [int(v) for v in upward]
+        if len(vols) != 2:
+            continue
+        labels = [owner_map.get(v) for v in vols]
+        if any(label is None for label in labels):
+            continue
+        if sorted(label[2] for label in labels) != [0, 1]:
+            continue
+        uvmin, uvmax = gmsh.model.getParametrizationBounds(2, tag)
+        mid = [
+            0.5 * (float(uvmin[0]) + float(uvmax[0])),
+            0.5 * (float(uvmin[1]) + float(uvmax[1])),
+        ]
+        curv = float(gmsh.model.getCurvature(2, tag, mid)[0])
+        if lo <= curv <= hi:
+            corner_faces.append(tag)
+    if not corner_faces:
         raise RuntimeError(
-            "to_full_body: OCC fragment of the filleted solid failed."
-        ) from exc
-    if len(ov_map) != len(owners):
-        raise RuntimeError(
-            "to_full_body: fillet fragment map length "
-            f"{len(ov_map)} != {len(owners)} inputs"
+            "to_full_body: no rounded interface corner faces found"
         )
-    return _entity_owner_map(ov_map, owners)
+
+    # Seam curves run along the coil.  The arc ends of each half-loft
+    # have curvature about 1/radius and are left out.
+    seams: list[int] = []
+    seen: set[int] = set()
+    for face in corner_faces:
+        _fup, down = gmsh.model.getAdjacencies(2, face)
+        for curve in (abs(int(c)) for c in down):
+            if curve in seen:
+                continue
+            seen.add(curve)
+            tmin, tmax = gmsh.model.getParametrizationBounds(1, curve)
+            tmid = 0.5 * (float(tmin[0]) + float(tmax[0]))
+            curv = float(gmsh.model.getCurvature(1, curve, [tmid])[0])
+            if curv < lo:
+                seams.append(curve)
+    if not seams:
+        raise RuntimeError(
+            "to_full_body: rounded corner faces have no seam curves"
+        )
+
+    max_len = max(float(gmsh.model.occ.getMass(1, c)) for c in seams)
+    sampling = max(2, math.ceil(max_len / (0.5 * h_min)))
+    dist = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(dist, "CurvesList", seams)
+    gmsh.model.mesh.field.setNumber(dist, "Sampling", sampling)
+
+    thresh = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(thresh, "InField", dist)
+    gmsh.model.mesh.field.setNumber(thresh, "SizeMin", h_min)
+    gmsh.model.mesh.field.setNumber(thresh, "SizeMax", h_max)
+    gmsh.model.mesh.field.setNumber(thresh, "DistMin", radius)
+    gmsh.model.mesh.field.setNumber(thresh, "DistMax", 3.0 * radius)
+    gmsh.model.mesh.field.setAsBackgroundMesh(thresh)
+    print(
+        f"to_full_body: refining {len(corner_faces)} interface corner "
+        f"faces, h={h_min:.4g}"
+    )
+    return corner_faces
 
 
 def to_full_body(
@@ -474,7 +632,7 @@ def to_full_body(
     path: str | Path = "full_body_fields.vtu",
     beam_length_factor: float = 0.95,
     save_step: bool = False,
-    fillet_options: dict | None = None,
+    smoothing_options: dict | None = None,
 ) -> Path:
     """Build a full-device TET10 mesh and write ``full_body_fields.vtu``.
 
@@ -488,9 +646,9 @@ def to_full_body(
     treat that key as optional.
 
     When ``save_step`` is set, the symmetry-expanded coil and beam solids
-    are written to a STEP file before the fragment.  When
-    ``fillet_options`` is set, coil–beam joints are filleted after the
-    fragment and before meshing; the added material is labelled support.
+    are written to a STEP file before the fragment.  ``smoothing_options``
+    rounds the winding-pack/casing corners and fillets coil–beam joints
+    before meshing.  Fillet material is labelled support.
 
     Parameters
     ----------
@@ -513,11 +671,21 @@ def to_full_body(
         When True, write the symmetry-expanded coil and beam solids
         (before the fragment) next to ``path``, with a ``.step`` suffix.
         Coordinates are metres.  Overlapping solids are expected.
-    fillet_options : dict or None
-        ``None`` (default) skips filleting.  Otherwise must contain
-        ``fillet_type`` (only ``'fillet'`` is supported) and
-        ``fillet_radius``, one positive radius applied at every
-        coil–beam joint.
+    smoothing_options : dict or None
+        ``None`` (default) leaves corners and joints sharp.  Otherwise
+        a subset of:
+
+        * ``joint_type`` — ``'fillet'``; fillets every coil–beam joint.
+        * ``joint_fillet_radius`` — positive radius, required with
+          ``joint_type``.
+        * ``interface_type`` — ``'rounding'``; rounds the winding-pack
+          corners.  The casing outer corners stay sharp.  Requires a
+          casing.
+        * ``interface_rounding_radius`` — positive radius, required with
+          ``interface_type``, and strictly less than half the smaller
+          winding-pack width.
+        * ``interface_mesh_size`` — target element size on the rounded
+          corners.  Optional; default is the rounding radius over 8.
 
     Returns
     -------
@@ -528,29 +696,32 @@ def to_full_body(
     ------
     ValueError
         Rectangular meshes or an OCC solid factory are missing,
-        ``beam_length_factor`` is not positive, or ``fillet_options``
-        has an unrecognized ``fillet_type`` or a missing or
-        non-positive ``fillet_radius``.
+        ``beam_length_factor`` is not positive, or ``smoothing_options``
+        has an unknown key, an unrecognized type, or a missing or
+        non-positive radius.
     RuntimeError
         The OCC fragment or fillet failed.  Lower
-        ``beam_length_factor`` or ``fillet_radius``, or use the
+        ``beam_length_factor`` or ``joint_fillet_radius``, or use the
         wildmeshing path in ``gmsh.py.old``.
 
     Notes
     -----
     An OCC fillet on a beam-into-loft intersection curve can fail.  The
     radius must be well below the beam cross-section size and the local
-    coil width, and ``MeshSizeMax`` is not reduced to resolve it.  A
-    beam end pulled back by ``beam_length_factor`` < 1 does not touch
-    the coil and is not filleted.  The fillet meets the coil and beam
-    tangentially, so the imprint of the fillet solid can leave sliver
-    faces; check the mesh when a joint looks faceted.
+    coil width.  A beam end pulled back by ``beam_length_factor`` < 1
+    does not touch the coil and is not filleted.  The fillet meets the
+    coil and beam tangentially, so the imprint of the fillet solid can
+    leave sliver faces; check the mesh when a joint looks faceted.
+
+    Interface rounding is built into the winding-pack cross-section
+    before the loft, so the fragment carries it onto the inner casing
+    surface.  A gmsh size field then refines those corner faces down to
+    ``interface_mesh_size``; the global ``MeshSizeMax`` cap is unchanged.
     """
     if beam_length_factor <= 0.0:
         raise ValueError(
             f"beam_length_factor must be positive, got {beam_length_factor}"
         )
-    radius = _fillet_radius(fillet_options)
 
     path = Path(path)
     coil_support = Jstress.coil_support
@@ -577,6 +748,10 @@ def to_full_body(
             "to_full_body requires rectangular coil meshes (FramedCurveMeshRectangle)."
         )
 
+    joint_r, interface_r, interface_h = _smoothing_radii(
+        smoothing_options, meshes,
+    )
+
     w1 = float(meshes[0].w1)
     materials = fem.materials
     g_vec = np.asarray(
@@ -598,8 +773,9 @@ def to_full_body(
         (m.casing_thickness for m in meshes if m.n_casing > 0), default=None,
     )
     if t_min is not None:
-        # ponytail: global cap; a gmsh size Field on the casing volumes
-        # would avoid refining the winding pack
+        # ponytail: global cap. Rounded interface corners are refined
+        # further by _refine_interface_corners; the flat casing stays
+        # at this size.
         size_max = min(size_max, t_min)
 
     # =========================================================================
@@ -620,7 +796,9 @@ def to_full_body(
             occ, support, sdofs, geom, solid_fn,
             length_factor=beam_length_factor,
         )
-        inputs, owners = _fragment_inputs(occ, meshes, Q_list, beam_dimtags)
+        inputs, owners = _fragment_inputs(
+            occ, meshes, Q_list, beam_dimtags, interface_r=interface_r,
+        )
         if save_step:
             occ.synchronize()
             # Default STEP units are millimetres; the model is metres.
@@ -632,25 +810,14 @@ def to_full_body(
             f"to_full_body: fragment {len(inputs)} solids "
             f"(beam_length_factor={beam_length_factor})"
         )
-        try:
-            _ov, ov_map = occ.fragment(inputs, [])
-            occ.synchronize()
-        except Exception as exc:
-            raise RuntimeError(
-                "to_full_body: OCC fragment failed (BOPAlgo). "
-                f"Lower beam_length_factor (currently {beam_length_factor}) "
-                "to shrink beam solids away from the coil surface, or use "
-                "the wildmeshing path in gmsh.py.old."
-            ) from exc
-        if len(ov_map) != len(owners):
-            raise RuntimeError(
-                "to_full_body: fragment map length "
-                f"{len(ov_map)} != {len(owners)} inputs"
-            )
-
-        owner_map = _entity_owner_map(ov_map, owners)
-        if radius is not None:
-            owner_map = _fillet_joints(occ, owner_map, radius)
+        owner_map = _fragment(
+            occ, inputs, owners,
+            f"(BOPAlgo). Lower beam_length_factor (currently "
+            f"{beam_length_factor}) to shrink beam solids away from the "
+            "coil surface, or use the wildmeshing path in gmsh.py.old.",
+        )
+        if joint_r is not None:
+            owner_map = _fillet_joints(occ, owner_map, joint_r)
         groups = {
             "winding_pack": [t for t, (_c, _s, mat) in owner_map.items() if mat == 0],
             "casing": [t for t, (_c, _s, mat) in owner_map.items() if mat == 1],
@@ -660,6 +827,10 @@ def to_full_body(
             if tags:
                 gmsh.model.addPhysicalGroup(3, tags, name=name)
 
+        if interface_r is not None:
+            _refine_interface_corners(
+                owner_map, interface_r, interface_h, size_max,
+            )
         gmsh.option.setNumber("Mesh.MeshSizeMax", size_max)
         gmsh.option.setNumber("Mesh.ElementOrder", 2)
         print(f"to_full_body: meshing, MeshSizeMax={size_max:.4g}")
