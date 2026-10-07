@@ -67,7 +67,8 @@ class CoilFEMObjective(Optimizable):
         Mesh construction options forwarded to :class:`~coil_fem.CoilFEM`.
     winding_pack_options : dict
         Winding-pack material properties (``'E'``, ``'nu'``, ``'density'``,
-        ``'itc'``).  Required; ``None`` raises.
+        ``'itc'``), plus optional ``'r_rounding'`` / ``'n_rounding'`` corner
+        rounding (see :class:`~coil_fem.CoilFEM`).  Required; ``None`` raises.
     casing_options : dict or None
         Casing material properties, same keys plus ``'thickness'`` [m].
         ``None`` means no casing.

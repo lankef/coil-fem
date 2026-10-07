@@ -194,6 +194,10 @@ class CoilFEM:
         * ``'mesh_type'`` : ``'TET4'`` (default)
         * ``'n_grid_1'``, ``'n_grid_2'`` (rect) or ``'n_center'``, ``'n_radial'`` (disk)
         * ``'aspect_ratio'`` : target element aspect ratio (default 1.0)
+        * ``'rounding_subdivision'`` : int (default 4) — elements per corner
+          edge at the rounded corners (rounding only).
+        * ``'g_meshing'`` : float (default 0.5) — element-size gradation away
+          from the rounded corners (rounding only).
 
         If ``'n_grid_1'`` and ``'n_grid_2'`` are not provided, the mesh resolution
         is automatically computed based on the aspect ratio and the total length
@@ -222,6 +226,16 @@ class CoilFEM:
         * ``'itc'`` : float, optional — isotropic integral thermal contraction
           ``ΔL/L`` on cooldown (positive, dimensionless).  Applied as the
           eigenstrain ``ε_th = −itc · I``.  Not a differentiable DOF.
+        * ``'r_rounding'``, ``'n_rounding'`` : float [m] and int >= 1,
+          optional — round the corners of a rectangular winding pack.  Each
+          corner gets ``n_rounding`` new edges tangent to a circle of radius
+          ``r_rounding`` (``n_rounding = 1`` is a chamfer with two 135°
+          corners), and the cross-section is meshed adaptively with gmsh:
+          element size ``h_max = min(aspect_ratio · Δs, min(w1, w2)/2)`` in
+          the core and ``s / rounding_subdivision`` at the corners, with
+          ``s`` the corner-edge length; ``n_grid_1``/``n_grid_2`` are
+          rejected.  Give both or neither (default: sharp corners,
+          structured mesh).
     casing_options : dict or None
         Same keys as ``winding_pack_options``, plus ``'thickness'`` [m].
         When given, a current-free casing of that thickness is added outside
@@ -298,7 +312,22 @@ class CoilFEM:
         # ============================================================================
         # 2. Material tables (index 0 = winding pack, 1 = casing)
         # ============================================================================
-        materials = [{**winding_pack_options, 'current_weight': 1.0}]
+        wp = dict(winding_pack_options)
+        r_round, n_round = wp.pop('r_rounding', None), wp.pop('n_rounding', None)
+        rounding = None
+        if (r_round is None) != (n_round is None):
+            raise ValueError(
+                "winding_pack_options: r_rounding and n_rounding must be given together."
+            )
+        if r_round is not None:
+            if any(opt['shape'] != 'rect' for opt in self.mesh_opts):
+                raise NotImplementedError("r_rounding/n_rounding require shape='rect'.")
+            if int(n_round) != n_round or n_round < 1:
+                raise ValueError(f"n_rounding must be an integer >= 1, got {n_round}.")
+            if r_round <= 0.0:
+                raise ValueError(f"r_rounding must be > 0, got {r_round}.")
+            rounding = (float(r_round), int(n_round))
+        materials = [{**wp, 'current_weight': 1.0}]
         casing_thickness = None
         if casing_options is not None:
             if any(opt['shape'] != 'rect' for opt in self.mesh_opts):
@@ -339,6 +368,7 @@ class CoilFEM:
             fc   = make_framed_curve(curve, frame_type)
             mesh = FramedCurveMesh.from_options(
                 fc, opt, mesh_type, casing_thickness=casing_thickness,
+                rounding=rounding,
             )
 
             pipeline_cls = (

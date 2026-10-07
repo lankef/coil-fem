@@ -54,7 +54,7 @@ src/coil_fem/                  # main package (Hatchling src-layout)
   coil_fem.py                  # CoilFEM — differentiable FEM pipeline container
   magnetic.py                  # B-field helpers (biot_savart, B_self_quadrature) + lorentz_body_force
   metrics.py                   # Von Mises / strain metrics on FEM solutions
-  meshing.py                   # Fixed-topology hex/tet meshing (rectangle/disk sweep, curved-sided TET10)
+  meshing.py                   # Fixed-topology tet meshing (rectangle/disk/gmsh-section sweep, curved-sided TET10)
   pipelines.py                 # ElasticPipeline / ThermoElasticPipeline — per-coil FEM state
   problems/                    # FEM Problem subpackage
     __init__.py                # re-exports LinearElasticity3D, DeviceProblem (+ elasticity helpers)
