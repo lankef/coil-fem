@@ -194,7 +194,7 @@ class CoilFEM:
         * ``'mesh_type'`` : ``'TET4'`` (default)
         * ``'n_grid_1'``, ``'n_grid_2'`` (rect) or ``'n_center'``, ``'n_radial'`` (disk)
         * ``'aspect_ratio'`` : target element aspect ratio (default 1.0)
-        * ``'rounding_subdivision'`` : int (default 4) — elements per corner
+        * ``'rounding_subdivision'`` : int (default 1) — elements per corner
           edge at the rounded corners (rounding only).
         * ``'g_meshing'`` : float (default 0.5) — element-size gradation away
           from the rounded corners (rounding only).
@@ -1398,6 +1398,7 @@ class CoilFEM:
         base_currents_dofs: jax.Array | None = None,
         base_support_dofs: dict | None = None,
         n_sub: int = 20,
+        phi_range: tuple[float, float] | None = None,
     ) -> list[str]:
         """Export the coil meshes (and support / beams) as VTU files.
 
@@ -1412,6 +1413,8 @@ class CoilFEM:
         Files written:
 
         * ``{out_dir}/{prefix}coils.vtu`` — merged conductor mesh.
+          ``phi_range`` truncates this file only; beam and support files
+          are written in full.
 
           - point fields ``w_clamp``, ``w_attach``, ``k_clamp_Npm3``,
             ``k_attach_Npm3`` — grounded-clamp / beam-attachment weights and
@@ -1460,12 +1463,32 @@ class CoilFEM:
         n_sub : int
             Number of sub-segments per beam in ``{prefix}beams.vtu`` when
             ``run`` (default 20).  Ignored when the support has no beam network.
+        phi_range : tuple[float, float] or None
+            ``(lo, hi)`` with ``0 <= lo < hi <= 1``.  ``coils.vtu`` then
+            contains only cells whose phi-slice centre
+            ``(phi_cell_idx + 0.5) / n_phi`` lies in ``[lo, hi]``; unused
+            nodes are dropped.  ``None`` (default) writes every cell.
 
         Returns
         -------
         list[str]
             Paths of all files written, in order.
+
+        Raises
+        ------
+        ValueError
+            ``phi_range`` is outside ``0 <= lo < hi <= 1``, or it selects
+            no cells.
         """
+        if phi_range is not None:
+            lo, hi = float(phi_range[0]), float(phi_range[1])
+            if not (0.0 <= lo < hi <= 1.0):
+                raise ValueError(
+                    "phi_range must satisfy "
+                    f"0 <= phi_range[0] < phi_range[1] <= 1, got {phi_range}."
+                )
+            phi_range = (lo, hi)
+
         if base_curves_dofs is None:
             base_curves_dofs = [c.dofs for c in self.base_curves_jax]
 
@@ -1497,6 +1520,7 @@ class CoilFEM:
             "material_id": [],
         }
         node_offset = 0
+        n_kept = 0
         cell_type = self.meshes[0].meshio_cell_type
 
         for i, coil_mesh in enumerate(self.meshes):
@@ -1506,6 +1530,14 @@ class CoilFEM:
                     f"{i} is {coil_mesh.meshio_cell_type!r}, expected "
                     f"{cell_type!r}"
                 )
+
+            cells_i = onp.asarray(coil_mesh.cells, dtype=onp.int32)
+            keep = onp.ones(cells_i.shape[0], dtype=bool)
+            if phi_range is not None:
+                phi_c = (onp.asarray(coil_mesh.phi_cell_idx) + 0.5) / coil_mesh.n_phi
+                keep = (phi_c >= phi_range[0]) & (phi_c <= phi_range[1])
+            if not onp.any(keep):
+                continue
 
             if run:
                 pts_np = onp.asarray(result['mesh_points'][i], dtype=onp.float64)
@@ -1517,6 +1549,7 @@ class CoilFEM:
             n_nodes = pts_np.shape[0]
 
             # Point fields: Winkler support weights (always written).
+            # Computed on the full mesh, then restricted to the kept nodes.
             pts_i = jnp.asarray(pts_np)
             surf_idx = onp.asarray(
                 self.pipelines[i].surface_node_indices, dtype=onp.int32
@@ -1528,36 +1561,42 @@ class CoilFEM:
             w_a_full = onp.zeros(n_nodes, dtype=onp.float64)
             w_g_full[surf_idx] = onp.asarray(w_g, dtype=onp.float64)
             w_a_full[surf_idx] = onp.asarray(w_a, dtype=onp.float64)
-            pt_accum["w_clamp"].append(w_g_full)
-            pt_accum["w_attach"].append(w_a_full)
-            pt_accum["k_clamp_Npm3"].append(w_g_full * k_clamp)
-            pt_accum["k_attach_Npm3"].append(w_a_full * k_attach)
+
+            used, conn = onp.unique(cells_i[keep], return_inverse=True)
+            conn = conn.reshape(-1, cells_i.shape[1]).astype(onp.int32) + node_offset
+            pt_accum["w_clamp"].append(w_g_full[used])
+            pt_accum["w_attach"].append(w_a_full[used])
+            pt_accum["k_clamp_Npm3"].append(w_g_full[used] * k_clamp)
+            pt_accum["k_attach_Npm3"].append(w_a_full[used] * k_attach)
 
             # Deformed-state fields (forward solve only).
             if run:
-                pt_accum["displacement_m"].append(
-                    onp.asarray(result['displacements'][i], dtype=onp.float64)
-                )
+                pt_accum["displacement_m"].append(onp.asarray(
+                    result['displacements'][i], dtype=onp.float64,
+                )[used])
                 cell_accum["von_mises_MPa"].append(onp.asarray(
                     jnp.mean(result['von_mises'][i], axis=-1) / 1e6,
                     dtype=onp.float64,
-                ))
+                )[keep])
                 cell_accum["f_vol_Npm3"].append(onp.asarray(
                     jnp.mean(result['f_vol'][i], axis=1), dtype=onp.float64,
-                ))
+                )[keep])
                 cell_accum["B_self_T"].append(onp.asarray(
                     jnp.mean(result['B_self'][i], axis=1), dtype=onp.float64,
-                ))
+                )[keep])
                 cell_accum["B_ext_T"].append(onp.asarray(
                     jnp.mean(result['B_ext'][i], axis=1), dtype=onp.float64,
-                ))
+                )[keep])
 
-            conn = onp.asarray(coil_mesh.cells, dtype=onp.int32) + node_offset
-            all_points.append(pts_np)
+            all_points.append(pts_np[used])
             all_conn.append(conn)
-            owner_coil.append(onp.full(conn.shape[0], i, dtype=onp.int32))
-            cell_accum["material_id"].append(onp.asarray(coil_mesh.material_id))
-            node_offset += n_nodes
+            owner_coil.append(onp.full(int(keep.sum()), i, dtype=onp.int32))
+            cell_accum["material_id"].append(onp.asarray(coil_mesh.material_id)[keep])
+            node_offset += used.shape[0]
+            n_kept += int(keep.sum())
+
+        if n_kept == 0:
+            raise ValueError(f"to_vtu: phi_range={phi_range} selects no cells.")
 
         point_data = {k: onp.concatenate(v) for k, v in pt_accum.items() if v}
         cell_data = {k: [onp.concatenate(v)] for k, v in cell_accum.items() if v}
