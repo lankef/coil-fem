@@ -280,13 +280,13 @@ def _extract_tet10(owner_map):
 
 
 def _fragment_inputs(occ, meshes, Q_list, beam_dimtags, interface_r=None):
-    """Full-device coil then beam volumes, with a parallel owner list.
+    """Per-coil-image fragment inputs, plus the symmetry-expanded beams.
 
-    Coil owners are ``(base_coil, sym_image, material_id)``.  Beam owners
-    are ``(-1, -1, -1)``.  Each coil image may contribute more than one
-    volume (the two half-lofts of the winding pack, and of the casing
-    when ``mesh.n_casing > 0``).  ``interface_r`` rounds the winding-pack
-    profile only; the casing loft stays a sharp box.
+    Returns ``(coil_groups, beams)``.  ``coil_groups`` has one
+    ``(inputs, owners)`` entry per coil image: its winding-pack and casing
+    half-lofts, owned by ``(base_coil, sym_image, material_id)``.  ``beams``
+    is the flat ``(dim, tag)`` list of every beam image.  ``interface_r``
+    rounds the winding-pack profile only; the casing loft stays a sharp box.
     """
     n_base = len(meshes)
     n_sym = len(Q_list)
@@ -307,20 +307,20 @@ def _fragment_inputs(occ, meshes, Q_list, beam_dimtags, interface_r=None):
     else:
         beam_vols = [[] for _ in range(n_sym)]
 
-    inputs, owners = [], []
+    coil_groups = []
     for s in range(n_sym):
         for i in range(n_base):
+            inputs, owners = [], []
             for dts, mat in coil_vols[s][i]:
                 for dim, tag in dts:
                     if dim == 3:
                         inputs.append((3, tag))
                         owners.append((i, s, mat))
-    for s in range(n_sym):
-        for dim, tag in beam_vols[s]:
-            if dim == 3:
-                inputs.append((3, tag))
-                owners.append((-1, -1, -1))
-    return inputs, owners
+            coil_groups.append((inputs, owners))
+    beams = [
+        (3, tag) for vols in beam_vols for dim, tag in vols if dim == 3
+    ]
+    return coil_groups, beams
 
 
 def _smoothing_radii(options, meshes):
@@ -414,57 +414,42 @@ def _fragment(occ, inputs, owners, hint: str):
     return _entity_owner_map(ov_map, owners)
 
 
+def _fragment_by_coil(occ, coil_groups, beam_dimtags, hint: str):
+    """Fragment each coil image against the beams, one coil at a time.
+
+    A single ``occ.fragment`` intersects every pair of its inputs.  Coils
+    never overlap each other, so each call holds one coil image plus the
+    current beam pieces, and coil-coil pairs are never tested.  Beam pieces
+    outside the coil just fragmented feed the next call; shared faces keep
+    their identity across calls, so the mesh stays conforming.
+    """
+    beams = list(beam_dimtags)
+    owner_map: dict[int, tuple[int, int, int]] = {}
+    for inputs, owners in coil_groups:
+        omap = _fragment(
+            occ, inputs + beams,
+            owners + [(-1, -1, -1)] * len(beams), hint,
+        )
+        owner_map.update({t: lab for t, lab in omap.items() if lab[0] >= 0})
+        beams = [(3, t) for t, lab in omap.items() if lab[0] < 0]
+    owner_map.update({t: (-1, -1, -1) for _dim, t in beams})
+    return owner_map
+
+
 def _fillet_joints(occ, owner_map, radius: float):
     """Fillet coil–beam joints and return an updated volume owner map.
 
-    Fillet-only volumes are labelled support ``(-1, -1, -1)``.  Conductor
-    and beam volumes keep the labels in ``owner_map``.
+    Each coil image is filleted on its own: fused with only the beam pieces
+    that touch it, filleted, then fragmented back against those pieces.
+    Coils never overlap, so no coil-coil pair is ever tested.  Fillet-only
+    volumes are labelled support ``(-1, -1, -1)``.  Conductor and beam
+    volumes keep their labels.
     """
     occ.synchronize()
-
-    # ========================================================================
-    # Find junction curves
-    # ========================================================================
-    # Curves of faces shared by one beam volume and one conductor.
-    junctions: list[int] = []
-    seen: set[int] = set()
-    for _dim, tag in gmsh.model.getEntities(2):
-        upward, down = gmsh.model.getAdjacencies(2, int(tag))
-        vols = [int(v) for v in upward]
-        if len(vols) != 2:
-            continue
-        labels = [owner_map.get(v) for v in vols]
-        if any(label is None for label in labels):
-            continue
-        if sum(label[0] < 0 for label in labels) != 1:
-            continue
-        for curve in (abs(int(c)) for c in down):
-            if curve not in seen:
-                seen.add(curve)
-                junctions.append(curve)
-    if not junctions:
-        print("to_full_body: no coil-beam joint to fillet")
-        return owner_map
-
-    vol_tags = [int(t) for t in owner_map]
-    vols = [(3, t) for t in vol_tags]
+    owner_map = dict(owner_map)
     bb = gmsh.model.getBoundingBox(-1, -1)
     extent = max(bb[i + 3] - bb[i] for i in range(3))
     tol2 = (1e-4 * extent) ** 2
-
-    jc_copies = list(occ.copy([(1, c) for c in junctions]))
-    keep = list(occ.copy(vols))
-    keep_owners = [owner_map[t] for t in vol_tags]
-    # ponytail: one fuse of every solid; cost and boolean fragility grow
-    # with the solid count. Upgrade path: fuse each connected coil-beam
-    # cluster on its own.
-    fused, _fused_map = occ.fuse(vols[:1], vols[1:])
-    occ.synchronize()
-
-    # ========================================================================
-    # Pick fused-solid edges that lie on a junction curve
-    # ========================================================================
-    jc_tags = [int(t) for d, t in jc_copies if d == 1]
 
     def _curves_of(tag: int) -> list[int]:
         curves: list[int] = []
@@ -485,66 +470,116 @@ def _fillet_joints(occ, owner_map, radius: float):
         xyz = gmsh.model.getValue(1, tag, [tmid])
         return [float(xyz[0]), float(xyz[1]), float(xyz[2])]
 
-    def _on_junction(mid: list[float]) -> bool:
-        for jtag in jc_tags:
-            closest, _par = gmsh.model.getClosestPoint(1, jtag, mid)
-            dx = float(closest[0]) - mid[0]
-            dy = float(closest[1]) - mid[1]
-            dz = float(closest[2]) - mid[2]
-            if dx * dx + dy * dy + dz * dz <= tol2:
-                return True
-        return False
-
-    to_fillet = []
-    to_drop = []
-    for dim, tag in fused:
-        if dim != 3:
-            continue
-        tag = int(tag)
-        edges = [
-            c for c in _curves_of(tag) if _on_junction(_midpoint(c))
-        ]
-        if edges:
-            to_fillet.append((tag, edges))
-        else:
-            to_drop.append((3, tag))
-    if not to_fillet:
-        raise RuntimeError(
-            "to_full_body: coil-beam junction curves did not match any "
-            "edge of the fused solid"
-        )
-
-    if jc_copies:
-        occ.remove(jc_copies, recursive=True)
-    if to_drop:
-        occ.remove(to_drop, recursive=True)
-
-    # ========================================================================
-    # Fillet, then fragment against the labelled copies
-    # ========================================================================
-    filleted = []
     n_edges = 0
-    for tag, edges in to_fillet:
-        n_edges += len(edges)
-        try:
-            out = occ.fillet([tag], edges, [radius])
-        except Exception as exc:
-            raise RuntimeError(
-                "to_full_body: OCC fillet failed. "
-                f"Lower joint_fillet_radius (currently {radius})."
-            ) from exc
-        vols_out = [(d, int(t)) for d, t in out if d == 3]
-        if not vols_out:
-            raise RuntimeError("to_full_body: OCC fillet returned no volume")
-        filleted.extend(vols_out)
-    print(f"to_full_body: filleted {n_edges} joint edges, radius={radius}")
+    coil_keys = sorted({(lab[0], lab[1]) for lab in owner_map.values() if lab[0] >= 0})
+    for key in coil_keys:
+        # ====================================================================
+        # Find this coil's junction curves and the beam pieces it touches
+        # ====================================================================
+        coil_tags = {
+            t for t, lab in owner_map.items() if (lab[0], lab[1]) == key
+        }
+        junctions: list[int] = []
+        beam_tags: set[int] = set()
+        seen: set[int] = set()
+        for _dim, ftag in gmsh.model.getEntities(2):
+            upward, down = gmsh.model.getAdjacencies(2, int(ftag))
+            vols = [int(v) for v in upward]
+            if len(vols) != 2:
+                continue
+            on_coil = [v for v in vols if v in coil_tags]
+            on_beam = [
+                v for v in vols
+                if owner_map.get(v) is not None and owner_map[v][0] < 0
+            ]
+            if len(on_coil) != 1 or len(on_beam) != 1:
+                continue
+            beam_tags.add(on_beam[0])
+            for curve in (abs(int(c)) for c in down):
+                if curve not in seen:
+                    seen.add(curve)
+                    junctions.append(curve)
+        if not junctions:
+            continue
 
-    inputs = filleted + keep
-    owners = [(-1, -1, -1)] * len(filleted) + keep_owners
-    return _fragment(
-        occ, inputs, owners,
-        "Fragment of the filleted solid failed; lower joint_fillet_radius.",
-    )
+        # ====================================================================
+        # Fuse the coil with its beam pieces and pick the junction edges
+        # ====================================================================
+        group = [(3, t) for t in sorted(coil_tags) + sorted(beam_tags)]
+        jc_copies = list(occ.copy([(1, c) for c in junctions]))
+        # The originals stay in the model: they are fragmented against the
+        # filleted solid below, so faces shared with other coils survive.
+        fused, _fused_map = occ.fuse(
+            group[:1], group[1:], removeObject=False, removeTool=False,
+        )
+        occ.synchronize()
+        jc_tags = [int(t) for d, t in jc_copies if d == 1]
+
+        def _on_junction(mid: list[float]) -> bool:
+            for jtag in jc_tags:
+                closest, _par = gmsh.model.getClosestPoint(1, jtag, mid)
+                dx = float(closest[0]) - mid[0]
+                dy = float(closest[1]) - mid[1]
+                dz = float(closest[2]) - mid[2]
+                if dx * dx + dy * dy + dz * dz <= tol2:
+                    return True
+            return False
+
+        to_fillet = []
+        to_drop = []
+        for dim, tag in fused:
+            if dim != 3:
+                continue
+            tag = int(tag)
+            edges = [
+                c for c in _curves_of(tag) if _on_junction(_midpoint(c))
+            ]
+            if edges:
+                to_fillet.append((tag, edges))
+            else:
+                to_drop.append((3, tag))
+        if not to_fillet:
+            raise RuntimeError(
+                f"to_full_body: coil {key} junction curves did not match "
+                "any edge of the fused solid"
+            )
+        occ.remove(jc_copies, recursive=True)
+        if to_drop:
+            occ.remove(to_drop, recursive=True)
+
+        # ====================================================================
+        # Fillet, then fragment against the original coil and beam pieces
+        # ====================================================================
+        filleted = []
+        for tag, edges in to_fillet:
+            n_edges += len(edges)
+            try:
+                out = occ.fillet([tag], edges, [radius])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"to_full_body: OCC fillet failed on coil {key}. "
+                    f"Lower joint_fillet_radius (currently {radius})."
+                ) from exc
+            vols_out = [(d, int(t)) for d, t in out if d == 3]
+            if not vols_out:
+                raise RuntimeError("to_full_body: OCC fillet returned no volume")
+            filleted.extend(vols_out)
+
+        omap = _fragment(
+            occ,
+            group + filleted,
+            [owner_map[t] for _d, t in group] + [(-1, -1, -1)] * len(filleted),
+            "Fragment of the filleted solid failed; lower joint_fillet_radius.",
+        )
+        for _d, t in group:
+            owner_map.pop(t, None)
+        owner_map.update(omap)
+
+    if n_edges == 0:
+        print("to_full_body: no coil-beam joint to fillet")
+    else:
+        print(f"to_full_body: filleted {n_edges} joint edges, radius={radius}")
+    return owner_map
 
 
 def _refine_interface_corners(owner_map, radius: float, h_min: float, h_max: float):
@@ -636,8 +671,10 @@ def to_full_body(
 ) -> Path:
     """Build a full-device TET10 mesh and write ``full_body_fields.vtu``.
 
-    OCC ``fragment`` imprints beam–coil (and coil–coil) contacts so gmsh
-    meshes each volume once with shared interface nodes.  A cased coil is
+    OCC ``fragment`` imprints beam–coil contacts so gmsh meshes each volume
+    once with shared interface nodes.  Coils are assumed not to overlap
+    or touch one another, so coil–coil contacts are neither detected nor
+    shared.  A cased coil is
     two nested lofts (winding pack, then casing); the overlap is labelled
     winding pack.  CellData ``owner_coil`` / ``owner_sym`` / ``material_id``
     label cells; ``-1`` is support.  FieldData ``E``, ``nu`` and ``rho``
@@ -790,13 +827,14 @@ def to_full_body(
     else:
         gmsh.clear()
     try:
+        gmsh.option.setNumber("Geometry.OCCParallel", 1)
         gmsh.model.add("device")
         occ = gmsh.model.occ
         beam_dimtags = _beam_solids(
             occ, support, sdofs, geom, solid_fn,
             length_factor=beam_length_factor,
         )
-        inputs, owners = _fragment_inputs(
+        coil_groups, beams = _fragment_inputs(
             occ, meshes, Q_list, beam_dimtags, interface_r=interface_r,
         )
         if save_step:
@@ -806,12 +844,13 @@ def to_full_body(
             step_path = path.with_suffix(".step")
             gmsh.write(str(step_path))
             print(f"to_full_body: wrote {step_path}")
+        n_solids = sum(len(g[0]) for g in coil_groups) + len(beams)
         print(
-            f"to_full_body: fragment {len(inputs)} solids "
-            f"(beam_length_factor={beam_length_factor})"
+            f"to_full_body: fragment {n_solids} solids, one coil image at a "
+            f"time (beam_length_factor={beam_length_factor})"
         )
-        owner_map = _fragment(
-            occ, inputs, owners,
+        owner_map = _fragment_by_coil(
+            occ, coil_groups, beams,
             f"(BOPAlgo). Lower beam_length_factor (currently "
             f"{beam_length_factor}) to shrink beam solids away from the "
             "coil surface, or use the wildmeshing path in gmsh.py.old.",

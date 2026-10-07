@@ -9,6 +9,7 @@ from coil_fem.io.gmsh import (
     _entity_owner_map,
     _fillet_joints,
     _fragment,
+    _fragment_by_coil,
     _refine_interface_corners,
     _smoothing_radii,
 )
@@ -182,6 +183,93 @@ def test_fillet_joints_box_cylinder():
                 coil += mass
         assert total > before
         assert coil == pytest.approx(1.0)
+    finally:
+        gmsh.finalize()
+
+
+class _SpyOcc:
+    """Delegates to ``gmsh.model.occ`` and records each fragment call's inputs."""
+
+    def __init__(self, occ):
+        self._occ = occ
+        self.calls = []
+
+    def fragment(self, objects, tools):
+        self.calls.append(list(objects))
+        return self._occ.fragment(objects, tools)
+
+    def __getattr__(self, name):
+        return getattr(self._occ, name)
+
+
+def _two_boxes_and_bar(occ):
+    """Coil boxes A and C joined by a bar; returns groups, beams, A and C tags."""
+    a = (3, occ.addBox(0.0, 0.0, 0.0, 1.0, 1.0, 1.0))
+    c = (3, occ.addBox(4.0, 0.0, 0.0, 1.0, 1.0, 1.0))
+    bar = (3, occ.addBox(0.5, 0.4, 0.4, 4.0, 0.2, 0.2))
+    groups = [([a], [(0, 0, 0)]), ([c], [(1, 0, 0)])]
+    return groups, [bar]
+
+
+def _duplicate_nodes() -> int:
+    _tags, xyz, _ = gmsh.model.mesh.getNodes()
+    xyz = np.round(np.asarray(xyz).reshape(-1, 3), 9)
+    return len(xyz) - len(np.unique(xyz, axis=0))
+
+
+def test_fragment_by_coil_never_pairs_coils():
+    """Each fragment call holds one coil image; the mesh stays conforming."""
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    try:
+        gmsh.model.add("by-coil")
+        spy = _SpyOcc(gmsh.model.occ)
+        groups, beams = _two_boxes_and_bar(spy)
+        coil_tags = [[t for _d, t in g[0]] for g in groups]
+        owner_map = _fragment_by_coil(spy, groups, beams, "test")
+        assert len(spy.calls) == len(groups)
+        for call in spy.calls:
+            tags = {t for _d, t in call}
+            assert sum(bool(tags & set(ct)) for ct in coil_tags) == 1
+
+        labels = sorted(lab[0] for lab in owner_map.values())
+        # Each coil = its box minus the bar plus the overlap; one bar middle.
+        assert labels == [-1, 0, 0, 1, 1]
+        gmsh.option.setNumber("Mesh.MeshSizeMax", 0.2)
+        gmsh.model.mesh.generate(3)
+        assert _duplicate_nodes() == 0
+    finally:
+        gmsh.finalize()
+
+
+def test_fillet_joints_per_coil_keeps_mesh_conforming():
+    """Filleting each coil adds support material and shares faces at both beam ends."""
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    try:
+        gmsh.model.add("by-coil-fillet")
+        occ = gmsh.model.occ
+        groups, beams = _two_boxes_and_bar(occ)
+        owner_map = _fragment_by_coil(occ, groups, beams, "test")
+        before = sum(
+            occ.getMass(3, t) for _d, t in gmsh.model.getEntities(3)
+        )
+        owner_map = _fillet_joints(occ, owner_map, 0.02)
+        total = 0.0
+        coil = 0.0
+        for _d, t in gmsh.model.getEntities(3):
+            mass = occ.getMass(3, int(t))
+            total += mass
+            assert int(t) in owner_map
+            if owner_map[int(t)][0] >= 0:
+                coil += mass
+        assert total > before
+        assert coil == pytest.approx(2.0)
+        # Both coils were filleted: coil ids 0 and 1 are still present.
+        assert {lab[0] for lab in owner_map.values()} == {-1, 0, 1}
+        gmsh.option.setNumber("Mesh.MeshSizeMax", 0.2)
+        gmsh.model.mesh.generate(3)
+        assert _duplicate_nodes() == 0
     finally:
         gmsh.finalize()
 

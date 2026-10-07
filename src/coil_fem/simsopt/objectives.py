@@ -384,7 +384,7 @@ class CoilFEMObjective(Optimizable):
         return out
 
     def to_vtu(self, out_dir: str = ".", *, run: bool = True,
-               prefix: str = "coil", n_sub: int = 20):
+               prefix: str = "", n_sub: int = 20):
         """Export coil / support / beam VTU files at the *current* DOFs.
 
         Thin wrapper over :meth:`coil_fem.CoilFEM.to_vtu` that reads the
