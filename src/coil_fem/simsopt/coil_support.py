@@ -25,11 +25,29 @@ from ..coupling import Support
 
 
 def _generate_k_clamp(base_coils, fixed_clamp_options):
-    """ Defaults for the fixed clamp's Robin/Winkler spring coefficients.
-    
-    A fixed clamp's Robin/Winkler spring coefficients can be auto-generated
-    based on the beam's stiffness. This method generates them from the coil's 
-    stiffness. 
+    """Return the fixed clamp's Winkler modulus, estimating it if absent.
+
+    When ``'k_clamp'`` is not given, it is estimated from the coil stiffness
+    via :func:`~coil_fem.utils.estimate_k` with ``E = E_coil``,
+    ``eps = eps_clamp`` and ``L`` the mean coil length divided by ``2π``.
+
+    Parameters
+    ----------
+    base_coils : list of simsopt Coil
+        Base coils; their curves set the length scale ``L``.
+    fixed_clamp_options : dict
+        Either ``'k_clamp'`` [N/m³], or ``'E_coil'`` [Pa] and optionally
+        ``'eps_clamp'`` (default ``1e-5``).
+
+    Returns
+    -------
+    float
+        Winkler modulus ``k_clamp`` [N/m³].
+
+    Raises
+    ------
+    KeyError
+        When neither ``'k_clamp'`` nor ``'E_coil'`` is given.
     """
     if 'k_clamp' in fixed_clamp_options.keys():
         return fixed_clamp_options['k_clamp']

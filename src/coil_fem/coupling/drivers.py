@@ -1,20 +1,11 @@
 """Coupled coil-support solver drivers.
 
-Provides driver functions and a static-bundle dataclass used when
-``support.is_coupled == True``:
-
-* :func:`solve_staggered` — **retired**; raises :class:`NotImplementedError`.
-  See ``notes/PLANS.md`` for the analysis.
-* :func:`solve_monolithic` — cuDSS-only single merged-system sparse direct
-  solve.  Raises :class:`NotImplementedError` when ``solver != 'cudss'``.
-* :class:`MonolithicStatic` — immutable bundle of all pattern-level and
-  solver-handle data built once at construction and reused every evaluation.
-* :func:`build_monolithic_static` — host-side construction of that bundle
-  (layout, optional cuDSS handles, and the ``custom_vjp`` ``merged_solve``).
-
-Both active driver functions take a shared ``params`` bundle (see individual
-docstrings) and return a ``dict`` with keys ``'sol_list_by_coil'``, ``'u_s'``,
-and ``'diagnostics'``.
+Provides the drivers :class:`~coil_fem.CoilFEM` dispatches to:
+:func:`solve_uncoupled` (independent per-coil solves) and
+:func:`solve_monolithic` (cuDSS-only merged coil + support solve, using the
+:class:`MonolithicStatic` bundle from :func:`build_monolithic_static`).
+:func:`solve_staggered` is a retired stub that raises
+:class:`NotImplementedError`.
 """
 
 from __future__ import annotations
@@ -67,6 +58,10 @@ class MonolithicStatic:
     has_sc : bool
         Whether the K_sc coupling block is non-empty.
     surface_node_indices_by_coil : tuple[np.ndarray, ...]
+    curve_qps : tuple
+        Per-coil quadrature-point arrays (static curve metadata).
+    curve_orders : tuple
+        Per-coil Fourier orders.
     I_ss_pat, J_ss_pat : np.ndarray
         Global COO indices for the support ``K_ss`` block (from
         ``support.support_pattern`` shifted by ``support_dof_offset``).
@@ -188,78 +183,15 @@ def solve_staggered(
     *,
     options: dict | None = None,
 ) -> dict:
-    """Block Gauss-Seidel fixed-point solver for coupled coil + support systems.
+    """Retired staggered coupled solver; always raises.
 
-    Alternates between solving each coil's FEM (with the current beam
-    attachment displacement) and solving the support network (given the
-    current coil surface displacements) until the support DOF vector
-    ``u_s`` converges.  Aitken relaxation is applied by default to
-    accelerate convergence.
+    Use ``coupling='monolithic'`` with ``problem_options={'solver': 'cudss'}``
+    for coupled coil-support solves.
 
-    The converged ``u_s`` is found via ``jax.lax.custom_root`` so that
-    ``jax.grad`` computes the correct implicit-function gradient through
-    the fixed-point equation without differentiating through the iteration
-    history.
-
-    Parameters
-    ----------
-    pipelines : list[:class:`~coil_fem.pipelines.ElasticPipeline`]
-        One per base coil.
-    support : :class:`~coil_fem.coupling.supports.Support`
-        Must have ``is_coupled == True`` and a ``n_support_dofs`` attribute.
-    params : dict
-        Required keys:
-
-        * ``'mesh_points_by_coil'``  : list[jax.Array]
-          Node positions per coil, shape ``(n_nodes_i, 3)``.
-        * ``'body_force_by_coil'``   : list[jax.Array]
-          Body force at every quadrature point per coil.
-        * ``'stiffness_by_coil'``    : list[jax.Array]
-          Per-surface-quad Winkler stiffness per coil [N/m³], shape ``(n_sq_i,)``.
-        * ``'curves_by_coil'``       : list[CurveXYZFourierJAX]
-          Traced coil centreline objects (rebuilt from DOFs by the caller).
-        * ``'support_dofs'``         : dict
-          Optimisable support parameters.
-    options : dict or None
-        Optional solver knobs:
-
-        * ``'max_iters'`` (int, default 100) — maximum BG-S iterations.
-        * ``'atol'`` (float, default 1e-8) — absolute convergence tolerance
-          on ``max|T(u_s) - u_s|``.
-        * ``'aitken'`` (bool, default True) — enable Aitken relaxation.
-        * ``'gmres_maxiter'`` (int, default 200) — GMRES iterations for the
-          ``tangent_solve`` (adjoint linear system).
-        * ``'gmres_tol'`` (float, default 1e-10) — GMRES relative tolerance.
-
-    Returns
-    -------
-    dict with keys:
-
-    * ``'sol_list_by_coil'``  — list of ``sol_list`` (each a list of arrays)
-      from the final coil FEM solve at the converged ``u_s``.
-    * ``'u_s'``               — ``(n_support_dofs,)`` converged beam DOFs.
-    * ``'diagnostics'``       — ``{}`` (reserved for future use).
-
-    Notes
-    -----
-    *Gradient correctness.* ``jax.lax.custom_root`` applies the
-    implicit-function theorem (IFT) at the converged ``u_s*``:
-
-    .. math::
-
-        \\frac{\\mathrm{d}u_s^*}{\\mathrm{d}p} =
-        -\\left(I - \\frac{\\partial T}{\\partial u_s}\\right)^{-1}
-        \\frac{\\partial T}{\\partial p}
-
-    The required linear solve :math:`(I - J_T) x = y` is handled by
-    ``tangent_solve`` using GMRES.
-
-    *JIT-compatibility.* The forward solver (``_solve``) uses a Python loop
-    with ``float()`` convergence checks.  This works correctly in eager
-    (non-JIT) mode, which is the intended use-case for ``jax.grad`` inside
-    ``CoilFEM.objective``.  Wrapping the outer function with ``jax.jit``
-    will fail; if JIT is needed, replace ``_solve`` with a
-    ``jax.lax.while_loop`` body.
+    Raises
+    ------
+    NotImplementedError
+        Always.
     """
     raise NotImplementedError(
         "solve_staggered is numerically unsound and has been retired.\n"
@@ -743,7 +675,10 @@ def solve_monolithic(
 
     Returns
     -------
-    dict with the same keys as :func:`solve_staggered`.
+    dict
+        ``'sol_list_by_coil'`` (per-coil ``[u_c]`` with ``u_c`` of shape
+        ``(n_nodes_i, 3)``), ``'u_s'`` (``(n_support_dofs,)`` support
+        displacements) and ``'diagnostics'`` (``{}``).
 
     Raises
     ------

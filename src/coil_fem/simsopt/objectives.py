@@ -1,29 +1,11 @@
-"""Simsopt ``Optimizable`` wrapper around :class:`~coil_fem.CoilFEM`.
+"""Simsopt ``Optimizable`` objectives for coil structural FEM and support geometry.
 
-Connects coil geometry DOFs to the structural FEM pipeline via
-:class:`CoilFEMObjective`, exposing :meth:`~CoilFEMObjective.J` and
-:meth:`~CoilFEMObjective.dJ` for use in simsopt optimisation loops.
-A single :class:`~coil_fem.simsopt.CoilSupport` object is the one entry
-point: it holds the base coils (curves + currents), ``nfp``, ``stellsym``,
-and any optimisable support DOFs (e.g. clamp locations).
-:class:`BeamSurfaceDistance` is a geometric companion penalty that keeps
-support beams clear of a target surface.
-:class:`BeamCurveDistance` hinges free-span beam clearance to the attached
-coil curves.
-:class:`BeamBeamDistance` hinges pairwise clearance between support beams
-(intra-group CC, CS plus symmetry images).
-:class:`BeamCurveAngle` penalises beam–coil attachments that are too nearly
-tangent.
-:class:`CSRVolume` estimates the central support ring volume as
-``w1 * w2 * L`` from the live CSR curve.
-:class:`CSRCurveDistance` hinges CSR–coil centreline clearance
-(coil–coil pairs are omitted).
-:class:`CSRSurfaceDistance` hinges CSR–surface clearance on one
-field period (half period if stellsym).
-:class:`ClampInboard` hinges fixed clamps that sit radially outboard of
-each coil centre.
-:class:`CRBeamInboard` hinges coil-to-CSR beam starts that sit radially
-outboard of each coil centre.
+:class:`CoilFEMObjective` wraps :class:`~coil_fem.CoilFEM` and exposes
+``J`` / ``dJ`` for simsopt optimisation loops, driven by a single
+:class:`~coil_fem.simsopt.CoilSupport`.  The remaining classes are geometric
+penalties on support beams, fixed clamps and the central support ring
+(clearance to coils, surfaces and other beams; attachment angle; CSR volume;
+inboard placement).
 """
 
 from __future__ import annotations
@@ -76,16 +58,16 @@ class CoilFEMObjective(Optimizable):
         registered with simsopt; curves and currents are reached through it.
     metrics : sequence of str
         Names of FEM metrics to include.  Available: ``'max_von_mises'``,
-        ``'max_von_mises_lse'``, ``'mean_von_mises'``, ``'l2_von_mises'``,
-        ``'strain_energy'``.
+        ``'max_von_mises_lse'``, ``'sq_max_von_mises_lse'``,
+        ``'mean_von_mises'``, ``'l2_von_mises'``, ``'strain_energy'``.
     metric_weights : sequence of float
         Weight applied to each metric.  Must have the same length as
         ``metrics``.
     mesh_options : dict or list[dict]
         Mesh construction options forwarded to :class:`~coil_fem.CoilFEM`.
-    winding_pack_options : dict or None
+    winding_pack_options : dict
         Winding-pack material properties (``'E'``, ``'nu'``, ``'density'``,
-        ``'itc'``).
+        ``'itc'``).  Required; ``None`` raises.
     casing_options : dict or None
         Casing material properties, same keys plus ``'thickness'`` [m].
         ``None`` means no casing.
@@ -94,6 +76,13 @@ class CoilFEMObjective(Optimizable):
         (including ``'remat_bs'``, default True).
     gravity_options : dict or None
         Gravity body-force options forwarded to :class:`~coil_fem.CoilFEM`.
+    physics_options : dict or None
+        Physics selection forwarded to :class:`~coil_fem.CoilFEM`.  Key
+        ``'type'`` is ``'elastic'`` (default) or ``'thermoelastic'`` (stub).
+    coupling : str
+        Coil-support coupling scheme forwarded to :class:`~coil_fem.CoilFEM`:
+        ``'monolithic'`` (default; requires ``solver='cudss'``) or
+        ``'staggered'`` (retired; raises at solve time).
     verbose : int
         JAX-FEM logging verbosity (0 = silent, 1 = INFO, 2 = DEBUG).
 
@@ -204,7 +193,7 @@ class CoilFEMObjective(Optimizable):
         # merged_solve is wrapped with custom_vjp (GPU FFI), set_params writes
         # and reads happen within the same trace, and mesh shapes are fixed at
         # construction.  Cache the compiled function so subsequent calls avoid
-        # re-tracing.  On the CPU/staggered path the Newton loop contains
+        # re-tracing.  On the non-cuDSS path the Newton loop contains
         # host syncs (float conversions) so JIT is not applied.
         _use_jit = (
             problem_options is not None
@@ -328,12 +317,14 @@ class CoilFEMObjective(Optimizable):
         fields, weighted directly by JxW.  Displacement magnitude is a nodal field
         interpolated to the quadrature points with the element shape functions before
         weighting.  Maxima are taken over the raw (unsmoothed) quantities.
+        von Mises RMS/max are also reported per material (winding pack, and
+        casing when present).
         """
         result = self.run()
         fem = self.fem
-        lam, mu = fem._lam, fem._mu
-        num_d2 = num_vm2 = num_f2 = vol = 0.0
-        max_d = max_vm = max_f = 0.0
+        num_d2 = num_f2 = vol = 0.0
+        max_d = max_f = 0.0
+        vm2_m, vol_m, max_m = [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]
         strain_energy = 0.0
         for i in range(len(result['von_mises'])):
             prob = fem.pipelines[i].problem
@@ -346,8 +337,13 @@ class CoilFEMObjective(Optimizable):
     
             # von Mises: quadrature field -> weight by JxW directly
             vm = np.asarray(result['von_mises'][i])
-            num_vm2 += np.sum(vm**2 * jxw)
-            max_vm   = max(max_vm, float(np.max(vm)))
+            mid = np.asarray(prob.material_id_q)
+            for m in (0, 1):
+                sel = mid == m
+                if sel.any():
+                    vm2_m[m] += np.sum(vm[sel]**2 * jxw[sel])
+                    vol_m[m] += np.sum(jxw[sel])
+                    max_m[m] = max(max_m[m], float(np.max(vm[sel])))
     
             # |u|: nodal field -> interpolate to quadrature points, then weight
             dmag   = np.linalg.norm(np.asarray(result['displacements'][i]), axis=-1)
@@ -362,16 +358,25 @@ class CoilFEMObjective(Optimizable):
     
             vol += np.sum(jxw)
             strain_energy += float(total_strain_energy(
-                prob, result['solutions'][i], lam, mu, shape_grads=sg, JxW=jxw_j))
-        return {
+                prob, result['solutions'][i], prob.lam_q, prob.mu_q,
+                shape_grads=sg, JxW=jxw_j))
+        out = {
             'rms_displacement_m': float(np.sqrt(num_d2 / vol)),
             'max_displacement_m': max_d,
-            'rms_von_mises_Pa':   float(np.sqrt(num_vm2 / vol)),
-            'max_von_mises_Pa':   max_vm,
+            'rms_von_mises_Pa':   float(np.sqrt(sum(vm2_m) / vol)),
+            'max_von_mises_Pa':   max(max_m),
+            'rms_von_mises_winding_pack_Pa': float(np.sqrt(vm2_m[0] / vol_m[0])),
+            'max_von_mises_winding_pack_Pa': max_m[0],
+        }
+        if vol_m[1] > 0.0:
+            out['rms_von_mises_casing_Pa'] = float(np.sqrt(vm2_m[1] / vol_m[1]))
+            out['max_von_mises_casing_Pa'] = max_m[1]
+        out.update({
             'rms_body_force_Npm3': float(np.sqrt(num_f2 / vol)),
             'max_body_force_Npm3': max_f,
             'strain_energy_J':    strain_energy,
-        }
+        })
+        return out
 
     def to_vtu(self, out_dir: str = ".", *, run: bool = True,
                prefix: str = "coil", n_sub: int = 20):
@@ -461,7 +466,7 @@ class CoilFEMObjective(Optimizable):
 
     def plot(self, engine: str = "matplotlib", ax=None, show: bool = True,
              axis_equal: bool = True, **kwargs):
-        """Plot von Mises stress surface over the support scatter.
+        """Plot exterior tet faces coloured by quad-averaged von Mises stress.
 
         Parameters
         ----------
@@ -803,12 +808,13 @@ class BeamCurveDistance(Optimizable):
 
     .. math::
         \xi_\mathrm{start}^\mathrm{eff}
-            = \max(\xi_\mathrm{start},\, r_\mathrm{safe}/L),
+            = \max(\xi_\mathrm{start},\, \ell_\mathrm{dead}/L),
         \qquad
         \xi_\mathrm{end}^\mathrm{eff}
-            = \min(\xi_\mathrm{end},\, 1 - r_\mathrm{safe}/L),
+            = \min(\xi_\mathrm{end},\, 1 - \ell_\mathrm{dead}/L),
 
-    with :math:`S_b` the segment between those stations.  Per-end trim is
+    with :math:`\ell_\mathrm{dead}` the ``dead_length`` argument and
+    :math:`S_b` the segment between those stations.  Per-end trim is
     capped at just under :math:`L/2` so the free span cannot invert; a
     collapsed beam still contributes a mid-chord sliver rather than zero.
 
@@ -2229,28 +2235,6 @@ class _InboardPenalty(Optimizable):
 
     return_fn_map = {'J': J, 'dJ': dJ}
 
-    def max_overhang(self):
-        """Largest ``r - r_center`` over attachments [m].
-
-        Returns
-        -------
-        float
-            Positive when at least one attachment is outboard of its coil
-            centre; non-positive when every attachment is inboard or on the
-            centre radius.
-        """
-        cdofs, sdofs = self._read_dofs()
-        curves = self._curves_jax(cdofs)
-        phis_per_coil = list(sdofs[self._dof_key])
-        best = -jnp.inf
-        for curve, phis in zip(curves, phis_per_coil):
-            c = curve.curve_center()
-            r_center = jnp.sqrt(c[0] ** 2 + c[1] ** 2)
-            x = curve.gamma_eval(phis)
-            r = jnp.sqrt(x[:, 0] ** 2 + x[:, 1] ** 2)
-            best = jnp.maximum(best, jnp.max(r - r_center))
-        return float(best)
-
 
 class ClampInboard(_InboardPenalty):
     r"""Penalise fixed clamps that sit radially outboard of a coil centre.
@@ -2266,8 +2250,6 @@ class ClampInboard(_InboardPenalty):
     Examples
     --------
     >>> Jclamp = ClampInboard(coil_support)  # doctest: +SKIP
-    >>> Jclamp.max_overhang()  # doctest: +SKIP
-    0.12...
     """
 
     _dof_key = 'phis'
@@ -2288,8 +2270,6 @@ class CRBeamInboard(_InboardPenalty):
     Examples
     --------
     >>> Jcr = CRBeamInboard(coil_support)  # doctest: +SKIP
-    >>> Jcr.max_overhang()  # doctest: +SKIP
-    0.08...
     """
 
     _dof_key = 'phis_start_cr'

@@ -1,8 +1,7 @@
 """Cross-section property factories for bisymmetric beam elements.
 
-Every function in this module is compatible with the ``cross_section_fn``
-attribute of :class:`~coil_fem.simsopt.CoilSupportBeams` and
-:class:`~coil_fem.coupling.SupportBeams`:
+Each section function in this module is valid as the ``cross_section_fn``
+argument of :class:`~coil_fem.coupling.SupportBeams`:
 
 .. code-block:: python
 
@@ -64,7 +63,7 @@ def _map_groups(fn, *ragged_args):
     is the container, each array is a leaf).  ``fn`` implements the
     elementwise ``(A, Iy, Iz, J)`` formula for a single group's array; this
     helper maps it across groups and transposes the per-group tuples back
-    into the four per-group lists expected by ``SupportBeams.coo``.
+    into the four per-group lists expected by ``SupportBeams.support_values``.
 
     Parameters
     ----------
@@ -404,7 +403,34 @@ def hollow_circle(support_dofs: dict):
     )
 
 
-hollow_circle_attachment = solid_circle_attachment
+def hollow_circle_attachment(surface_pts_beam_frame, dofs, sign_x, beam_options):
+    """Select surface points inside the outer disk of a hollow circular beam.
+
+    Same as :func:`solid_circle_attachment` with
+    ``r_beam = max(r_1_beam, r_2_beam)``, the outer radius.
+
+    Parameters
+    ----------
+    surface_pts_beam_frame : jax.Array, shape (N, 3)
+        Surface points expressed in the beam's local frame, origin at the
+        endpoint.
+    dofs : dict
+        Must contain ``'r_1_beam'`` and ``'r_2_beam'`` (scalars for this beam).
+    sign_x : bool
+        ``True`` at the node-1 end (beam extends toward ``+x_local``);
+        ``False`` at node-2.
+    beam_options : dict
+        Must contain ``'eps_sigmoid'``.
+
+    Returns
+    -------
+    jax.Array, shape (N,)
+        Soft attachment weights in ``[0, 1]``.
+    """
+    r_o = jnp.maximum(dofs['r_1_beam'], dofs['r_2_beam'])
+    return solid_circle_attachment(
+        surface_pts_beam_frame, {'r_beam': r_o}, sign_x, beam_options,
+    )
 
 
 def hollow_circle_solid(occ, dofs, L):

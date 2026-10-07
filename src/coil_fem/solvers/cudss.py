@@ -2,8 +2,8 @@
 
 Provides :class:`CuDSSNewtonSolver` and :func:`cudss_ad_wrapper`, a drop-in
 replacement for ``jax_fem.solver.ad_wrapper`` that keeps the Jacobian on the
-GPU device throughout the Newton loop and reuses the cuDSS factorisation for
-both the forward and adjoint solves.
+GPU device throughout the linear solve.  The forward and adjoint solves share
+the CSR sparsity pattern; the adjoint solve refactorises.
 
 Requires an NVIDIA GPU, ``spineax`` (see ``.[cudss]`` install extra), and
 ``jax_enable_x64 = True``.  ``spineax`` is an optional dependency: this module
@@ -185,7 +185,9 @@ def build_csr_pattern(I: onp.ndarray, J: onp.ndarray, n: int):
     I = onp.asarray(I, dtype=onp.int64)
     J = onp.asarray(J, dtype=onp.int64)
 
-    # --- 1. Lex-sort (row, col) and deduplicate to get unique (i,j) pairs ---
+    # ============================================================================
+    # Lex-sort (row, col) and deduplicate to get unique (i,j) pairs
+    # ============================================================================
     sort_idx = onp.lexsort((J, I))
     I_s = I[sort_idx]
     J_s = J[sort_idx]
@@ -196,7 +198,9 @@ def build_csr_pattern(I: onp.ndarray, J: onp.ndarray, n: int):
     _, first_occ, inv = onp.unique(key, return_index=True, return_inverse=True)
     nnz_csr = int(len(first_occ))
 
-    # --- 2. CSR arrays ---------------------------------------------------------
+    # ============================================================================
+    # CSR arrays
+    # ============================================================================
     indices_np = J_s[first_occ].astype(onp.int32)
     rows_unique = I_s[first_occ].astype(onp.int32)
 
@@ -204,14 +208,20 @@ def build_csr_pattern(I: onp.ndarray, J: onp.ndarray, n: int):
     indptr_np = onp.zeros(n + 1, dtype=onp.int32)
     onp.cumsum(row_counts, out=indptr_np[1:])
 
-    # --- 3. row_per_nnz: row index for every CSR slot -------------------------
+    # ============================================================================
+    # row_per_nnz: row index for every CSR slot
+    # ============================================================================
     row_per_nnz_np = onp.repeat(onp.arange(n, dtype=onp.int32), row_counts)
 
-    # --- 4. coo_to_csr: map each original COO entry → CSR slot ---------------
+    # ============================================================================
+    # coo_to_csr: map each original COO entry → CSR slot
+    # ============================================================================
     coo_to_csr_np = onp.empty(len(I), dtype=onp.int32)
     coo_to_csr_np[sort_idx] = inv.astype(onp.int32)
 
-    # --- 5. Diagonal slots: CSR slot k where row_per_nnz[k] == indices[k] ----
+    # ============================================================================
+    # Diagonal slots: CSR slot k where row_per_nnz[k] == indices[k]
+    # ============================================================================
     is_diag = indices_np == row_per_nnz_np
     diag_slot_indices = onp.where(is_diag)[0]           # CSR slot indices of diag entries
     diag_rows = row_per_nnz_np[diag_slot_indices]        # which rows they belong to
@@ -444,9 +454,9 @@ class CuDSSNewtonSolver:
                 mview_id,
             )
 
-    # ------------------------------------------------------------------
+    # ============================================================================
     # Single linear solve (one Newton step)
-    # ------------------------------------------------------------------
+    # ============================================================================
 
     def solve_step(
         self,
@@ -497,9 +507,9 @@ class CuDSSNewtonSolver:
         inc, inertia = self.cudss(b_bc, csr_values_bc)
         return inc, inertia
 
-    # ------------------------------------------------------------------
+    # ============================================================================
     # Single-step linear solve
-    # ------------------------------------------------------------------
+    # ============================================================================
 
     def solve(self, params) -> list[jnp.ndarray]:
         """Solve the linear system in a single step.
@@ -534,9 +544,9 @@ class CuDSSNewtonSolver:
     # Keep alias so any user code that called newton_loop() still works.
     newton_loop = solve
 
-    # ------------------------------------------------------------------
+    # ============================================================================
     # Adjoint linear solve (for custom_vjp backward)
-    # ------------------------------------------------------------------
+    # ============================================================================
 
     def adjoint_solve(
         self,
@@ -601,7 +611,8 @@ def cudss_ad_wrapper(
     Builds a single :class:`CuDSSNewtonSolver` and returns a ``fwd_pred``
     callable decorated with ``jax.custom_vjp``.  The backward pass mirrors
     ``jax_fem.solver.implicit_vjp`` but replaces the PETSc/scipy linear solve
-    with cuDSS, which reuses the factorization from the forward pass.
+    with cuDSS.  The adjoint solve reuses the forward CSR sparsity pattern
+    but refactorises the matrix.
 
     Only problems with ``is_linear = True`` are accepted; the check is
     enforced in :func:`~coil_fem.solvers.build_fwd_pred` before reaching here.

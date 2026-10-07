@@ -1072,7 +1072,7 @@ def test_cf_beam_cantilever_analytic():
 
 
 # ============================================================================
-# 14. endpoint_state / beam_displacement / beam_labels
+# 14. beam_displacement / beam_labels
 # ============================================================================
 
 def _solved_beam_state(n_base=2, n_cc=1, n_cf=1):
@@ -1093,16 +1093,6 @@ def _solved_beam_state(n_base=2, n_cc=1, n_cf=1):
     })
     geom = sb.beam_geometry(curves, sdofs)
     return sb, geom, result['u_s']
-
-
-def test_endpoint_state_shape_and_roundtrip():
-    """endpoint_state reshapes u_s into (n_beams, 2, 6) without reordering."""
-    sb, _, u_s = _solved_beam_state()
-    es = sb.endpoint_state(u_s)
-    assert es.shape == (sb.n_beams_total, 2, 6)
-    u_beams = u_s.reshape(sb.n_beams_total, 12)
-    assert jnp.allclose(es[:, 0, :], u_beams[:, 0:6])
-    assert jnp.allclose(es[:, 1, :], u_beams[:, 6:12])
 
 
 def test_beam_displacement_boundary_values_match_nodal_translations():

@@ -94,7 +94,6 @@ def test_clamp_inboard_J_matches_analytic():
     cs = _make_fixed(phis=np.array([[0.0, 0.5]]))
     J = ClampInboard(cs)
     np.testing.assert_allclose(J.J(), R1 ** 2, rtol=1e-10)
-    np.testing.assert_allclose(J.max_overhang(), R1, rtol=1e-10)
 
 
 def test_cr_beam_inboard_J_matches_analytic():
@@ -102,7 +101,6 @@ def test_cr_beam_inboard_J_matches_analytic():
     cs = _make_csr(phis_start_cr=np.array([[0.0, 0.5]]))
     J = CRBeamInboard(cs)
     np.testing.assert_allclose(J.J(), R1 ** 2, rtol=1e-10)
-    np.testing.assert_allclose(J.max_overhang(), R1, rtol=1e-10)
 
 
 def test_clamp_inboard_dJ_matches_fd():

@@ -5,8 +5,8 @@ Sweeps a rectangular (:class:`FramedCurveMeshRectangle`) or disk
 to produce a tetrahedral :class:`FramedCurveMesh` (TET4 or TET10).  The
 differentiable method :meth:`FramedCurveMesh.mesh_points_from_dofs` regenerates node
 positions from updated curve DOFs, enabling gradient flow through the mesh
-geometry.  Use :func:`rectangle_sweep` or :func:`disk_sweep` for mesh
-generation, or :meth:`FramedCurveMesh.from_options` for dict-driven dispatch.
+geometry.  Construct a subclass directly, or use
+:meth:`FramedCurveMesh.from_options` for dict-driven dispatch.
 """
 
 import abc
@@ -68,11 +68,28 @@ _TET_EDGE_PAIRS = np.array([
 ], dtype=np.int32)
 
 def _build_disk_o_grid_topology_np(n_center: int, n_radial: int):
-    """
-    Five-block structured O-grid for the unit disk (R = 1 in the cross-section plane).
+    """Five-block structured O-grid for the unit disk (R = 1 in the cross-section plane).
 
-    Returns quad connectivity (counter-clockwise in the (p, q) plane), unit-disk
-    offsets ``oxy`` shape (n2d, 2), and the total node count.
+    Parameters
+    ----------
+    n_center : int
+        Nodes per side of the central square block (>= 2).
+    n_radial : int
+        Nodes along each radial block, including the shared inner edge (>= 2).
+
+    Returns
+    -------
+    quads : np.ndarray, shape (n_quads, 4), int32
+        Quad connectivity, counter-clockwise in the (p, q) plane.
+    oxy : np.ndarray, shape (n2d, 2)
+        Unit-disk node offsets.
+    n2d : int
+        Total node count.
+
+    Raises
+    ------
+    ValueError
+        When ``n_center`` or ``n_radial`` is less than 2.
     """
     Nc = int(n_center)
     Nr = int(n_radial)
@@ -248,7 +265,9 @@ def _rect_sweep_topology(
     O = v_grid.shape[0]
     stride = 2 if mesh_type == 'TET10' else 1                # phi-grid stride
 
-    # ── Corner nodes ──
+    # ============================================================================
+    # Corner nodes
+    # ============================================================================
     # Linear index nidx(m, n, o) = m * (N*O) + n * O + o.
     mm, nn, oo = np.meshgrid(
         np.arange(n_slices), np.arange(N), np.arange(O), indexing='ij'
@@ -257,7 +276,9 @@ def _rect_sweep_topology(
     v_corners = v_grid[oo].ravel()
     phi_corners = (stride * mm).ravel().astype(np.int32)
 
-    # ── Hex connectivity (one hex per (m, n, o), n<N-1, o<O-1) ──
+    # ============================================================================
+    # Hex connectivity (one hex per (m, n, o), n<N-1, o<O-1)
+    # ============================================================================
     def nidx(m, n, o):
         if closed:
             return (m % M) * (N * O) + n * O + o
@@ -295,7 +316,9 @@ def _rect_sweep_topology(
             cells.astype(np.int32), material_id,
         )
 
-    # ── TET10: midside nodes by per-edge deduplication ──
+    # ============================================================================
+    # TET10: midside nodes by per-edge deduplication
+    # ============================================================================
     #
     # The corner tets are the Kuhn split of every hex (all six share the main
     # diagonal v0–v6), so the split is conforming: any interior triangular face
@@ -392,7 +415,7 @@ def _rect_sweep_points(
         Full widths of the rectangular cross-section.
     N, O : int (static under JIT)
         Number of cross-section grid points (= ``n_grid_1 + 1``,
-        ``n_grid_2 + 1`` in :func:`rectangle_sweep`).
+        ``n_grid_2 + 1`` in :class:`FramedCurveMeshRectangle`).
     mesh_type : str (static)
         ``'TET4'`` or ``'TET10'``.
     M : int or None (static)
@@ -401,6 +424,11 @@ def _rect_sweep_points(
     phi_span : float or None (static)
         ``None`` (default) keeps the closed full-turn sweep.  A float opens
         the sweep over ``[0, phi_span]``.
+    n_casing : int (static)
+        Cells through the casing on each side of the winding pack (default 0).
+    tu, tv : float (static)
+        Normalized casing thickness, ``2 t / w1`` and ``2 t / w2``.  Nodes
+        then reach ``u = ±(1 + tu)`` and ``v = ±(1 + tv)``.
 
     Returns
     -------
@@ -477,7 +505,7 @@ def quad_sweep_points_to_mesh(
     # Match :func:`_rect_sweep_topology` brick order: v0–v3 at phi = m
     # span (q0,q1) and (q3,q2) with phi-edges v0–v1 and v3–v2; v4–v7 at phi = m+1.
     # Quad corners must be ordered CCW as (q0,q1,q2,q3) = tensor-product
-    # (i,j),(i+1,j),(i+1,j+1),(i,j+1) from :func:`build_disk_o_grid_topology_np`.
+    # (i,j),(i+1,j),(i+1,j+1),(i,j+1) from :func:`_build_disk_o_grid_topology_np`.
     hex_corners = jnp.stack(
         [
             nidx(mm, q4[:, 0]),
@@ -493,62 +521,6 @@ def quad_sweep_points_to_mesh(
     )
     cells = hex_corners[:, _KUHN_6].reshape(-1, 4)
     return points, cells.astype(jnp.int32)
-
-
-def disk_sweep(
-    framed_curve,
-    radius,
-    *,
-    n_center=None,
-    n_radial=None,
-    aspect_ratio=1.0,
-    mesh_type: str = "TET4",
-):
-    """Backward-compatible wrapper that builds a :class:`FramedCurveMeshDisk`.
-
-    The mesh-generation logic now lives in :class:`FramedCurveMeshDisk.__init__`; this
-    function is a thin shim so existing callers keep working.  See
-    :class:`FramedCurveMeshDisk` for the full parameter documentation.
-
-    Returns
-    -------
-    FramedCurveMeshDisk
-    """
-    return FramedCurveMeshDisk(
-        framed_curve, radius,
-        n_center=n_center, n_radial=n_radial,
-        aspect_ratio=aspect_ratio, mesh_type=mesh_type,
-    )
-
-def rectangle_sweep(
-    framed_curve,
-    w1, w2,
-    *,
-    n_grid_1=None,
-    n_grid_2=None,
-    aspect_ratio=1.0,
-    mesh_type="TET4",
-    phi_span=None,
-    n_phi=None,
-    casing_thickness=None,
-):
-    """ Backward-compatible wrapper that builds a :class:`FramedCurveMeshRectangle`.
-
-    The mesh-generation logic now lives in :class:`FramedCurveMeshRectangle.__init__`;
-    this function is a thin shim so existing callers keep working.  See
-    :class:`FramedCurveMeshRectangle` for the full parameter documentation.
-
-    Returns
-    -------
-    FramedCurveMeshRectangle
-    """
-    return FramedCurveMeshRectangle(
-        framed_curve, w1, w2,
-        n_grid_1=n_grid_1, n_grid_2=n_grid_2,
-        aspect_ratio=aspect_ratio, mesh_type=mesh_type,
-        phi_span=phi_span, n_phi=n_phi,
-        casing_thickness=casing_thickness,
-    )
 
 
 class FramedCurveMesh(JAXFEMMesh, abc.ABC):
@@ -623,7 +595,7 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
         """Store the metadata common to every cross-section shape.
 
         Called by subclass constructors after ``super().__init__`` so that
-        ``self.cells`` is already populated.  Phase-2 reference-coordinate
+        ``self.cells`` is already populated.  The reference-coordinate
         fields (``n_quads``/``phi_quad``/``uv_quad``) are initialised to ``None``
         and filled later by :meth:`attach_ref_coords`.
         """
@@ -637,7 +609,7 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
             np.zeros(self.n_cells, np.int32) if material_id is None
             else np.asarray(material_id, np.int32)
         )
-        # Phase-2 (set by attach_ref_coords once the FEM problem exists).
+        # Set by attach_ref_coords once the FEM problem exists.
         self.n_quads = None
         self.phi_quad = None
         self.uv_quad = None
@@ -653,6 +625,10 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
             A single normalised ``mesh_options`` entry (must contain ``'shape'``).
         mesh_type : str
             ``'TET4'`` or ``'TET10'``.
+        casing_thickness : float or None
+            Casing thickness [m] added outside a rectangular winding pack
+            (default ``None``, no casing).  Raises ``NotImplementedError``
+            for ``shape='disk'``.
 
         Returns
         -------
@@ -697,7 +673,7 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
         raise NotImplementedError
 
     # ============================================================================
-    # Reference-coordinate pre-computation (phase 2; needs the FEM problem)
+    # Reference-coordinate pre-computation (needs the FEM problem)
     # ============================================================================
 
     def attach_ref_coords(self, prob) -> None:
