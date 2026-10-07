@@ -1,7 +1,7 @@
 """Metrics for evaluating the FEM solutions.
 
-All public functions accept optional ``shape_grads`` and ``JxW`` keyword
-arguments.  When provided (as recomputed by :meth:`~coil_fem.CoilFEM.objective`
+The volume-integrated metrics accept optional ``shape_grads`` and ``JxW``
+keyword arguments.  When provided (as recomputed by :meth:`~coil_fem.CoilFEM.objective`
 outside the ``ad_wrapper`` boundary), gradients flow through mesh geometry
 correctly.  When ``None``, the function falls back to ``problem.shape_grads``
 / ``problem.JxW``, which is fine for forward-only diagnostics.
@@ -144,7 +144,7 @@ def mean_von_mises_volume_weighted(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     shape_grads : jnp.ndarray or None
     JxW : jnp.ndarray or None
         Quadrature weights ``(n_cells, n_quads)``.
@@ -174,7 +174,7 @@ def max_von_mises_hard(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     shape_grads : jnp.ndarray or None
     JxW : jnp.ndarray or None
     epsilon_th : jnp.ndarray or None
@@ -210,7 +210,7 @@ def max_von_mises_lse(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     beta : float
         Smoothing parameter (default 20.0).
     shape_grads : jnp.ndarray or None
@@ -238,17 +238,17 @@ def sq_max_von_mises_lse(
     JxW=None,
     epsilon_th=None,
 ) -> jnp.ndarray:
-    r"""Smooth maximum von Mises stress via log-sum-exp.
+    r"""Squared smooth maximum von Mises stress via log-sum-exp.
 
-    Computes :math:`\frac{1}{\beta}\log\sum_q e^{\beta \sigma_{vm,q}}` over
-    all quadrature points.  Differentiable everywhere; approaches the hard
-    maximum as ``beta`` → ∞.
+    Computes :math:`\left(\frac{1}{\beta}\log\sum_q e^{\beta \sigma_{vm,q}}\right)^2`
+    over all quadrature points.  Differentiable everywhere; approaches the
+    squared hard maximum as ``beta`` → ∞.
 
     Parameters
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     beta : float
         Smoothing parameter (default 20.0).
     shape_grads : jnp.ndarray or None
@@ -258,7 +258,7 @@ def sq_max_von_mises_lse(
     Returns
     -------
     jnp.ndarray
-        Scalar smooth-maximum von Mises stress [Pa].
+        Scalar squared smooth-maximum von Mises stress [Pa²].
     """
     vm = von_mises_on_quadrature(
         problem, sol_list, lam, mu, shape_grads=shape_grads, epsilon_th=epsilon_th,
@@ -281,7 +281,7 @@ def l2_von_mises(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     shape_grads : jnp.ndarray or None
     JxW : jnp.ndarray or None
     epsilon_th : jnp.ndarray or None
@@ -311,7 +311,7 @@ def strain_energy_density(
     ----------
     u_grad : jnp.ndarray, shape ``(..., 3, 3)``
         Displacement gradient at each quadrature point.
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
         Lamé parameters.
     epsilon_th : jnp.ndarray or None
         Constant thermal eigenstrain ``(3, 3)``; ``None`` for isothermal.
@@ -336,7 +336,7 @@ def total_strain_energy(
     ----------
     problem : LinearElasticity3D
     sol_list : list[jnp.ndarray]
-    lam, mu : float
+    lam, mu : float or array, shape (n_cells, n_quads)
     shape_grads : jnp.ndarray or None
     JxW : jnp.ndarray or None
     epsilon_th : jnp.ndarray or None

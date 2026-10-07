@@ -204,7 +204,8 @@ class CoilFEM:
     support : Support
         Support model owning the grounded-clamp modulus (``k_clamp``) and,
         for coupled subclasses, the beam-attachment modulus
-        (``k_attachment``).  Provides per-surface-node Winkler weights via
+        (``k_attachment``).  Provides Winkler weights per surface point
+        (quadrature points during solves) via
         :meth:`~coil_fem.coupling.Support.compute_weights` and combines them
         into a stiffness via :meth:`~coil_fem.coupling.Support.stiffness`.
     gravity_options : dict or None
@@ -234,6 +235,13 @@ class CoilFEM:
         * ``'remat_bs'`` : bool (default True) — checkpoint Biot–Savart
           scan body to cut reverse-mode peak memory.
 
+    physics_options : dict or None
+        Physics selection.  Key ``'type'`` is ``'elastic'`` (default) or
+        ``'thermoelastic'`` (stub, not yet implemented).
+    coupling : str
+        Coil-support coupling scheme for coupled supports: ``'monolithic'``
+        (default; requires ``solver='cudss'``) or ``'staggered'`` (retired;
+        raises at solve time).
     verbose : int
         Logging verbosity (0 = silent, 1 = INFO, 2 = DEBUG).
 
@@ -274,7 +282,9 @@ class CoilFEM:
             )
         self.coupling = coupling
 
-        # ── 1. Validate and normalise inputs ─────────────────────────────────
+        # ============================================================================
+        # 1. Validate and normalise inputs
+        # ============================================================================
         self.base_curves_jax = list(base_curves_jax)
         self.base_currents_jax = jnp.asarray(base_currents_jax, dtype=float)
         self.nfp = int(nfp)
@@ -304,7 +314,9 @@ class CoilFEM:
                 raise ValueError(f"material {i} missing keys {sorted(missing)}.")
         self.materials = materials
 
-        # ── 3+4. Build per-coil pipelines (mesh + problem + fwd_pred) ───────────
+        # ============================================================================
+        # 3+4. Build per-coil pipelines (mesh + problem + fwd_pred)
+        # ============================================================================
         # Pipelines replace the separate self.meshes / self._problems /
         # self._fwd_preds / self._surface_node_indices lists.  The mesh is
         # built inside ElasticPipeline so topology and problem stay co-located.
@@ -357,7 +369,9 @@ class CoilFEM:
             else None
         )
 
-        # ── Per-coil JIT body force functions ────────────────────────────────
+        # ============================================================================
+        # Per-coil JIT body force functions
+        # ============================================================================
         # Binding coil_idx statically via functools.partial lets JAX resolve
         # self.meshes[i], self.pipelines[i], and the cross-section branch at
         # trace time, turning _body_force_at_quads into a pure traced function
@@ -367,7 +381,9 @@ class CoilFEM:
             for i in range(len(self.base_curves_jax))
         ]
 
-        # ── Per-coil JIT recompute_fe_geometry ───────────────────────────────
+        # ============================================================================
+        # Per-coil JIT recompute_fe_geometry
+        # ============================================================================
         # recompute_fe_geometry is called twice per coil per objective
         # evaluation (once in _body_force_at_quads, once in the metrics loop).
         # Closing over the static problem fields eliminates re-tracing when
@@ -468,17 +484,6 @@ class CoilFEM:
             Self-field at FEM quadrature points.
         B_ext_q : (n_cells, n_quads, 3) [T]
             Mutual field from all other coils at FEM quadrature points.
-
-        Pipeline
-        --------
-        1. Evaluate tangent ``t_hat`` at FEM quad points via
-           ``curve.gamma_eval(..., diff_order=1)`` (exact Fourier derivative).
-        2. Build current density ``J_q = (I / A) * current_weight_q * t_hat_q``.
-        3. Compute ``B_self_q`` via
-           :func:`~coil_fem.magnetic.B_self_quadrature` (rect; raises for disk).
-        4. Compute ``B_ext_q`` via :func:`~coil_fem.magnetic.biot_savart` at
-           physical quad point positions.
-        5. ``f_vol = J_q × (B_self_q + B_ext_q)  +  rho_q * g``.
         """
         mesh = self.meshes[coil_idx]
         prob = self.pipelines[coil_idx].problem
@@ -496,16 +501,22 @@ class CoilFEM:
         curve = fc.curve
         I     = all_currents[coil_idx]
 
-        # ── 1. Tangent at FEM quad points (exact Fourier derivative) ──────────
+        # ============================================================================
+        # 1. Tangent at FEM quad points (exact Fourier derivative)
+        # ============================================================================
         gammadash_q = curve.gamma_eval(phi_q, diff_order=1)  # (n_cells, n_quads, 3)
         t_hat_q = gammadash_q / jnp.linalg.norm(
             gammadash_q, axis=-1, keepdims=True
         )
 
-        # ── 2. Current density at FEM quad points (uniform current model) ─────
+        # ============================================================================
+        # 2. Current density at FEM quad points (uniform current model)
+        # ============================================================================
         J_q = (I / A_conductor) * prob.current_weight_q[..., None] * t_hat_q
 
-        # ── 3. B_self at FEM quad points ──────────────────────────────────────
+        # ============================================================================
+        # 3. B_self at FEM quad points
+        # ============================================================================
         cross_section: dict = {'shape': mesh.shape}
         if mesh.shape == 'rect':
             cross_section['w1'] = mesh.w1
@@ -519,7 +530,9 @@ class CoilFEM:
             fc, I, cross_section, phi_q, jnp.clip(mesh.uv_quad, -1.0, 1.0),
         )   # (n_cells, n_quads, 3)
 
-        # ── 4. B_ext at FEM quad points via Biot-Savart on physical mesh ──────
+        # ============================================================================
+        # 4. B_ext at FEM quad points via Biot-Savart on physical mesh
+        # ============================================================================
         if pqp is None:
             prob_i = self.pipelines[coil_idx].problem
             _, _, _, pqp = recompute_fe_geometry(
@@ -533,7 +546,9 @@ class CoilFEM:
             remat=self.problem_options['remat_bs'],
         ).reshape(n_cells, n_quads, 3)
 
-        # ── 5. Lorentz body force (+ gravity) ─────────────────────────────────
+        # ============================================================================
+        # 5. Lorentz body force (+ gravity)
+        # ============================================================================
         f_vol = lorentz_body_force(J_q, B_self_q + B_ext_q)
 
         if self.gravity_options is not None:
@@ -580,9 +595,9 @@ class CoilFEM:
         """Run FEM solves for all base coils, dispatching to the correct driver.
 
         When ``support.is_coupled`` is ``True``, delegates to
-        :func:`~coil_fem.coupling.solve_staggered` or
-        :func:`~coil_fem.coupling.solve_monolithic` depending on
-        :attr:`coupling`.  Otherwise runs an independent per-coil loop.
+        :func:`~coil_fem.coupling.solve_monolithic` (``coupling='staggered'``
+        raises ``NotImplementedError``).  Otherwise runs an independent
+        per-coil loop.
 
         Parameters
         ----------
@@ -602,8 +617,12 @@ class CoilFEM:
         * ``'B_self_by_coil'``  — list of ``(n_cells, n_quads, 3)`` self-field arrays.
         * ``'B_ext_by_coil'``   — list of ``(n_cells, n_quads, 3)`` mutual-field arrays.
         * ``'stiffness_by_coil'`` — list of per-quad Winkler stiffness arrays.
+        * ``'sg_by_coil'``      — list of ``(n_cells, n_quads, n_nodes_per_cell, 3)``
+          shape-function gradients.
+        * ``'jxw_by_coil_fe'``  — list of ``(n_cells, n_quads)`` ``JxW`` arrays.
         * ``'u_s'``             — ``(n_support_dofs,)`` support DOF vector, or
           ``None`` for uncoupled solves.
+        * ``'diagnostics'``     — driver diagnostics dict (empty if none).
         """
         n_base = len(self.base_curves_jax)
 
@@ -721,7 +740,8 @@ class CoilFEM:
         base_support_dofs : dict or None
             Merged support-dofs dict for the whole coil set (as returned by
             :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).  ``None``
-            lets the support object use its own default parameters.
+            switches off the beam-attachment weights, leaving only the
+            grounded-clamp weights.
 
         Returns
         -------
@@ -744,9 +764,7 @@ class CoilFEM:
           arrays [T] per coil.
         * ``'u_s'``           -- support DOF vector, shape ``(n_support_dofs,)``,
           or ``None`` for an uncoupled :class:`~coil_fem.coupling.Support`.
-          For :class:`~coil_fem.coupling.SupportBeams`, reshape via
-          ``self.support.endpoint_state(result['u_s'])`` for a per-beam,
-          per-node ``(translation, rotation)`` breakdown, or evaluate
+          For :class:`~coil_fem.coupling.SupportBeams`, evaluate
           ``self.support.beam_displacement(geom, result['u_s'], xi)`` for the
           closed-form displacement along each beam.
         * ``'support_continuum'`` -- list of dicts, one per
@@ -815,8 +833,7 @@ class CoilFEM:
         displacement field into per-quadrature-point strain tensors.  Uses the
         small-strain additive split ``ε = ε_elastic + ε_th``: the total strain
         ``ε = ½(∇u + ∇uᵀ)`` is purely geometric, while the thermal eigenstrain
-        ``ε_th = −itc · I`` is the spatially-uniform constant
-        configured via ``winding_pack_options``.  The stress-producing elastic
+        is ``ε_th = −itc · I`` per material.  The stress-producing elastic
         strain is ``eps_total - eps_thermal`` (broadcasts automatically).
 
         Intended for diagnostics and post-processing; no gradients are
@@ -839,9 +856,9 @@ class CoilFEM:
 
         * ``'eps_total'``   -- list of ``(n_cells, n_quads, 3, 3)`` total-strain
           arrays, one per base coil.
-        * ``'eps_thermal'`` -- list of ``(3, 3)`` thermal-eigenstrain arrays,
-          one per base coil.  Uniform per coil (zeros when no thermal
-          parameters were configured); left un-broadcast for memory efficiency.
+        * ``'eps_thermal'`` -- list of thermal-eigenstrain arrays, one per base
+          coil: ``(n_cells, n_quads, 3, 3)`` when any material has ``'itc'``,
+          otherwise a ``(3, 3)`` zero tensor.
         """
         result = self.run(
             base_curves_dofs=base_curves_dofs,
@@ -866,7 +883,7 @@ class CoilFEM:
 
         return {
             'eps_total':   eps_total_list,    # list of (n_cells, n_quads, 3, 3)
-            'eps_thermal': eps_thermal_list,  # list of (3, 3)
+            'eps_thermal': eps_thermal_list,  # list of (n_cells, n_quads, 3, 3) or (3, 3)
         }
 
     def objective(
@@ -898,10 +915,12 @@ class CoilFEM:
         base_support_dofs : dict or None
             Merged support-dofs dict for the whole coil set (as returned by
             :attr:`~coil_fem.simsopt.CoilSupport.support_dofs`).  ``None``
-            lets the support object use its own default parameters.
+            switches off the beam-attachment weights, leaving only the
+            grounded-clamp weights.
         metrics : tuple[str, ...]
             Metric names (static).  Available: ``'max_von_mises'``,
-            ``'max_von_mises_lse'``, ``'mean_von_mises'``,
+            ``'max_von_mises_lse'``, ``'sq_max_von_mises_lse'``,
+            ``'mean_von_mises'``,
             ``'l2_von_mises'``, ``'strain_energy'``.
 
         Returns
@@ -922,7 +941,9 @@ class CoilFEM:
         """
         n_base = len(self.base_curves_jax)
 
-        # ── Argument validation ───────────────────────────────────────────────
+        # ============================================================================
+        # Argument validation
+        # ============================================================================
         if not isinstance(base_curves_dofs, (list, tuple)):
             raise TypeError(
                 "base_curves_dofs must be a list of jax.Array, "
@@ -942,18 +963,24 @@ class CoilFEM:
 
         metric_fns = [_build_metric_fn(m) for m in metrics]
 
-        # ── Symmetry expansion (shared across all coils) ──────────────────────
+        # ============================================================================
+        # Symmetry expansion (shared across all coils)
+        # ============================================================================
         all_gammas, all_gammadashs, all_currents = self._expand_geometry(
             base_curves_dofs, base_currents_dofs
         )
 
-        # ── Solve all coils (coupled or uncoupled) ────────────────────────────
+        # ============================================================================
+        # Solve all coils (coupled or uncoupled)
+        # ============================================================================
         solved = self._solve_all(
             base_curves_dofs, all_gammas, all_gammadashs, all_currents,
             base_support_dofs,
         )
 
-        # ── Per-coil metric accumulation ──────────────────────────────────────
+        # ============================================================================
+        # Per-coil metric accumulation
+        # ============================================================================
         # Max-type metrics reduce across coils with ``max`` (worst-coil peak);
         # all other metrics accumulate with ``sum``.
         totals = {
@@ -985,7 +1012,9 @@ class CoilFEM:
                 else:
                     totals[m] = totals[m] + val_i
 
-        # ── Support continuum members (e.g. CSR ring) ─────────────────────────
+        # ============================================================================
+        # Support continuum members (e.g. CSR ring)
+        # ============================================================================
         u_s = solved['u_s']
         if u_s is not None and base_support_dofs is not None:
             sdofs = base_support_dofs
@@ -1027,6 +1056,8 @@ class CoilFEM:
 
         Parameters
         ----------
+        coil_idx : int
+            Base-coil index.
         pts_i : (n_nodes, 3) traced
         curves_jax : list[CurveXYZFourierJAX]
             Differentiable centreline curves for **all** base coils.
@@ -1062,12 +1093,7 @@ class CoilFEM:
 
     @functools.cached_property
     def meshes(self) -> list[FramedCurveMesh]:
-        """Per-coil mesh objects (one per base coil).
-
-        Backward-compatibility shim: delegates to ``pipeline.mesh`` so that
-        all existing code using ``self.meshes[i]`` continues to work after
-        the internal migration to :class:`~coil_fem.pipelines.ElasticPipeline`.
-        """
+        """Per-coil mesh objects (one per base coil), i.e. ``pipeline.mesh``."""
         return [p.mesh for p in self.pipelines]
 
     @property
@@ -1109,8 +1135,9 @@ class CoilFEM:
             DOF vectors used to evaluate current surface positions.  ``None``
             uses the initial DOFs from ``self.base_curves_jax``.
         base_support_dofs : dict or None
-            Per-coil support parameters for the support functions.  ``None``
-            (default) uses the support parameters supplied at construction.
+            Merged support-dofs dict for the whole coil set.  ``None``
+            (default) switches off the beam-attachment weights, leaving only
+            the grounded-clamp weights.
         ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None
             Existing 3-D axes to draw on.  ``None`` (default) creates a new
             figure and 3-D axes.
@@ -1212,11 +1239,9 @@ class CoilFEM:
         base_support_dofs: dict | None = None,
         ax=None,
         cmap: str = "viridis",
-        support_color="k",
-        support_s: float = 6.0,
         axis_equal: bool = True,
     ):
-        """Overlay a von Mises stress surface on the Winkler support scatter.
+        """Plot exterior tet faces coloured by quad-averaged von Mises stress.
 
         Renders the exterior faces of every tetrahedron as coloured
         triangles whose colour is the owning cell's quad-averaged von Mises
@@ -1240,10 +1265,6 @@ class CoilFEM:
         cmap : str
             Matplotlib colormap name for the von Mises surface (default
             ``"viridis"``).
-        support_color : color-like
-            Colour of the support markers (default ``"k"``).
-        support_s : float
-            Marker size for the support scatter (default ``6.0``).
         axis_equal : bool
             If ``True`` (default) scale the three axes equally via
             :func:`simsopt.geo.plotting.fix_matplotlib_3d`.
@@ -1259,7 +1280,9 @@ class CoilFEM:
         from matplotlib.cm import ScalarMappable
         from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-        # ── Mesh-type check: surface rendering needs triangular tet faces ────
+        # ============================================================================
+        # Mesh-type check: surface rendering needs triangular tet faces
+        # ============================================================================
         for m in self.meshes:
             if m.ele_type not in ("TET4", "TET10"):
                 raise NotImplementedError(
@@ -1267,12 +1290,13 @@ class CoilFEM:
                     f"found ele_type={m.ele_type!r}."
                 )
 
-        # ── Support scatter (hollow circles, weight-as-alpha) ────────────────
         if ax is None:
             _, ax = plt.subplots(subplot_kw={"projection": "3d"})
         fig = ax.get_figure()
 
-        # ── Forward FEM for von Mises + node geometry ────────────────────────
+        # ============================================================================
+        # Forward FEM for von Mises + node geometry
+        # ============================================================================
         result = self.run(
             base_curves_dofs=base_curves_dofs,
             base_currents_dofs=base_currents_dofs,
@@ -1378,7 +1402,7 @@ class CoilFEM:
           With ``run`` each beam is subdivided into ``n_sub`` segments carrying
           the closed-form ``displacement_m``; without ``run`` a single straight
           segment per beam on ``[ξ_start, ξ_end]`` is written.  Cell fields
-          ``beam_type`` (CC=0, CF=1), ``coil_index``, ``beam_length``.
+          ``beam_type`` (CC=0, CF=1, CR=2), ``coil_index``, ``beam_length``.
 
         * ``{out_dir}/{prefix}{name}.vtu`` — one file per
           :attr:`~coil_fem.coupling.Support.continuum_members` entry, with the
@@ -1394,7 +1418,7 @@ class CoilFEM:
             deformed-state fields; when ``False`` export geometry and support
             weights only.
         prefix : str
-            File-name prefix (default ``"coil"``).
+            File-name prefix (default ``""``).
         base_curves_dofs : list[jax.Array] or None
             DOF vectors per base coil.  ``None`` uses initial DOFs from
             ``self.base_curves_jax``.
@@ -1404,7 +1428,7 @@ class CoilFEM:
         base_support_dofs : dict or None
             Per-coil support parameters for the support functions.
         n_sub : int
-            Number of sub-segments per beam in ``{prefix}_beams.vtu`` when
+            Number of sub-segments per beam in ``{prefix}beams.vtu`` when
             ``run`` (default 20).  Ignored when the support has no beam network.
 
         Returns
