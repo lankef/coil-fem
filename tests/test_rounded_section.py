@@ -110,7 +110,7 @@ def test_sweep_conforming(mesh_type):
 def test_coilfem_rounding_wiring():
     curve = _circle(N=8)
     wp = {'E': 200e9, 'nu': 0.3, 'density': 8000.0}
-    mesh_opt = {'shape': 'rect', 'w1': 0.02, 'w2': 0.02, 'rounding_subdivision': 1}
+    mesh_opt = {'shape': 'rect', 'w1': 0.02, 'w2': 0.02}
     common = dict(
         base_curves_jax=[curve],
         base_currents_jax=jnp.array([1e6]),

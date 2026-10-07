@@ -868,7 +868,7 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
         opt : dict
             A single normalised ``mesh_options`` entry (must contain ``'shape'``).
             With ``rounding``, the optional keys ``'rounding_subdivision'``
-            (int, default 4) and ``'g_meshing'`` (float, default 0.5) apply
+            (int, default 1) and ``'g_meshing'`` (float, default 0.5) apply
             and ``'n_grid_1'`` / ``'n_grid_2'`` are rejected.
         mesh_type : str
             ``'TET4'`` or ``'TET10'``.
@@ -901,7 +901,7 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
                 raise ValueError(
                     "n_grid_1/n_grid_2 do not apply to the rounded (adaptive) mesh."
                 )
-            sub = opt.get('rounding_subdivision', 4)
+            sub = opt.get('rounding_subdivision', 1)
             if int(sub) != sub or sub < 1:
                 raise ValueError(f"rounding_subdivision must be an integer >= 1, got {sub}.")
             g = float(opt.get('g_meshing', 0.5))
