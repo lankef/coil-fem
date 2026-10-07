@@ -206,7 +206,7 @@ class CoilFEMObjective(Optimizable):
             self._jit_vg = _vg
 
         # Caches invalidated via recompute_bell() when any DOFs change.
-        self._needs_dJ: bool = True
+        self._needs_update: bool = True
         self._J_cache: float | None = None
         self._grad_curves: list | None = None
         self._grad_currents: np.ndarray | None = None
@@ -220,7 +220,7 @@ class CoilFEMObjective(Optimizable):
 
     def recompute_bell(self, child=None, parent=None):
         """Invalidate cached J / dJ when any ancestor DOFs change."""
-        self._needs_dJ = True
+        self._needs_update = True
 
     # ============================================================================
     # Core computation
@@ -245,7 +245,7 @@ class CoilFEMObjective(Optimizable):
 
     def _compute(self):
         """Evaluate J and its gradients from the single ``value_and_grad``."""
-        if not self._needs_dJ:
+        if not self._needs_update:
             return
         cdofs, idofs, sdofs = self._read_dofs()
 
@@ -257,7 +257,7 @@ class CoilFEMObjective(Optimizable):
         self._grad_curves   = [np.asarray(g) for g in grad_cdofs]
         self._grad_currents = np.asarray(grad_idofs)
         self._grad_support  = grad_sdofs   # single dict
-        self._needs_dJ = False
+        self._needs_update = False
 
     # ============================================================================
     # Simsopt interface
