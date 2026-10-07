@@ -1,7 +1,8 @@
-"""Structured volume meshes and meshing routines for finite-build coils.
+"""Swept volume meshes and meshing routines for finite-build coils.
 
-Sweeps a rectangular (:class:`FramedCurveMeshRectangle`) or disk
-(:class:`FramedCurveMeshDisk`) cross-section grid along a framed centerline curve
+Sweeps a rectangular (:class:`FramedCurveMeshRectangle`), disk
+(:class:`FramedCurveMeshDisk`) or gmsh-triangulated (:class:`FramedCurveMeshSection`)
+cross-section along a framed centerline curve
 to produce a tetrahedral :class:`FramedCurveMesh` (TET4 or TET10).  The
 differentiable method :meth:`FramedCurveMesh.mesh_points_from_dofs` regenerates node
 positions from updated curve DOFs, enabling gradient flow through the mesh
@@ -10,6 +11,7 @@ geometry.  Construct a subclass directly, or use
 """
 
 import abc
+import dataclasses
 
 import numpy as np
 import jax
@@ -316,23 +318,8 @@ def _rect_sweep_topology(
             cells.astype(np.int32), material_id,
         )
 
-    # ============================================================================
-    # TET10: midside nodes by per-edge deduplication
-    # ============================================================================
-    #
-    # The corner tets are the Kuhn split of every hex (all six share the main
-    # diagonal v0–v6), so the split is conforming: any interior triangular face
-    # is shared by exactly two tets and every interior edge is shared by all the
-    # tets around it.  We therefore create exactly ONE midside node per unique
-    # tet edge — no per-family bookkeeping, and no coincident duplicates.
-    #
-    # For each of the 6 tet edges (VTK order) we form a canonical key from the
-    # *global* (wrapped) corner-index pair and deduplicate.  Endpoint u/v come
-    # straight from the corner arrays.  The phi index is the average of the two
-    # endpoints' *unwrapped* phi levels (2*m at slice m, 2*m+2 at slice m+1).
-    # Closed: taken mod 2M so the periodic seam (level 2M) wraps back to 0.
-    # Open: no wrap; half-steps land on odd indices in ``[0, 2M]``.
-
+    # The Kuhn split is conforming (all six tets share the main diagonal), so
+    # one midside node per unique tet edge suffices.
     # Unwrapped phi level (in stride-2 units) of each of the 8 hex corners.
     # Back face (slice m): v0, v3, v4, v7.  Front face (slice m+1): v1, v2, v5, v6.
     back = (stride * mh).astype(np.int64)                    # (num_hex,)
@@ -340,16 +327,24 @@ def _rect_sweep_topology(
     hex_philevel = np.stack(
         [back, front, front, back, back, front, front, back], axis=1
     )                                                        # (num_hex, 8)
-
-    # Corner tets and their per-corner unwrapped phi levels (num_cells, 4).
     cells4 = hex_corners[:, _KUHN_6].reshape(-1, 4)
     cell_phi = hex_philevel[:, _KUHN_6].reshape(-1, 4)
+    u_per_node, v_per_node, phi_idx, cells_10 = _tet10_midsides(
+        cells4, cell_phi, u_corners, v_corners, phi_corners, M, closed,
+    )
+    return u_per_node, v_per_node, phi_idx, cells_10, material_id
 
-    # All 6 VTK edges of every tet → global index pairs and phi-level pairs.
+
+def _tet10_midsides(cells4, cell_phi, u_corners, v_corners, phi_corners, M, closed):
+    """Append one midside node per unique edge of a conforming TET4 sweep.
+
+    ``cell_phi`` holds each corner's *unwrapped* phi level in stride-2 units
+    (``2m`` at slice ``m``); the midside level is the half-sum, folded mod
+    ``2M`` for a closed sweep so the seam wraps back to 0.
+    """
     edge_g = cells4[:, _TET10_VTK_EDGES].reshape(-1, 2)      # (num_cells*6, 2)
     edge_phi = cell_phi[:, _TET10_VTK_EDGES].reshape(-1, 2)  # (num_cells*6, 2)
 
-    # Canonical (sorted) global key → one midside node per unique edge.
     key = np.sort(edge_g, axis=1)
     uniq_key, first_idx, inv = np.unique(
         key, axis=0, return_index=True, return_inverse=True
@@ -361,11 +356,9 @@ def _rect_sweep_topology(
     u_mid = 0.5 * (u_corners[a] + u_corners[b])
     v_mid = 0.5 * (v_corners[a] + v_corners[b])
 
-    # Half-sum of the unwrapped phi levels, taken from a representative
-    # occurrence of each unique edge.  Closed: mod 2M folds the seam (2M → 0).
     edge_phi_half = (edge_phi[:, 0] + edge_phi[:, 1]) // 2    # (num_cells*6,)
     if closed:
-        phi_mid = (edge_phi_half[first_idx] % (stride * M)).astype(np.int32)
+        phi_mid = (edge_phi_half[first_idx] % (2 * M)).astype(np.int32)
     else:
         phi_mid = edge_phi_half[first_idx].astype(np.int32)
 
@@ -373,10 +366,9 @@ def _rect_sweep_topology(
     v_per_node = np.concatenate([v_corners, v_mid])
     phi_idx = np.concatenate([phi_corners, phi_mid]).astype(np.int32)
 
-    base = n_slices * N * O
-    mid_idx = (base + inv).reshape(-1, 6)                    # (num_cells, 6)
+    mid_idx = (u_corners.shape[0] + inv).reshape(-1, 6)      # (num_cells, 6)
     cells_10 = np.concatenate([cells4, mid_idx], axis=1)     # (num_cells, 10)
-    return u_per_node, v_per_node, phi_idx, cells_10.astype(np.int32), material_id
+    return u_per_node, v_per_node, phi_idx, cells_10.astype(np.int32)
 
 
 @partial(jax.jit, static_argnames=(
@@ -446,8 +438,20 @@ def _rect_sweep_points(
         M, N, O, mesh_type, phi_span=phi_span,
         n_casing=n_casing, tu=tu, tv=tv,
     )
-    closed = phi_span is None
-    if closed:
+    return _sweep_points(
+        framed_curve, w1, w2,
+        jnp.asarray(u_np, dtype=float), jnp.asarray(v_np, dtype=float),
+        jnp.asarray(phi_idx_np), M=M, mesh_type=mesh_type, phi_span=phi_span,
+    )
+
+
+def _sweep_points(framed_curve, w1, w2, u, v, phi_idx, *, M, mesh_type, phi_span=None):
+    """Map per-node ``(u, v, phi_idx)`` to ``γ + (w1/2) u p + (w2/2) v q``.
+
+    ``phi_idx`` indexes a uniform phi grid with ``M`` cells (stride 2 for
+    TET10); the grid is closed over ``[0, 1)`` or open over ``[0, phi_span]``.
+    """
+    if phi_span is None:
         K = (2 * M) if mesh_type == 'TET10' else M
         phi_grid = jnp.linspace(0.0, 1.0, K, endpoint=False)
     else:
@@ -456,10 +460,6 @@ def _rect_sweep_points(
 
     r0 = framed_curve.curve.gamma_eval(phi_grid)             # (K, 3)
     _, p, q = framed_curve.rotated_frame_eval(phi_grid)      # each (K, 3)
-
-    phi_idx = jnp.asarray(phi_idx_np)
-    u = jnp.asarray(u_np, dtype=float)
-    v = jnp.asarray(v_np, dtype=float)
 
     r0_n = r0[phi_idx]
     p_n  = p[phi_idx]
@@ -521,6 +521,248 @@ def quad_sweep_points_to_mesh(
     )
     cells = hex_corners[:, _KUHN_6].reshape(-1, 4)
     return points, cells.astype(jnp.int32)
+
+
+# ============================================================================
+# Triangulated cross-sections (adaptive, gmsh)
+# ============================================================================
+
+def corner_polygon(w1, w2, r, n):
+    r"""Rectangle outline whose corners are cut by ``n`` equal-turn edges.
+
+    Each corner is replaced by a quarter of a regular :math:`4(n+1)`-gon
+    whose edges are tangent to a circle of radius ``r``, so every corner
+    vertex has interior angle :math:`\pi - \pi / (2(n+1))` (135° for
+    ``n = 1``).  ``n = 0`` returns the sharp rectangle.
+
+    Parameters
+    ----------
+    w1, w2 : float
+        Full widths of the rectangle [m].
+    r : float
+        Radius of the circle the corner edges are tangent to [m]; each straight
+        side is cut back by :math:`r(1 - \tan(\pi / (4(n+1))))` from the corner.
+    n : int
+        Number of new edges per corner (>= 0).
+
+    Returns
+    -------
+    np.ndarray, shape (4 (n + 1), 2)
+        Vertices in counter-clockwise order, centred at the origin.
+    """
+    m = int(n) + 1
+    theta = (np.arange(m) + 0.5) * (np.pi / 2) / m
+    arc = (r / np.cos(np.pi / (4 * m))) * np.stack([np.cos(theta), np.sin(theta)], -1)
+    c = np.array([w1 / 2 - r, w2 / 2 - r])
+    pts = []
+    for sx, sy in [(1, 1), (-1, 1), (-1, -1), (1, -1)]:
+        a = arc if sx * sy > 0 else arc[::-1]
+        pts.append(np.array([sx, sy]) * (c + a))
+    return np.concatenate(pts)
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class SectionMesh:
+    """Static triangulated cross-section in normalized frame coordinates.
+
+    Attributes
+    ----------
+    uv : np.ndarray, shape (n2d, 2)
+        Node coordinates ``(2a / w1, 2b / w2)`` for offsets ``(a, b)`` [m]
+        along the cross-section frame ``(p, q)``.
+    tris : np.ndarray, shape (n_tri, 3)
+        Counter-clockwise triangle connectivity.
+    material_id : np.ndarray, shape (n_tri,)
+        ``0`` for winding pack, ``1`` for casing.
+    w1, w2 : float
+        Winding-pack bounding-box widths [m] (normalization of ``uv``).
+    w1_outer, w2_outer : float
+        Outer bounding-box widths [m] (including any casing).
+    casing_thickness : float
+        Casing thickness [m]; ``0.0`` without casing.
+    conductor_area : float
+        Total area of the winding-pack triangles [m²].
+    """
+
+    uv: np.ndarray
+    tris: np.ndarray
+    material_id: np.ndarray
+    w1: float
+    w2: float
+    w1_outer: float
+    w2_outer: float
+    casing_thickness: float
+    conductor_area: float
+
+
+def rounded_rect_section(
+    w1, w2, r, n, *, casing_thickness=None, h_min, h_max, g_meshing=0.5,
+) -> SectionMesh:
+    """Mesh a rounded rectangular winding pack (and casing) with gmsh.
+
+    The winding-pack outline is :func:`corner_polygon`.  Element size grows
+    linearly from ``h_min`` at the corner vertices to ``h_max`` with slope
+    ``g_meshing``; inside the casing it is capped at the casing thickness.
+
+    Parameters
+    ----------
+    w1, w2 : float
+        Winding-pack widths [m].
+    r : float
+        Corner radius [m], ``0 < r < min(w1, w2) / 2``.
+    n : int
+        New edges per corner (see :func:`corner_polygon`).
+    casing_thickness : float or None
+        Casing thickness [m]; ``None`` (default) meshes the winding pack only.
+    h_min, h_max : float
+        Element size at the corner vertices and far from them [m].
+    g_meshing : float
+        Size gradation ``|∇h|`` away from the corner vertices (default 0.5).
+
+    Returns
+    -------
+    SectionMesh
+    """
+    import gmsh
+
+    t = 0.0 if casing_thickness is None else float(casing_thickness)
+    w1o, w2o = w1 + 2.0 * t, w2 + 2.0 * t
+    owned = not gmsh.isInitialized()
+    if owned:
+        gmsh.initialize(interruptible=False)
+    gmsh.model.add("coil_fem_section")
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.option.setNumber("General.NumThreads", 1)
+        occ = gmsh.model.occ
+        pts = [occ.addPoint(x, y, 0.0) for x, y in corner_polygon(w1, w2, r, n)]
+        lines = [occ.addLine(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
+        wp = [(2, occ.addPlaneSurface([occ.addCurveLoop(lines)]))]
+        casing = []
+        if t > 0.0:
+            box = occ.addRectangle(-w1o / 2, -w2o / 2, 0.0, w1o, w2o)
+            _, out_map = occ.fragment([(2, box)], wp)
+            wp = list(out_map[1])
+            casing = [dt for dt in out_map[0] if dt not in wp]
+        occ.synchronize()
+
+        vertices = [
+            t_ for _d, t_ in gmsh.model.getBoundary(
+                wp, combined=True, oriented=False, recursive=True,
+            )
+        ]
+        field = gmsh.model.mesh.field
+        f_dist = field.add("Distance")
+        field.setNumbers(f_dist, "PointsList", vertices)
+        f_size = field.add("Threshold")
+        field.setNumber(f_size, "InField", f_dist)
+        field.setNumber(f_size, "SizeMin", h_min)
+        field.setNumber(f_size, "SizeMax", h_max)
+        field.setNumber(f_size, "DistMin", 0.0)
+        field.setNumber(f_size, "DistMax", max((h_max - h_min) / g_meshing, 1e-12))
+        fields = [f_size]
+        if casing:
+            f_cas = field.add("Constant")
+            field.setNumber(f_cas, "VIn", min(t, h_max))
+            field.setNumber(f_cas, "VOut", h_max)
+            field.setNumbers(f_cas, "SurfacesList", [t_ for _d, t_ in casing])
+            fields.append(f_cas)
+        f_min = field.add("Min")
+        field.setNumbers(f_min, "FieldsList", fields)
+        field.setAsBackgroundMesh(f_min)
+        for opt in ("MeshSizeFromPoints", "MeshSizeFromCurvature", "MeshSizeExtendFromBoundary"):
+            gmsh.option.setNumber(f"Mesh.{opt}", 0)
+        gmsh.option.setNumber("Mesh.Algorithm", 6)
+        gmsh.model.mesh.generate(2)
+
+        node_tags, coords, _ = gmsh.model.mesh.getNodes()
+        tris, mats = [], []
+        for mat, surfaces in ((0, wp), (1, casing)):
+            for _d, tag in surfaces:
+                types, _e, conn = gmsh.model.mesh.getElements(2, tag)
+                for typ, c in zip(types, conn):
+                    if typ != 2:
+                        raise RuntimeError(f"rounded_rect_section: unexpected element type {typ}")
+                    tri = np.asarray(c, dtype=np.int64).reshape(-1, 3)
+                    tris.append(tri)
+                    mats.append(np.full(tri.shape[0], mat, np.int32))
+    finally:
+        gmsh.model.remove()
+        if owned:
+            gmsh.finalize()
+
+    tris = np.concatenate(tris)
+    used, tris = np.unique(tris, return_inverse=True)
+    tris = tris.reshape(-1, 3).astype(np.int32)
+    node_tags = np.asarray(node_tags, dtype=np.int64)
+    row = np.empty(node_tags.max() + 1, dtype=np.int64)
+    row[node_tags] = np.arange(node_tags.shape[0])
+    xy = np.asarray(coords, dtype=np.float64).reshape(-1, 3)[row[used], :2]
+    material_id = np.concatenate(mats)
+
+    e1 = xy[tris[:, 1]] - xy[tris[:, 0]]
+    e2 = xy[tris[:, 2]] - xy[tris[:, 0]]
+    area2 = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+    flip = area2 < 0.0
+    tris[flip] = tris[flip][:, [0, 2, 1]]
+    return SectionMesh(
+        uv=xy / np.array([w1 / 2.0, w2 / 2.0]),
+        tris=tris,
+        material_id=material_id,
+        w1=float(w1), w2=float(w2),
+        w1_outer=float(w1o), w2_outer=float(w2o),
+        casing_thickness=t,
+        conductor_area=float(0.5 * np.abs(area2[material_id == 0]).sum()),
+    )
+
+
+def _section_sweep_topology(section: SectionMesh, M: int, mesh_type: str):
+    """Closed layered sweep of a triangulated section into tets.
+
+    Each prism (triangle × phi cell) splits into 3 tets.  With the triangle's
+    node ids sorted ``i < j < k``, every quad side face ``(a < b)`` gets the
+    diagonal ``a``-``b'``, so neighbouring prisms agree and the mesh is
+    conforming.  Same return contract as :func:`_rect_sweep_topology`.
+    """
+    if mesh_type not in ('TET4', 'TET10'):
+        raise ValueError(
+            f"mesh_type must be 'TET4' or 'TET10', got {mesh_type!r}"
+        )
+    M = int(M)
+    n2d = section.uv.shape[0]
+    n_tri = section.tris.shape[0]
+    stride = 2 if mesh_type == 'TET10' else 1
+
+    u_corners = np.tile(section.uv[:, 0], M)
+    v_corners = np.tile(section.uv[:, 1], M)
+    phi_corners = (stride * np.repeat(np.arange(M), n2d)).astype(np.int32)
+
+    i, j, k = np.sort(section.tris, axis=1).T.astype(np.int64)
+    m = np.repeat(np.arange(M, dtype=np.int64), n_tri)                 # (M*n_tri,)
+    i, j, k = np.tile(i, M), np.tile(j, M), np.tile(k, M)
+    lo, hi = m * n2d, ((m + 1) % M) * n2d
+    cells4 = np.stack([
+        np.stack([lo + i, lo + j, lo + k, hi + k], -1),
+        np.stack([lo + i, lo + j, hi + j, hi + k], -1),
+        np.stack([lo + i, hi + i, hi + j, hi + k], -1),
+    ], axis=1).reshape(-1, 4)                                          # (M*n_tri*3, 4)
+    is_hi = np.tile(np.array([[0, 0, 0, 1], [0, 0, 1, 1], [0, 1, 1, 1]]), (M * n_tri, 1))
+    cell_phi = stride * (np.repeat(m, 3)[:, None] + is_hi)            # unwrapped levels
+
+    # Positive volume in parametric (phi, u, v); swap two corners otherwise.
+    x = np.stack([cell_phi, u_corners[cells4], v_corners[cells4]], axis=-1)
+    vol = np.linalg.det(x[:, 1:] - x[:, :1])
+    neg = vol < 0.0
+    cells4[neg] = cells4[neg][:, [0, 2, 1, 3]]
+    cell_phi[neg] = cell_phi[neg][:, [0, 2, 1, 3]]
+
+    material_id = np.tile(np.repeat(section.material_id, 3), M).astype(np.int32)
+    if mesh_type == 'TET4':
+        return u_corners, v_corners, phi_corners, cells4.astype(np.int32), material_id
+    u, v, phi_idx, cells10 = _tet10_midsides(
+        cells4, cell_phi, u_corners, v_corners, phi_corners, M, closed=True,
+    )
+    return u, v, phi_idx, cells10, material_id
 
 
 class FramedCurveMesh(JAXFEMMesh, abc.ABC):
@@ -615,26 +857,65 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
         self.uv_quad = None
 
     @classmethod
-    def from_options(cls, framed_curve, opt, mesh_type, casing_thickness=None):
-        """Dispatch ``mesh_options`` to the matching concrete subclass.
+    def from_options(
+        cls, framed_curve, opt, mesh_type, casing_thickness=None, rounding=None,
+    ):
+        r"""Dispatch ``mesh_options`` to the matching concrete subclass.
 
         Parameters
         ----------
         framed_curve : FramedCurveJAX
         opt : dict
             A single normalised ``mesh_options`` entry (must contain ``'shape'``).
+            With ``rounding``, the optional keys ``'rounding_subdivision'``
+            (int, default 4) and ``'g_meshing'`` (float, default 0.5) apply
+            and ``'n_grid_1'`` / ``'n_grid_2'`` are rejected.
         mesh_type : str
             ``'TET4'`` or ``'TET10'``.
         casing_thickness : float or None
             Casing thickness [m] added outside a rectangular winding pack
             (default ``None``, no casing).  Raises ``NotImplementedError``
             for ``shape='disk'``.
+        rounding : tuple[float, int] or None
+            ``(r, n)`` corner rounding of a rectangular winding pack (see
+            :func:`corner_polygon`); selects :class:`FramedCurveMeshSection`.
+            The element size is ``h_max = min(aspect_ratio · Δs, min(w1, w2)/2)``
+            in the core (``Δs`` the mean arclength per curve quadpoint) and
+            ``h_min = min(s / rounding_subdivision, h_max)`` at the corner
+            vertices, with ``s = 2 r \tan(\pi / (4(n+1)))`` the corner edge
+            length.  ``None`` (default) keeps the structured mesh.
 
         Returns
         -------
-        FramedCurveMeshRectangle or FramedCurveMeshDisk
+        FramedCurveMeshRectangle, FramedCurveMeshSection or FramedCurveMeshDisk
         """
         shape = opt['shape']
+        if shape == 'rect' and rounding is not None:
+            r, n = rounding
+            w1, w2 = float(opt['w1']), float(opt['w2'])
+            if not 0.0 < r < 0.5 * min(w1, w2):
+                raise ValueError(
+                    f"r_rounding must be in (0, min(w1, w2)/2 = {0.5 * min(w1, w2)}), got {r}."
+                )
+            if opt.get('n_grid_1') is not None or opt.get('n_grid_2') is not None:
+                raise ValueError(
+                    "n_grid_1/n_grid_2 do not apply to the rounded (adaptive) mesh."
+                )
+            sub = opt.get('rounding_subdivision', 4)
+            if int(sub) != sub or sub < 1:
+                raise ValueError(f"rounding_subdivision must be an integer >= 1, got {sub}.")
+            g = float(opt.get('g_meshing', 0.5))
+            if g <= 0.0:
+                raise ValueError(f"g_meshing must be > 0, got {g}.")
+            ds = framed_curve.curve.incremental_arclength()
+            h_core = float(jnp.mean(ds)) / ds.shape[0] * opt.get('aspect_ratio', 1.0)
+            h_max = min(h_core, 0.5 * min(w1, w2))
+            s = 2.0 * r * np.tan(np.pi / (4 * (n + 1)))
+            section = rounded_rect_section(
+                w1, w2, r, n, casing_thickness=casing_thickness,
+                h_min=min(s / sub, h_max), h_max=h_max, g_meshing=g,
+            )
+            return FramedCurveMeshSection(framed_curve, section, mesh_type=mesh_type)
         if shape == 'rect':
             return FramedCurveMeshRectangle(
                 framed_curve, opt['w1'], opt['w2'],
@@ -645,9 +926,9 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
                 casing_thickness=casing_thickness,
             )
         elif shape == 'disk':
-            if casing_thickness is not None:
+            if casing_thickness is not None or rounding is not None:
                 raise NotImplementedError(
-                    "casing_thickness is only supported for shape='rect'."
+                    "casing_thickness and rounding are only supported for shape='rect'."
                 )
             return FramedCurveMeshDisk(
                 framed_curve, opt['radius'],
@@ -733,12 +1014,16 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
         self.uv_quad = self._compute_uv_quad(cells_np, sv_np)
 
     def _compute_uv_quad(self, cells_np, sv_np):
-        """Cross-section ``(u, v)`` at quadrature points; ``None`` by default.
+        """Cross-section ``(u, v)`` at quadrature points from ``u_per_node``/``v_per_node``.
 
-        Overridden by shapes (e.g. :class:`FramedCurveMeshRectangle`) that carry a
-        rectangular ``(u, v)`` parametrisation.
+        ``None`` for shapes without a ``(u, v)`` parametrisation (e.g. the disk).
         """
-        return None
+        if getattr(self, 'u_per_node', None) is None:
+            return None
+        uv_ref_local = np.stack(
+            [self.u_per_node[cells_np], self.v_per_node[cells_np]], axis=-1,
+        )                                                   # (n_cells, n_nodes, 2)
+        return jnp.asarray(np.einsum('qn, cnd -> cqd', sv_np, uv_ref_local))
 
     @property
     def meshio_cell_type(self) -> str:
@@ -944,12 +1229,63 @@ class FramedCurveMeshRectangle(FramedCurveMesh):
             n_casing=self.n_casing, tu=self.tu, tv=self.tv,
         )
 
-    def _compute_uv_quad(self, cells_np, sv_np):
-        """Cross-section ``(u, v)`` at quadrature points from stored node coords."""
-        uv_ref_local = np.stack(
-            [self.u_per_node[cells_np], self.v_per_node[cells_np]], axis=-1,
-        )                                                   # (n_cells, n_nodes, 2)
-        return jnp.asarray(np.einsum('qn, cnd -> cqd', sv_np, uv_ref_local))
+
+class FramedCurveMeshSection(FramedCurveMesh):
+    """Triangulated cross-section (:class:`SectionMesh`) swept along a framed curve.
+
+    The section is swept in uniform phi layers (one per curve quadpoint) and
+    each prism is split into 3 tets, so the in-plane mesh may be graded
+    (e.g. refined at rounded corners) while the phi spacing stays uniform.
+    Node positions use the same map as :class:`FramedCurveMeshRectangle`,
+    ``γ + (w1/2) u p + (w2/2) v q``.  ``shape`` is ``'rect'``: the
+    rectangular self-field formula and the outer bounding box are used.
+
+    Parameters
+    ----------
+    framed_curve : FramedCurveJAX
+    section : SectionMesh
+        Cross-section, e.g. from :func:`rounded_rect_section`.
+    mesh_type : str
+        ``'TET4'`` or ``'TET10'``.
+    """
+
+    shape = 'rect'
+
+    def __init__(self, framed_curve, section: SectionMesh, *, mesh_type="TET4"):
+        M = int(framed_curve.curve.quadpoints.shape[0])
+        u, v, phi_idx, cells, material_id = _section_sweep_topology(
+            section, M, mesh_type,
+        )
+        self._u = jnp.asarray(u, dtype=float)
+        self._v = jnp.asarray(v, dtype=float)
+        self._phi_idx = jnp.asarray(phi_idx)
+        pts = _sweep_points(
+            framed_curve, section.w1, section.w2, self._u, self._v, self._phi_idx,
+            M=M, mesh_type=mesh_type,
+        )
+        super().__init__(pts, cells, ele_type=mesh_type)
+
+        self.section = section
+        self.w1, self.w2 = section.w1, section.w2
+        self.w1_outer, self.w2_outer = section.w1_outer, section.w2_outer
+        self.casing_thickness = section.casing_thickness
+        self.u_per_node = np.asarray(u, dtype=np.float64)
+        self.v_per_node = np.asarray(v, dtype=np.float64)
+        self.phi_idx_per_node = np.asarray(phi_idx, dtype=np.int32)
+        self._set_metadata(
+            framed_curve,
+            cross_section_area=section.conductor_area,
+            n_cross=section.uv.shape[0],
+            phi_cell_idx=np.repeat(np.arange(M, dtype=np.int32), 3 * section.tris.shape[0]),
+            material_id=material_id,
+        )
+
+    def mesh_points_from_dofs(self, dofs_i):
+        fc = self.framed_curve.with_dofs(dofs_i)
+        return _sweep_points(
+            fc, self.w1, self.w2, self._u, self._v, self._phi_idx,
+            M=self.n_phi, mesh_type=self.ele_type,
+        )
 
 
 class FramedCurveMeshDisk(FramedCurveMesh):
