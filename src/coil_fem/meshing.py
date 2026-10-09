@@ -602,7 +602,7 @@ def rounded_rect_section(
 
     The winding-pack outline is :func:`corner_polygon`.  Element size grows
     linearly from ``h_min`` at the corner vertices to ``h_max`` with slope
-    ``g_meshing``; inside the casing it is capped at the casing thickness.
+    ``g_meshing``, in both the winding pack and the casing.
 
     Parameters
     ----------
@@ -660,16 +660,7 @@ def rounded_rect_section(
         field.setNumber(f_size, "SizeMax", h_max)
         field.setNumber(f_size, "DistMin", 0.0)
         field.setNumber(f_size, "DistMax", max((h_max - h_min) / g_meshing, 1e-12))
-        fields = [f_size]
-        if casing:
-            f_cas = field.add("Constant")
-            field.setNumber(f_cas, "VIn", min(t, h_max))
-            field.setNumber(f_cas, "VOut", h_max)
-            field.setNumbers(f_cas, "SurfacesList", [t_ for _d, t_ in casing])
-            fields.append(f_cas)
-        f_min = field.add("Min")
-        field.setNumbers(f_min, "FieldsList", fields)
-        field.setAsBackgroundMesh(f_min)
+        field.setAsBackgroundMesh(f_size)
         for opt in ("MeshSizeFromPoints", "MeshSizeFromCurvature", "MeshSizeExtendFromBoundary"):
             gmsh.option.setNumber(f"Mesh.{opt}", 0)
         gmsh.option.setNumber("Mesh.Algorithm", 6)
@@ -915,7 +906,9 @@ class FramedCurveMesh(JAXFEMMesh, abc.ABC):
                 w1, w2, r, n, casing_thickness=casing_thickness,
                 h_min=min(s / sub, h_max), h_max=h_max, g_meshing=g,
             )
-            return FramedCurveMeshSection(framed_curve, section, mesh_type=mesh_type)
+            return FramedCurveMeshSection(
+                framed_curve, section, mesh_type=mesh_type, rounding=(r, n),
+            )
         if shape == 'rect':
             return FramedCurveMeshRectangle(
                 framed_curve, opt['w1'], opt['w2'],
@@ -1247,11 +1240,16 @@ class FramedCurveMeshSection(FramedCurveMesh):
         Cross-section, e.g. from :func:`rounded_rect_section`.
     mesh_type : str
         ``'TET4'`` or ``'TET10'``.
+    rounding : tuple[float, int] or None
+        ``(r, n)`` corner polygon of the winding pack (see :func:`corner_polygon`).
+        ``None`` (default) is a sharp section outline.
     """
 
     shape = 'rect'
 
-    def __init__(self, framed_curve, section: SectionMesh, *, mesh_type="TET4"):
+    def __init__(
+        self, framed_curve, section: SectionMesh, *, mesh_type="TET4", rounding=None,
+    ):
         M = int(framed_curve.curve.quadpoints.shape[0])
         u, v, phi_idx, cells, material_id = _section_sweep_topology(
             section, M, mesh_type,
@@ -1269,6 +1267,10 @@ class FramedCurveMeshSection(FramedCurveMesh):
         self.w1, self.w2 = section.w1, section.w2
         self.w1_outer, self.w2_outer = section.w1_outer, section.w2_outer
         self.casing_thickness = section.casing_thickness
+        self.n_casing = 0 if section.casing_thickness == 0.0 else 1
+        self.rounding = (
+            None if rounding is None else (float(rounding[0]), int(rounding[1]))
+        )
         self.u_per_node = np.asarray(u, dtype=np.float64)
         self.v_per_node = np.asarray(v, dtype=np.float64)
         self.phi_idx_per_node = np.asarray(phi_idx, dtype=np.int32)
