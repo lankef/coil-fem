@@ -68,6 +68,10 @@ def test_section_areas_and_sizes():
     # Graded: corner edges are much shorter than core edges.
     edge = np.linalg.norm(np.concatenate([e1, e2]), axis=1)
     assert edge.min() < 0.6 * s and edge.max() > 2.5 * s
+    # Casing grades past its thickness, same cap as the winding pack.
+    cas = sec.material_id == 1
+    cas_edge = np.linalg.norm(np.concatenate([e1[cas], e2[cas]]), axis=1)
+    assert cas_edge.max() > 1.2 * T
 
 
 @pytest.mark.parametrize("mesh_type", ["TET4", "TET10"])
