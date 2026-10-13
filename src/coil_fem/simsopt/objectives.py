@@ -502,6 +502,23 @@ class CoilFEMObjective(Optimizable):
             plt.show()
         return ax
 
+    def export(self, prefix="full_body_fields", **kwargs) -> None:
+        """Write the hull-welded full device to STEP and/or VTU.
+
+        Each beam is trimmed by a convex hull that runs from the beam sides
+        to the coil and fused with it. The weld is cut by the coil, so the
+        support ends on the casing, and then fragmented with the coil
+        volumes. One mesh covers the whole device, with shared nodes on the
+        contact patch. A winding pack is chamfered only when this objective's
+        mesh carries ``rounding``. Thin wrapper around
+        :func:`coil_fem.io._export._export_simsopt`; see it for all keyword
+        arguments. ``n_sides_circle`` (default 12) is the number of sides of
+        the prism used for circular beams.
+        """
+        from ..io._export import _export_simsopt
+
+        _export_simsopt(self, prefix, **kwargs)
+
 
 # ============================================================================
 # Beam-surface distance
