@@ -8,6 +8,7 @@ Covers:
 * Coupling consistency: with JxW=1 fixture the beam coupling assembly is
   unchanged from the pre-JxW code path (identity-interp regression check).
 * Transpose symmetry: with ``Q = I``, ``K_cs = K_sc^T`` unconditionally.
+* Face mass: TET4 integrates ``N_i N_j`` exactly; TET10's face mass is full rank.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import math
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 jax.config.update("jax_enable_x64", True)
 
@@ -45,6 +47,7 @@ def _make_pipeline(
     w1: float = 0.02,
     w2: float = 0.02,
     n_grid: int = 1,
+    mesh_type: str = 'TET4',
 ) -> ElasticPipeline:
     """Build a minimal ElasticPipeline with a Winkler surface."""
     curve = _make_circle(N=n_phi, R=R)
@@ -53,7 +56,7 @@ def _make_pipeline(
         fc,
         {'shape': 'rect', 'w1': w1, 'w2': w2,
          'n_grid_1': n_grid, 'n_grid_2': n_grid},
-        'TET4',
+        mesh_type,
     )
     return ElasticPipeline(
         mesh, [{'E': 200e9, 'nu': 0.3}], (0.0, 0.0, 0.0),
@@ -125,7 +128,40 @@ def test_surface_jxw_autodiff():
 
 
 # ============================================================================
-# 4. Transpose symmetry: K_cs = K_sc^T when Q = I
+# 4. Face mass matrix — exact for TET4, full rank for TET10
+# ============================================================================
+
+@pytest.mark.parametrize("mesh_type", ["TET4", "TET10"])
+def test_face_quadrature_exact_mass(mesh_type):
+    """One selected face integrates N_i N_j at the element's face order.
+
+    TET4 faces are linear, so three points must reproduce the exact P1
+    triangle mass (up to the reference-face area, which cancels in
+    ``M / M.sum()``).  TET10 faces are quadratic; the 6×6 face mass is
+    rank-deficient below gauss_order=4.
+    """
+    pipeline = _make_pipeline(mesh_type=mesh_type)
+    problem = pipeline.problem
+    bi = np.asarray(problem.boundary_inds_list[0])
+    N = np.asarray(problem._sel_face_sv[0])       # (n_fq, n_face_nodes)
+    w = np.asarray(problem._face_qw[int(bi[0, 1])])  # (n_fq,)
+    M = (N.T * w) @ N
+
+    if mesh_type == "TET4":
+        assert N.shape[0] == 3, f"TET4 face has {N.shape[0]} quad points, expected 3"
+        exact = np.array([[2.0, 1.0, 1.0],
+                          [1.0, 2.0, 1.0],
+                          [1.0, 1.0, 2.0]]) / 12.0
+        assert np.allclose(M / M.sum(), exact, rtol=1e-12, atol=1e-14), (
+            f"TET4 face mass is not the exact P1 mass:\n{M / M.sum()}"
+        )
+    else:
+        rank = int(np.linalg.matrix_rank(M))
+        assert rank == 6, f"TET10 face mass rank {rank}, expected 6"
+
+
+# ============================================================================
+# 5. Transpose symmetry: K_cs = K_sc^T when Q = I
 # ============================================================================
 
 def test_coupling_transpose_symmetry():

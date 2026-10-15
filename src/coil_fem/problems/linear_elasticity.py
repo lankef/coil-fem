@@ -293,18 +293,22 @@ class LinearElasticity3D(DeviceProblem):
             [ext_flat // n_ftypes, ext_flat % n_ftypes], axis=1
         ).astype(onp.int32)
 
-        # For TET10: upgrade face quadrature to gauss_order=4 BEFORE building
-        # the surface arrays, so everything is built once at the right order.
-        # gauss_order=2 gives only 3 face quad points for TRI6 faces, which
-        # under-integrates degree-4 products of quadratic shape functions and
-        # yields a rank-deficient surface stiffness.
-        if _ele_type == 'TET10':
-            face_sv, face_sg, face_qw, face_normals, _ = \
-                _gfsv('TET10', gauss_order=4)
-            fe.face_shape_vals    = face_sv
+        # Upgrade face quadrature BEFORE building the surface arrays, so
+        # everything is built once at the right order.  The rule must integrate
+        # k N_i N_j exactly (degree 2 for TET4, 4 for TET10).  jax-fem's
+        # defaults (0 and 2) are too low: TET4 gets one centroid point, and
+        # TET10's 3-point rule under-integrates the degree-4 products of
+        # quadratic shape functions, leaving the surface stiffness
+        # rank-deficient.  basix's order-3 triangle rule is still rank-deficient
+        # for TRI6, so TET10 needs 4.
+        _face_order = {'TET4': 2, 'TET10': 4}.get(_ele_type)
+        if _face_order is not None:
+            face_sv, face_sg, face_qw, _, _ = \
+                _gfsv(_ele_type, gauss_order=_face_order)
+            fe.face_shape_vals      = face_sv
             fe.face_shape_grads_ref = face_sg
-            fe.face_quad_weights  = face_qw
-            fe.num_face_quads     = face_qw.shape[1]
+            fe.face_quad_weights    = face_qw
+            fe.num_face_quads       = face_qw.shape[1]
 
         # Build all six boundary structures, mirroring Problem.__init__:132-157.
         s_shape_grads, n_scale, s_shape_vals = [], [], []
