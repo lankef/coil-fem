@@ -66,7 +66,8 @@ src/coil_fem/                  # main package (Hatchling src-layout)
     cross_section_fns.py       # solid/hollow circle & rectangle section factories
   io/                          # I/O helpers
     __init__.py                # namespace only; no re-exports
-    _export.py                 # hull-welded STEP and conforming TET10 export (CoilFEMObjective.export)
+    _export.py                 # parallel per-beam weld+trim stage, welds fused into coil_big per coil image; STEP / conforming TET10 VTU export (CoilFEMObjective.export)
+    _export_hull_v1.py         # mothballed hull/toe exporter, kept for reference only
   geo/                         # Curve geometry and symmetry subpackage
     __init__.py                # re-exports CurveXYZFourierJAX, framed curves, symmetry helpers
     curve_jax.py               # CurveXYZFourierJAX — JAX pytree, simsopt interop

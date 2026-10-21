@@ -503,17 +503,18 @@ class CoilFEMObjective(Optimizable):
         return ax
 
     def export(self, prefix="full_body_fields", **kwargs) -> None:
-        """Write the hull-welded full device to STEP and/or VTU.
+        """Write the welded full device to STEP and/or a conforming TET10 VTU.
 
-        Each beam is trimmed by a convex hull that runs from the beam sides
-        to the coil and fused with it. The weld is cut by the coil, so the
-        support ends on the casing, and then fragmented with the coil
-        volumes. One mesh covers the whole device, with shared nodes on the
-        contact patch. A winding pack is chamfered only when this objective's
-        mesh carries ``rounding``. Thin wrapper around
-        :func:`coil_fem.io._export._export_simsopt`; see it for all keyword
-        arguments. ``n_sides_circle`` (default 12) is the number of sides of
-        the prism used for circular beams.
+        Each beam end is joined to its coil by a convex weld of casing
+        material that reaches into both the beam and the coil. The material
+        boundary lies between the weld and the beam. ``save_step=True`` writes
+        ``<prefix>_raw.step`` (winding packs, full-coil ``coil_big`` solids and
+        untrimmed beams) and ``<prefix>_premerge.step`` (the same plus the
+        welds), all as separate bodies. ``save_vtk=True`` fuses the welds into
+        each coil, trims the beams, meshes everything in one pass so interfaces
+        share nodes, optimizes the mesh and writes ``<prefix>.vtu``. Every
+        coil needs a casing. Thin wrapper around
+        :func:`coil_fem.io._export._export_simsopt`.
         """
         from ..io._export import _export_simsopt
 
@@ -559,8 +560,14 @@ def _beam_surface_distance_pure(x_start, x_end, L, gammas, ns, minimum_distance)
     r"""Hinge penalty on beam-chord-to-surface distance.
 
     .. math::
-        J = \left\langle L_b \, \|\mathbf{n}_s\| \,
-            \max(0, d_\min - d_{bs})^2 \right\rangle_{b, s}
+        J = \frac{1}{N} \sum_{b = 1}^{N} L_b \int_{surface}
+            \max(0, d_{\min} - \min_{t \in [0, 1]}
+            \| \mathbf{x}_b(t) - \mathbf{s} \|_2)^2 ~ds
+
+    where :math:`\mathbf{x}_b(t) = \mathbf{x}_b^{\text{start}} + t\,
+    (\mathbf{x}_b^{\text{end}} - \mathbf{x}_b^{\text{start}})` is the chord of
+    beam :math:`b` and :math:`L_b` is its total length. The surface integral
+    is the mean over the quadrature points weighted by :math:`\|\mathbf{n}_s\|`.
 
     Parameters
     ----------
@@ -569,7 +576,7 @@ def _beam_surface_distance_pure(x_start, x_end, L, gammas, ns, minimum_distance)
     x_end : jax.Array, shape (N, 3)
         Beam endpoints at node 2.
     L : jax.Array, shape (N,)
-        Beam chord lengths; the arclength element of a chord on ``[0, 1]``.
+        Total chord length of each beam.
     gammas : jax.Array, shape (M, 3)
         Surface quadrature points.
     ns : jax.Array, shape (M, 3)
@@ -590,18 +597,35 @@ def _beam_surface_distance_pure(x_start, x_end, L, gammas, ns, minimum_distance)
 class BeamSurfaceDistance(Optimizable):
     r"""Penalise support beams that come closer than ``minimum_distance`` to a surface.
 
-    The beam analogue of :class:`simsopt.geo.CurveSurfaceDistance`: the same
-    hinge form and scaling, so the two terms share a weight scale.  Support
-    beams are straight chords rather than sampled curves, so distances use the
-    exact point-to-segment formula instead of a quadrature over beam points.
-    All coil-coil and coil-foundation beams contribute.
+    The beam analogue of :class:`simsopt.geo.CurveSurfaceDistance`. Support
+    beams are straight chords, so instead of sampling points along each beam,
+    the distance from every surface point to the nearest point on the chord is
+    computed exactly. All coil-coil and coil-foundation beams contribute.
 
     .. math::
-        J = \left\langle L_b \, \|\mathbf{n}_s\| \,
-            \max(0, d_\min - d_{bs})^2 \right\rangle_{b, s}
+        J = \frac{1}{N_b} \sum_{b = 1}^{N_b} d_{b}
 
-    where :math:`d_{bs}` is the distance from surface point :math:`s` to beam
-    chord :math:`b` and :math:`L_b` is the chord length.
+    where
+
+    .. math::
+        d_{b} = L_b \int_{surface} \max(0, d_{\min} - \min_{t \in [0, 1]}
+                \| \mathbf{x}_b(t) - \mathbf{s} \|_2)^2 ~ds
+
+    :math:`\mathbf{x}_b(t) = \mathbf{x}_b^{\text{start}} + t\,
+    (\mathbf{x}_b^{\text{end}} - \mathbf{x}_b^{\text{start}})` is the
+    centreline chord of beam :math:`b`, :math:`L_b = \|\mathbf{x}_b^{\text{end}}
+    - \mathbf{x}_b^{\text{start}}\|_2` is its total length, and
+    :math:`\mathbf{s}` is a point on the surface. The closest point on the
+    chord may be either endpoint. :math:`d_\min` is the desired minimum
+    beam-to-surface clearance. The penalty is zero when every beam lies more
+    than :math:`d_\min` from the surface.
+
+    Because the hinge uses the closest point on the chord and is weighted by
+    the full length :math:`L_b`, :math:`d_b` is an upper bound on the line
+    integral :math:`\int_{\text{beam}_b} \int_{surface} \max(0, d_\min -
+    \|\mathbf{x}_b - \mathbf{s}\|_2)^2 ~dl ~ds`. Unlike
+    :class:`~simsopt.geo.CurveSurfaceDistance`, the beam terms are averaged,
+    not summed, over the :math:`N_b` beams.
 
     Parameters
     ----------
