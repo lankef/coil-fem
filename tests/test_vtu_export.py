@@ -8,6 +8,7 @@ exported VTU files.
 from __future__ import annotations
 
 import meshio
+import pytest
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -71,9 +72,31 @@ def test_to_vtu_no_run_writes_support_only(tmp_path):
     assert 'von_mises_MPa' not in mesh.cell_data
 
 
-# ============================================================================
-# to_vtu beam-displacement file (SupportBeams only)
-# ============================================================================
+def test_to_vtu_phi_range(tmp_path):
+    """phi_range keeps cells by slice centre and drops unused nodes."""
+    fem = _make_coilfem()
+    coil = fem.meshes[0]
+    phi_c = (np.asarray(coil.phi_cell_idx) + 0.5) / coil.n_phi
+    lo, hi = 0.25, 0.5
+    n_keep = int(np.sum((phi_c >= lo) & (phi_c <= hi)))
+    assert 0 < n_keep < coil.cells.shape[0]
+
+    written = fem.to_vtu(str(tmp_path), run=False, phi_range=(lo, hi))
+    grid = meshio.read(written[0])
+    cells = grid.cells[0].data
+    assert cells.shape[0] == n_keep
+    assert set(cells.ravel()) == set(range(grid.points.shape[0]))
+    for key in ('w_clamp', 'w_attach', 'k_clamp_Npm3', 'k_attach_Npm3'):
+        assert len(grid.point_data[key]) == grid.points.shape[0]
+    assert len(grid.cell_data['owner_coil'][0]) == n_keep
+    assert len(grid.cell_data['material_id'][0]) == n_keep
+
+    full = fem.to_vtu(str(tmp_path / "full"), run=False)
+    assert meshio.read(full[0]).cells[0].data.shape[0] == coil.cells.shape[0]
+
+    for bad in ((0.5, 0.5), (-0.1, 0.5), (0.2, 1.1)):
+        with pytest.raises(ValueError):
+            fem.to_vtu(str(tmp_path), run=False, phi_range=bad)
 
 def _section_fn(sdofs):
     """Constant cross-section, matching the contract of SupportBeams.coo."""

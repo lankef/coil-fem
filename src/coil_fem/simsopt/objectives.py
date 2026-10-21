@@ -67,7 +67,8 @@ class CoilFEMObjective(Optimizable):
         Mesh construction options forwarded to :class:`~coil_fem.CoilFEM`.
     winding_pack_options : dict
         Winding-pack material properties (``'E'``, ``'nu'``, ``'density'``,
-        ``'itc'``).  Required; ``None`` raises.
+        ``'itc'``), plus optional ``'r_rounding'`` / ``'n_rounding'`` corner
+        rounding (see :class:`~coil_fem.CoilFEM`).  Required; ``None`` raises.
     casing_options : dict or None
         Casing material properties, same keys plus ``'thickness'`` [m].
         ``None`` means no casing.
@@ -500,6 +501,23 @@ class CoilFEMObjective(Optimizable):
             import matplotlib.pyplot as plt
             plt.show()
         return ax
+
+    def export(self, prefix="full_body_fields", **kwargs) -> None:
+        """Write the hull-welded full device to STEP and/or VTU.
+
+        Each beam is trimmed by a convex hull that runs from the beam sides
+        to the coil and fused with it. The weld is cut by the coil, so the
+        support ends on the casing, and then fragmented with the coil
+        volumes. One mesh covers the whole device, with shared nodes on the
+        contact patch. A winding pack is chamfered only when this objective's
+        mesh carries ``rounding``. Thin wrapper around
+        :func:`coil_fem.io._export._export_simsopt`; see it for all keyword
+        arguments. ``n_sides_circle`` (default 12) is the number of sides of
+        the prism used for circular beams.
+        """
+        from ..io._export import _export_simsopt
+
+        _export_simsopt(self, prefix, **kwargs)
 
 
 # ============================================================================
