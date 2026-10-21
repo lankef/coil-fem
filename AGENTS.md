@@ -54,7 +54,7 @@ src/coil_fem/                  # main package (Hatchling src-layout)
   coil_fem.py                  # CoilFEM — differentiable FEM pipeline container
   magnetic.py                  # B-field helpers (biot_savart, B_self_quadrature) + lorentz_body_force
   metrics.py                   # Von Mises / strain metrics on FEM solutions
-  meshing.py                   # Fixed-topology hex/tet meshing (rectangle/disk sweep, curved-sided TET10)
+  meshing.py                   # Fixed-topology tet meshing (rectangle/disk/gmsh-section sweep, curved-sided TET10)
   pipelines.py                 # ElasticPipeline / ThermoElasticPipeline — per-coil FEM state
   problems/                    # FEM Problem subpackage
     __init__.py                # re-exports LinearElasticity3D, DeviceProblem (+ elasticity helpers)
@@ -64,9 +64,9 @@ src/coil_fem/                  # main package (Hatchling src-layout)
   presets/                     # Named material / cross-section factory helpers
     __init__.py
     cross_section_fns.py       # solid/hollow circle & rectangle section factories
-  io/                          # I/O helpers (import coil_fem.io.gmsh, not coil_fem.io)
+  io/                          # I/O helpers
     __init__.py                # namespace only; no re-exports
-    gmsh.py                    # to_full_body — OCC + fTetWild full-body VTU export
+    _export.py                 # hull-welded STEP and conforming TET10 export (CoilFEMObjective.export)
   geo/                         # Curve geometry and symmetry subpackage
     __init__.py                # re-exports CurveXYZFourierJAX, framed curves, symmetry helpers
     curve_jax.py               # CurveXYZFourierJAX — JAX pytree, simsopt interop
