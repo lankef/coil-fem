@@ -5,7 +5,11 @@
 :class:`~coil_fem.simsopt.CoilSupport`.  The remaining classes are geometric
 penalties on support beams, fixed clamps and the central support ring
 (clearance to coils, surfaces and other beams; attachment angle; CSR volume;
+<<<<<<< HEAD
 inboard placement), including LSE soft-min clearances.
+=======
+inboard placement).
+>>>>>>> fffcbb55efa6620ce0daa9bda8caab8f2e40bdc7
 """
 
 from __future__ import annotations
@@ -30,13 +34,19 @@ try:
     from simsopt._core.optimizable import Optimizable
     from simsopt._core.derivative import derivative_dec, Derivative
     from simsopt.geo.curveobjectives import cc_distance_pure
+<<<<<<< HEAD
     from .objectives_geo import max_lse
+=======
+>>>>>>> fffcbb55efa6620ce0daa9bda8caab8f2e40bdc7
     _HAS_SIMSOPT = True
 except ImportError:  # pragma: no cover
     Optimizable = object           # type: ignore[misc, assignment]
     _HAS_SIMSOPT = False
     cc_distance_pure = None        # type: ignore[misc, assignment]
+<<<<<<< HEAD
     max_lse = None                 # type: ignore[misc, assignment]
+=======
+>>>>>>> fffcbb55efa6620ce0daa9bda8caab8f2e40bdc7
 
     def derivative_dec(fn):        # type: ignore[misc]
         return fn
@@ -787,6 +797,7 @@ class BeamSurfaceDistance(Optimizable):
         return float(jnp.min(_segment_point_dists(x_start, x_end, gammas)))
 
 
+<<<<<<< HEAD
 class BeamSurfaceDistanceLSE(BeamSurfaceDistance):
     r"""Soft-minimum distance from support-beam chords to a surface.
 
@@ -837,6 +848,8 @@ class BeamSurfaceDistanceLSE(BeamSurfaceDistance):
         return -max_lse(-dists, self.epsilon)
 
 
+=======
+>>>>>>> fffcbb55efa6620ce0daa9bda8caab8f2e40bdc7
 # ============================================================================
 # Beam-curve distance
 # ============================================================================
@@ -1513,6 +1526,7 @@ class BeamBeamDistance(Optimizable):
         return float(jnp.min(jnp.minimum(d_ab, d_ba)))
 
 
+<<<<<<< HEAD
 class BeamBeamDistanceLSE(BeamBeamDistance):
     r"""Soft-minimum distance between sampled points on support beams.
 
@@ -1572,6 +1586,8 @@ class BeamBeamDistanceLSE(BeamBeamDistance):
         return -max_lse(-dists, self.epsilon)
 
 
+=======
+>>>>>>> fffcbb55efa6620ce0daa9bda8caab8f2e40bdc7
 def _beam_curve_angle_hinge(abs_dot, cos_min, mask):
     """Sum of ``max(|n·t| - cos θ_min, 0)^2`` over masked beam endpoints."""
     hinge = jnp.maximum(abs_dot - cos_min, 0.0) ** 2
