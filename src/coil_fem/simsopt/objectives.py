@@ -5,7 +5,7 @@
 :class:`~coil_fem.simsopt.CoilSupport`.  The remaining classes are geometric
 penalties on support beams, fixed clamps and the central support ring
 (clearance to coils, surfaces and other beams; attachment angle; CSR volume;
-inboard placement).
+inboard placement), including LSE soft-min clearances.
 """
 
 from __future__ import annotations
@@ -30,11 +30,13 @@ try:
     from simsopt._core.optimizable import Optimizable
     from simsopt._core.derivative import derivative_dec, Derivative
     from simsopt.geo.curveobjectives import cc_distance_pure
+    from .objectives_geo import max_lse
     _HAS_SIMSOPT = True
 except ImportError:  # pragma: no cover
     Optimizable = object           # type: ignore[misc, assignment]
     _HAS_SIMSOPT = False
     cc_distance_pure = None        # type: ignore[misc, assignment]
+    max_lse = None                 # type: ignore[misc, assignment]
 
     def derivative_dec(fn):        # type: ignore[misc]
         return fn
@@ -785,6 +787,56 @@ class BeamSurfaceDistance(Optimizable):
         return float(jnp.min(_segment_point_dists(x_start, x_end, gammas)))
 
 
+class BeamSurfaceDistanceLSE(BeamSurfaceDistance):
+    r"""Soft-minimum distance from support-beam chords to a surface.
+
+    Same beams and same exact chord-to-point distances as
+    :class:`BeamSurfaceDistance`: every surface quadrature point against the
+    full centreline of every coil-coil and coil-foundation beam. No length or
+    area weight and no threshold. With :math:`d` those distances and
+    :math:`t = \max(1, \log n) / \epsilon`,
+
+    .. math::
+
+        J = -\frac{1}{t}\operatorname{LSE}(-t\, d),
+
+    so :math:`\min d - \epsilon \le J \le \min d`.
+
+    Parameters
+    ----------
+    coil_support_beams : CoilSupportBeams
+        Provides the base curves, the beam DOFs, and the underlying
+        :class:`~coil_fem.coupling.SupportBeams` model.
+    surface : simsopt.geo.Surface
+        Target surface. Not a DOF parent, so it contributes no gradient.
+    epsilon : float
+        Error bound of the soft minimum [m]. Must be positive.
+
+    Notes
+    -----
+    The inherited ``minimum_distance`` attribute is unused; it is set to 0
+    because the parent constructor requires one.
+    """
+
+    def __init__(self, coil_support_beams, surface, epsilon: float):
+        epsilon = float(epsilon)
+        if not math.isfinite(epsilon) or epsilon <= 0.0:
+            raise ValueError(f"epsilon must be > 0; got {epsilon}.")
+        self.epsilon = epsilon
+        super().__init__(coil_support_beams, surface, minimum_distance=0.0)
+
+    def _J_pure(self, cdofs, sdofs, gammas, ns):
+        """Soft-min of exact chord-to-surface distances (traced scalar).
+
+        ``ns`` is accepted so the signature matches
+        :meth:`BeamSurfaceDistance._J_pure`; the area element does not enter.
+        """
+        x_start, x_end, _ = self._beam_chords(cdofs, sdofs)
+        dists = _segment_point_dists(x_start, x_end, gammas)
+        # min(d) - epsilon <= -max_lse(-d) <= min(d)
+        return -max_lse(-dists, self.epsilon)
+
+
 # ============================================================================
 # Beam-curve distance
 # ============================================================================
@@ -1459,6 +1511,65 @@ class BeamBeamDistance(Optimizable):
         d_ab = jax.vmap(_one_way)(x_s[self._ia], x_e[self._ia], pts[self._ib])
         d_ba = jax.vmap(_one_way)(x_s[self._ib], x_e[self._ib], pts[self._ia])
         return float(jnp.min(jnp.minimum(d_ab, d_ba)))
+
+
+class BeamBeamDistanceLSE(BeamBeamDistance):
+    r"""Soft-minimum distance between sampled points on support beams.
+
+    Same chords, same midpoint samples (:meth:`BeamBeamDistance`'s ``n_quad``)
+    and the same pairs (CC upper triangle within each group, and each CS
+    master against its later symmetry images). No arclength weight and no
+    threshold. With :math:`d` the sample-to-sample distances and
+    :math:`t = \max(1, \log n) / \epsilon`,
+
+    .. math::
+
+        J = -\frac{1}{t}\operatorname{LSE}(-t\, d),
+
+    so :math:`\min d - \epsilon \le J \le \min d`. No pairs gives
+    :math:`J = +\infty`.
+
+    Parameters
+    ----------
+    coil_support_beams : CoilSupportBeams
+        Provides the base curves, the beam DOFs, and the underlying
+        :class:`~coil_fem.coupling.SupportBeams` model. CSR supports and
+        coil-foundation beams are rejected, as by :class:`BeamBeamDistance`.
+    epsilon : float
+        Error bound of the soft minimum [m]. Must be positive.
+    n_quad : int
+        Midpoint samples along each chord (default 32).
+
+    Notes
+    -----
+    The inherited ``minimum_distance`` attribute is unused; it is set to 0
+    because the parent constructor requires one.
+    """
+
+    def __init__(self, coil_support_beams, epsilon: float, n_quad: int = 32):
+        epsilon = float(epsilon)
+        if not math.isfinite(epsilon) or epsilon <= 0.0:
+            raise ValueError(f"epsilon must be > 0; got {epsilon}.")
+        self.epsilon = epsilon
+        super().__init__(
+            coil_support_beams, minimum_distance=0.0, n_quad=n_quad,
+        )
+
+    def _J_pure(self, cdofs, sdofs):
+        """Soft-min of sample-to-sample distances over the paired beams."""
+        if self._ia.size == 0:
+            return jnp.asarray(jnp.inf)
+        geom = self._support.beam_geometry(self._curves_jax(cdofs), sdofs)
+        x_s, x_e = _pooled_endpoints(geom, self._support)
+        pts, _ = _chord_quadrature(x_s, x_e, self.n_quad)
+        # ponytail: all sample pairs, O(n_pairs * n_quad^2), same cost as the
+        # hinge kernel. No threshold to prune with.
+        dists = jnp.linalg.norm(
+            pts[self._ia][:, :, None, :] - pts[self._ib][:, None, :, :],
+            axis=-1,
+        )
+        # min(d) - epsilon <= -max_lse(-d) <= min(d)
+        return -max_lse(-dists, self.epsilon)
 
 
 def _beam_curve_angle_hinge(abs_dot, cos_min, mask):
