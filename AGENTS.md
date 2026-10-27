@@ -83,8 +83,8 @@ src/coil_fem/                  # main package (Hatchling src-layout)
     __init__.py                # re-exports CoilFEMObjective, CoilSupport*, CSR* objectives
     objectives.py              # CoilFEMObjective + beam/CSR geometric constraints
     objectives_geo.py          # LSE soft-min curve-curve and curve-surface clearance
-    coil_support.py            # CoilSupport base + k_clamp helpers
     sorted_dphis.py            # Incremental dphis* ↔ phis* codecs for Sorted classes
+    coil_support.py            # CoilSupport base + k_clamp helpers
     coil_support_fixed.py      # CoilSupportFixed, TopBottom, FixedSorted
     coil_support_beams.py      # CoilSupportBeams, CoilSupportBeamsSorted
     coil_support_beams_csr.py  # CoilSupportBeamsCSR, CoilSupportBeamsCSRSorted
