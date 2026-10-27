@@ -1,14 +1,16 @@
 """Simsopt Optimizable wrappers for coil-fem supports and objectives.
 
 Re-exports :class:`CoilSupport` and its Fixed / Beams / CSR subclasses
-(including Sorted variants), plus :class:`CoilFEMObjective` and the
-beam / CSR geometric constraints.
+(including Sorted variants), plus :class:`CoilFEMObjective`, the
+beam / CSR geometric constraints, and the LSE soft-min clearances.
 """
 
 from .objectives import (
     BeamSurfaceDistance,
+    BeamSurfaceDistanceLSE,
     BeamCurveDistance,
     BeamBeamDistance,
+    BeamBeamDistanceLSE,
     BeamCurveAngle,
     ClampInboard,
     CoilFEMObjective,
@@ -17,6 +19,7 @@ from .objectives import (
     CSRCurveDistance,
     CSRSurfaceDistance,
 )
+from .objectives_geo import CurveCurveDistanceLSE, CurveSurfaceDistanceLSE
 from .coil_support import CoilSupport
 from .coil_support_fixed import (
     CoilSupportFixed,
@@ -29,9 +32,13 @@ from .utils import constraint_from_optimizable
 
 __all__ = [
     "BeamSurfaceDistance",
+    "BeamSurfaceDistanceLSE",
     "BeamCurveDistance",
     "BeamBeamDistance",
+    "BeamBeamDistanceLSE",
     "BeamCurveAngle",
+    "CurveCurveDistanceLSE",
+    "CurveSurfaceDistanceLSE",
     "ClampInboard",
     "CoilFEMObjective",
     "CRBeamInboard",
