@@ -15,11 +15,12 @@ from simsopt.field import Coil, Current                       # noqa: E402
 from simsopt.geo import SurfaceRZFourier, create_equally_spaced_curves  # noqa: E402
 
 from coil_fem.simsopt import (                                # noqa: E402
-    BeamBeamDistanceLSE,
-    BeamSurfaceDistanceLSE,
+    BeamBeamDistanceMinLSE,
+    BeamSurfaceDistanceMinLSE,
     CoilSupportBeams,
-    CurveCurveDistanceLSE,
-    CurveSurfaceDistanceLSE,
+    CurveCurveDistanceMinLSE,
+    CurveCurvatureMaxSqLSE,
+    CurveSurfaceDistanceMinLSE,
 )
 
 EPS = 1e-2
@@ -106,18 +107,20 @@ def test_rejects_nonpositive_epsilon():
     surf = _surface()
     cs = _support()
     with pytest.raises(ValueError, match="epsilon"):
-        CurveCurveDistanceLSE(curves, 0.0)
+        CurveCurveDistanceMinLSE(curves, 0.0)
     with pytest.raises(ValueError, match="epsilon"):
-        CurveSurfaceDistanceLSE(curves, surf, -0.1)
+        CurveCurvatureMaxSqLSE(curves, 0.0)
     with pytest.raises(ValueError, match="epsilon"):
-        BeamSurfaceDistanceLSE(cs, surf, 0.0)
+        CurveSurfaceDistanceMinLSE(curves, surf, -0.1)
     with pytest.raises(ValueError, match="epsilon"):
-        BeamBeamDistanceLSE(cs, -1.0)
+        BeamSurfaceDistanceMinLSE(cs, surf, 0.0)
+    with pytest.raises(ValueError, match="epsilon"):
+        BeamBeamDistanceMinLSE(cs, -1.0)
 
 
 def test_curve_curve_bound_and_dJ():
     curves = _curves()
-    obj = CurveCurveDistanceLSE(curves, EPS, downsample=2)
+    obj = CurveCurveDistanceMinLSE(curves, EPS, downsample=2)
     sampled = [c.gamma()[::2] for c in curves]
     true_min = min(cdist(sampled[i], sampled[j]).min() for i, j in obj.pairs)
     _assert_softmin(float(obj.J()), true_min, EPS)
@@ -127,7 +130,7 @@ def test_curve_curve_bound_and_dJ():
 def test_curve_surface_bound_and_dJ():
     curves = _curves()
     surf = _surface()
-    obj = CurveSurfaceDistanceLSE(curves, surf, EPS)
+    obj = CurveSurfaceDistanceMinLSE(curves, surf, EPS)
     surf_pts = surf.gamma().reshape((-1, 3))
     true_min = min(cdist(c.gamma(), surf_pts).min() for c in curves)
     _assert_softmin(float(obj.J()), true_min, EPS)
@@ -137,13 +140,13 @@ def test_curve_surface_bound_and_dJ():
 def test_beam_surface_bound_and_dJ():
     cs = _support()
     surf = _surface()
-    obj = BeamSurfaceDistanceLSE(cs, surf, EPS)
+    obj = BeamSurfaceDistanceMinLSE(cs, surf, EPS)
     _assert_softmin(obj.J(), obj.shortest_distance(), EPS)
     _assert_fd(obj)
 
 
 def test_beam_beam_bound_and_dJ():
-    obj = BeamBeamDistanceLSE(_support(), EPS, n_quad=8)
+    obj = BeamBeamDistanceMinLSE(_support(), EPS, n_quad=8)
     cdofs, sdofs = obj._read_dofs()
     geom = obj._support.beam_geometry(obj._curves_jax(cdofs), sdofs)
     x_s, x_e = _pooled_endpoints(geom, obj._support)
@@ -155,3 +158,28 @@ def test_beam_beam_bound_and_dJ():
     true_min = min(cdist(pts[i], pts[j]).min() for i, j in zip(ia, ib))
     _assert_softmin(obj.J(), true_min, EPS)
     _assert_fd(obj)
+
+
+def test_curvature_max_sq_bound_and_dJ():
+    curves = _curves()
+    obj = CurveCurvatureMaxSqLSE(curves, EPS)
+    true_max = max(float(np.max(np.asarray(c.kappa()) ** 2)) for c in curves)
+    J = float(obj.J())
+    assert true_max - 1e-8 <= J <= true_max + EPS + 1e-8
+
+    # Curvature squared is more nonlinear than the distance objectives, so the
+    # shared 1e-4 step sits outside the linear range.
+    x0 = np.array(obj.x)
+    dx = np.random.default_rng(0).standard_normal(x0.size)
+    dJdx = float(np.asarray(obj.dJ()) @ dx)
+    errs = []
+    for step in (1e-5, 1e-6, 1e-7):
+        obj.x = x0 + step * dx
+        Jp = float(obj.J())
+        obj.x = x0 - step * dx
+        Jm = float(obj.J())
+        errs.append(abs((Jp - Jm) / (2 * step) - dJdx))
+    obj.x = x0
+    assert errs[0] > 0.0
+    for coarse, fine in zip(errs[:-1], errs[1:]):
+        assert fine < coarse * 0.05 or fine < 1e-9 * abs(dJdx)

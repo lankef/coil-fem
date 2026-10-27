@@ -1,7 +1,8 @@
-"""Soft-minimum curve clearance objectives for simsopt.
+"""LSE curve objectives for simsopt.
 
-:class:`CurveCurveDistanceLSE` and :class:`CurveSurfaceDistanceLSE` estimate
-the smallest sampled distance with a log-sum-exp whose error is at most a
+:class:`CurveCurveDistanceMinLSE` and :class:`CurveSurfaceDistanceMinLSE`
+estimate the smallest sampled distance, and :class:`CurveCurvatureMaxSqLSE`
+estimates the largest sampled curvature squared. Each error is at most a
 given ``epsilon``. They depend only on simsopt and JAX.
 """
 
@@ -53,7 +54,7 @@ def max_lse(x, epsilon):
     return epsilon_norm * logsumexp(x / epsilon_norm)
 
 
-class CurveCurveDistanceLSE(Optimizable):
+class CurveCurveDistanceMinLSE(Optimizable):
     r"""Soft-minimum distance between sampled points on a set of curves.
 
     Samples are ``curve.gamma()[::downsample]``, and the pairs are the same
@@ -144,7 +145,7 @@ class CurveCurveDistanceLSE(Optimizable):
     return_fn_map = {'J': J, 'dJ': dJ}
 
 
-class CurveSurfaceDistanceLSE(Optimizable):
+class CurveSurfaceDistanceMinLSE(Optimizable):
     r"""Soft-minimum distance between sampled curve points and a surface.
 
     Curve samples are ``curve.gamma()`` and surface samples are
@@ -216,6 +217,74 @@ class CurveSurfaceDistanceLSE(Optimizable):
         )
         return sum(
             curve.dgamma_by_dcoeff_vjp(np.asarray(g))
+            for curve, g in zip(self.curves, grads)
+        )
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+
+class CurveCurvatureMaxSqLSE(Optimizable):
+    r"""Soft-maximum of curvature squared over a set of curves.
+
+    Samples are ``curve.kappa()`` at each curve's quadrature points, the same
+    points :class:`~simsopt.geo.LpCurveCurvature` uses. There is no arclength
+    weight and no threshold. With :math:`\kappa^2` those samples over every
+    curve and :math:`t = \max(1, \log n) / \epsilon`,
+
+    .. math::
+
+        J = \frac{1}{t}\operatorname{LSE}(t\, \kappa^2),
+
+    so
+
+    .. math::
+
+        \max \kappa^2 \le J \le \max \kappa^2 + \epsilon.
+
+    ``J`` never underestimates the maximum, so a constraint ``J <= \kappa_0^2``
+    keeps every sample at or below curvature :math:`\kappa_0`.
+
+    Parameters
+    ----------
+    curves : sequence of simsopt.geo.Curve
+        Curves in the coil set. DOF parents of this objective.
+    epsilon : float
+        Error bound on :math:`\kappa^2` [1/m²]. Must be positive.
+    """
+
+    def __init__(self, curves, epsilon):
+        epsilon = float(epsilon)
+        if not math.isfinite(epsilon) or epsilon <= 0.0:
+            raise ValueError(f"epsilon must be > 0; got {epsilon}.")
+        self.curves = curves
+        self.epsilon = epsilon
+        self.J_jax = jit(self._J_pure)
+        self.dJ_dkappas = jit(grad(self._J_pure))
+        super().__init__(depends_on=curves)
+
+    def _J_pure(self, kappas):
+        """Soft-max of curvature squared at every quadrature point."""
+        sq = jnp.concatenate([kappa ** 2 for kappa in kappas])
+        # max(κ^2) <= max_lse(κ^2) <= max(κ^2) + epsilon
+        return max_lse(sq, self.epsilon)
+
+    def J(self):
+        """Soft-maximum of curvature squared [1/m²]."""
+        return self.J_jax([c.kappa() for c in self.curves])
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of :meth:`J` with respect to the curve DOFs.
+
+        ``kappa`` already chains through the tangent and its derivative, so
+        the only vector-Jacobian product is
+        :meth:`~simsopt.geo.Curve.dkappa_by_dcoeff_vjp`.
+        ``@derivative_dec`` contracts the result to a flat array aligned
+        with ``self.x``.
+        """
+        grads = self.dJ_dkappas([c.kappa() for c in self.curves])
+        return sum(
+            curve.dkappa_by_dcoeff_vjp(np.asarray(g))
             for curve, g in zip(self.curves, grads)
         )
 
