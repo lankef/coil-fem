@@ -81,7 +81,7 @@ def _gmsh_done(owned):
 def test_no_file_exported_warns():
     """Both output flags off returns before any geometry work."""
     with pytest.warns(UserWarning, match="No file exported"):
-        assert _export_simsopt(None, save_step=False, save_vtk=False) is None
+        assert _export_simsopt(None, save_step=False, save_vtu=False) is None
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)
         with pytest.raises(ValueError, match="CoilFEMObjective"):
@@ -162,6 +162,53 @@ def test_beam_loops_halfspace(dofs):
         _beam_loops(sdf, joint, 1.0, delta, 10.0, h=0.01)
 
 
+@pytest.mark.parametrize("shrink, n_corners2", [(0.005, 8), (0.0125, 4)])
+def test_beam_loops_rounded_rect(shrink, n_corners2):
+    """A chamfered beam's rings follow the chamfer; ring 2 drops chamfers inset past their length."""
+    from coil_fem.meshing import corner_polygon
+
+    sec = _section({"w1_beam": 0.05, "w2_beam": 0.1}, 7, rounding=(0.01, 1))
+    eye = np.eye(3)
+    planes = _planes_in_frame(sec, eye, eye)
+    normals, offsets = planes
+    assert len(normals) == 8
+    assert np.allclose(np.sort(normals @ corner_polygon(0.1, 0.05, 0.01, 1).T, axis=1)[:, -1], offsets)
+    joint = {"origin": np.zeros(3), "frame": eye, "planes": planes, "beam": 0, "side": "start"}
+    delta = 0.02
+
+    ring1, ring2 = _beam_loops(lambda P: np.asarray(P)[:, 0] - 0.2, joint, 1.0, delta, shrink, h=0.005)
+    for ring, inset, n_corners in ((ring1, 0.0, 8), (ring2, shrink, n_corners2)):
+        signed = ring[:, 1:] @ normals.T - (offsets - inset)
+        assert np.all(signed <= 1e-12)
+        assert np.all(np.abs(signed).min(axis=1) < 1e-12)
+        assert np.count_nonzero(np.sum(np.abs(signed) < 1e-12, axis=1) >= 2) == n_corners
+    assert np.abs(ring2[:, 1]).max() == pytest.approx(0.05 - shrink)
+    assert np.abs(ring2[:, 2]).max() == pytest.approx(0.025 - shrink)
+
+    with pytest.raises(ValueError, match="rounding radius"):
+        _section({"w1_beam": 0.05, "w2_beam": 0.1}, 7, rounding=(0.03, 1))
+
+
+def test_beam_solid_rounded_rect():
+    """A chamfered rectangular beam is the ``corner_polygon`` prism; z-mirrored frames keep it."""
+    from coil_fem.meshing import corner_polygon
+
+    uv = corner_polygon(0.1, 0.05, 0.01, 1)
+    x, y = uv[:, 0], uv[:, 1]
+    area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    sec = _section({"w1_beam": 0.05, "w2_beam": 0.1}, 7, rounding=(0.01, 1))
+    owned = _gmsh_model()
+    try:
+        occ = gmsh.model.occ
+        for g in (np.eye(3), np.diag([1.0, -1.0, 1.0])):
+            tags = _beam_solid(occ, {"section": sec, "L": 0.7, "gamma3": g, "x_start": np.zeros(3)})
+            occ.synchronize()
+            assert len(tags) == 1
+            assert occ.getMass(3, tags[0][1]) == pytest.approx(0.7 * area, rel=1e-9)
+    finally:
+        _gmsh_done(owned)
+
+
 def test_casing_sdf_matches_the_sharp_casing():
     """Signed distance to the swept outer rectangle: negative inside, exact offsets outside."""
     sdf = _casing_sdf(_circle_mesh(), np.eye(3), 0.01)
@@ -175,6 +222,33 @@ def test_casing_sdf_matches_the_sharp_casing():
     assert d[0] < 0.0 and d[3] > 0.0
     assert d[1] == pytest.approx(0.05, abs=1e-3)
     assert d[2] == pytest.approx(0.1, abs=1e-3)
+
+
+@pytest.mark.parametrize("round_casing", [True, False])
+def test_coil_bodies_round_casing(round_casing):
+    """``round_casing`` gives ``coil_big`` the winding-pack chamfer; the winding pack is unchanged."""
+    from coil_fem.meshing import corner_polygon
+
+    def area(uv):
+        x, y = uv[:, 0], uv[:, 1]
+        return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+    r, n = 0.05, 1
+    owned = _gmsh_model()
+    try:
+        occ = gmsh.model.occ
+        parts = ex._coil_bodies(
+            occ, [_circle_mesh(rounding=(r, n))], [np.eye(3)], round_casing,
+        )[(0, 0)]
+        vol = {k: sum(occ.getMass(3, t) for t in tags) for k, tags in parts.items()}
+    finally:
+        _gmsh_done(owned)
+    big_uv = corner_polygon(0.4, 0.4, r, n) if round_casing else 0.2 * np.array(
+        [[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=float
+    )
+    # Unit-radius torus-like sweep: volume ~ 2 pi * section area.
+    assert vol["wp"] == pytest.approx(2 * np.pi * area(corner_polygon(0.3, 0.3, r, n)), rel=1e-4)
+    assert vol["big"] == pytest.approx(2 * np.pi * area(big_uv), rel=1e-4)
 
 
 def test_coil_contour_hits_the_level_set_on_the_given_section():

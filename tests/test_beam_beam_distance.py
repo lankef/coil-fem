@@ -202,6 +202,33 @@ def test_cs_pairs_include_symmetry_images():
     np.testing.assert_allclose(Jb.J(), _host_J(Jb), rtol=1e-10)
 
 
+def test_cs_pairs_with_cc_from_same_coil():
+    """A CS beam from coil 0 pairs with group 0 and the wrap group, not group 1."""
+    cs = _make_coil_support(
+        n_beam_cc=2, n_beam_cf=0,
+        i_beam_cs=[(0, 1)], s_beam_cs=[True],
+    )
+    support = cs.support
+    cs0 = support.cs_beam_offset
+    expected = {(cs0, support.beam_offsets[0] + i)
+                for i in range(support.n_beam_cc[0])}
+    expected |= {(cs0, support.wrap_beam_offset + i)
+                 for i in range(support.n_beam_cc[N_BASE])}
+
+    ia, ib = _beam_beam_pair_indices(support)
+    cs_cc = {
+        (int(a), int(b)) for a, b in zip(ia, ib)
+        if int(a) == cs0 and int(b) < cs0
+    }
+    assert cs_cc == expected
+    group1 = {support.beam_offsets[1] + i for i in range(support.n_beam_cc[1])}
+    assert not any(b in group1 for _a, b in cs_cc)
+
+    Jb = BeamBeamDistance(cs, minimum_distance=10.0, n_quad=N_QUAD)
+    assert Jb.J() > 0.0
+    np.testing.assert_allclose(Jb.J(), _host_J(Jb), rtol=1e-10)
+
+
 def test_shortest_distance_matches_point_to_segment():
     cs = _make_coil_support()
     Jb = BeamBeamDistance(cs, minimum_distance=0.1, n_quad=N_QUAD)

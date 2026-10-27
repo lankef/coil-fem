@@ -330,6 +330,73 @@ def test_dJ_taylor_test(cls):
         assert e_fine < e_coarse * 0.05 or e_fine < 1e-9 * abs(dJdx)
 
 
+# ============================================================================
+# effective_endpoint
+# ============================================================================
+
+def _synthetic_geom(xi_start, xi_end, L=1.0):
+    """One beam along +x of length ``L`` with the given surface-exit stations."""
+    return {
+        'x_start': jnp.array([[0.0, 0.0, 0.0]]),
+        'x_end': jnp.array([[L, 0.0, 0.0]]),
+        'L': jnp.array([L]),
+        'xi_start': jnp.array([xi_start]),
+        'xi_end': jnp.array([xi_end]),
+    }
+
+
+def _span_stations(Jb, geom):
+    x_a, x_b, _ = Jb._effective_segments(geom)
+    L = float(geom['L'][0])
+    return float(x_a[0, 0]) / L, float(x_b[0, 0]) / L
+
+
+def test_effective_endpoint_measures_from_surface_exits():
+    cs = _make_coil_support()
+    geom = _synthetic_geom(0.1, 0.8)
+    Jc = BeamCurveDistance(cs, dead_length=0.05, minimum_distance=0.1)
+    Je = BeamCurveDistance(
+        cs, dead_length=0.05, minimum_distance=0.1, effective_endpoint=True,
+    )
+    np.testing.assert_allclose(_span_stations(Jc, geom), (0.1, 0.8), atol=1e-12)
+    np.testing.assert_allclose(_span_stations(Je, geom), (0.15, 0.75), atol=1e-12)
+
+
+def test_effective_endpoint_caps_oversized_dead_length():
+    """2*dead_length >= L_free collapses to a min_span sliver at the free-span midpoint."""
+    cs = _make_coil_support()
+    Je = BeamCurveDistance(
+        cs, dead_length=10.0, minimum_distance=0.1, effective_endpoint=True,
+    )
+    a, b = _span_stations(Je, _synthetic_geom(0.1, 0.8))
+    np.testing.assert_allclose(0.5 * (a + b), 0.45, atol=1e-12)
+    np.testing.assert_allclose(b - a, 2e-3, atol=1e-9)
+
+
+@pytest.mark.parametrize("xi_start, xi_end", [(0.6, 0.4), (0.5, 0.5)])
+def test_effective_endpoint_overlapping_exits_keep_sliver(xi_start, xi_end):
+    cs = _make_coil_support()
+    Je = BeamCurveDistance(
+        cs, dead_length=0.05, minimum_distance=0.1, effective_endpoint=True,
+    )
+    a, b = _span_stations(Je, _synthetic_geom(xi_start, xi_end))
+    np.testing.assert_allclose(0.5 * (a + b), 0.5, atol=1e-12)
+    np.testing.assert_allclose(b - a, 1e-3, atol=1e-9)
+
+
+def test_effective_endpoint_matches_default_when_meshes_unbound():
+    """Unbound meshes give xi = (0, 1), so both modes agree and dJ is finite."""
+    cs = _make_coil_support()
+    d0 = BeamCurveDistance(cs, DEAD_LENGTH, 0.0).shortest_distance()
+    Jc = BeamCurveDistance(cs, DEAD_LENGTH, 4.0 * d0)
+    Je = BeamCurveDistance(cs, DEAD_LENGTH, 4.0 * d0, effective_endpoint=True)
+    np.testing.assert_allclose(Je.J(), Jc.J(), rtol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(Je.dJ()), np.asarray(Jc.dJ()), rtol=1e-10, atol=1e-14,
+    )
+    assert np.all(np.isfinite(np.asarray(Je.dJ())))
+
+
 def test_dJ_reaches_both_curve_and_support_dofs():
     cs = _make_coil_support()
     d0 = BeamCurveDistance(cs, DEAD_LENGTH, 0.0).shortest_distance()

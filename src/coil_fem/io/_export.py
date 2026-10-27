@@ -172,18 +172,30 @@ def _image_of(Q_list: np.ndarray, Q: np.ndarray) -> int:
     raise ValueError("symmetry map is not one of the field-period images")
 
 
-def _section(dofs: dict, n_sides_circle: int) -> dict:
+def _section(dofs: dict, n_sides_circle: int, rounding=None) -> dict:
     """Outer beam section from one beam's scalar cross-section dofs.
 
     A circular section is an ``n_sides_circle``-gon whose vertices lie on the
     circle. Vertex 0 is on local +y, and vertex k is at angle
-    ``2 π k / n`` from +y toward +z.
+    ``2 π k / n`` from +y toward +z. ``rounding=(r, n)`` cuts the corners of a
+    rectangular section with :func:`~coil_fem.meshing.corner_polygon`;
+    circular sections ignore it.
     """
     if "w1_beam" in dofs:
         w1 = float(dofs["w1_beam"])
         w2 = float(dofs["w2_beam"])
         t = float(dofs["t_beam"]) if "t_beam" in dofs else None
-        return {"kind": "rect", "w1": w1, "w2": w2, "t": t, "w_min": min(w1, w2)}
+        if rounding is not None:
+            rounding = (float(rounding[0]), int(rounding[1]))
+            if not 0.0 < rounding[0] < 0.5 * min(w1, w2):
+                raise ValueError(
+                    f"beam rounding radius {rounding[0]} must be in "
+                    f"(0, min(w1, w2)/2 = {0.5 * min(w1, w2)})"
+                )
+        return {
+            "kind": "rect", "w1": w1, "w2": w2, "t": t, "w_min": min(w1, w2),
+            "rounding": rounding,
+        }
     n = int(n_sides_circle)
     if "r_beam" in dofs:
         r = float(dofs["r_beam"])
@@ -209,12 +221,28 @@ def _polygon_width(r: float, n: int) -> float:
     return float(r) + apothem
 
 
+def _rounded_yz(section: dict) -> np.ndarray:
+    """Counter-clockwise ``(y, z)`` outline of a rounded rectangular section.
+
+    y spans ``w2`` and z spans ``w1``, as in the sharp beam box.
+    """
+    r, n = section["rounding"]
+    return corner_polygon(float(section["w2"]), float(section["w1"]), float(r), int(n))
+
+
 def _side_planes(section: dict) -> tuple[np.ndarray, np.ndarray]:
     """Outward side planes in the beam frame, ``n · (y, z) = offset``.
 
     Rectangle planes match ``addBox(0, -w2/2, -w1/2, L, w2, w1)``. Polygon
-    planes are the sides of :func:`_section`'s n-gon.
+    planes are the sides of :func:`_section`'s n-gon. A rounded rectangle has
+    one plane per edge of :func:`_rounded_yz`.
     """
+    if section["kind"] == "rect" and section.get("rounding") is not None:
+        yz = _rounded_yz(section)
+        d = np.roll(yz, -1, axis=0) - yz
+        normals = np.stack([d[:, 1], -d[:, 0]], axis=1)
+        normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+        return normals, np.einsum("ij,ij->i", normals, yz)
     if section["kind"] == "rect":
         hy = 0.5 * float(section["w2"])
         hz = 0.5 * float(section["w1"])
@@ -237,8 +265,13 @@ def _planes_in_frame(section: dict, frame, gamma3) -> tuple[np.ndarray, np.ndarr
     return normals @ turn.T, offsets
 
 
-def _master_beams(support, sdofs, geom, Q_list, n_sides_circle: int) -> list[dict]:
-    """One record per beam, in ``beam_geometry`` order, with a joint at each coil end."""
+def _master_beams(
+    support, sdofs, geom, Q_list, n_sides_circle: int, beam_rounding=None,
+) -> list[dict]:
+    """One record per beam, in ``beam_geometry`` order, with a joint at each coil end.
+
+    ``beam_rounding=(r, n)`` chamfers every rectangular beam section.
+    """
     x_start = _np(geom["x_start"])
     x_end = _np(geom["x_end"])
     gamma3 = _np(geom["gamma3"])
@@ -256,7 +289,7 @@ def _master_beams(support, sdofs, geom, Q_list, n_sides_circle: int) -> list[dic
         s_end = 0 if cf else _image_of(Q_list, support._tfm_Q[tfm])
         for _j in range(int(n_add)):
             dofs = {k: float(flat[k][b]) for k in flat}
-            sec = _section(dofs, n_sides_circle)
+            sec = _section(dofs, n_sides_circle, beam_rounding)
             g = gamma3[b]
             L = float(length[b])
             start_frame = g.copy()
@@ -759,6 +792,31 @@ def _casing_sdf(mesh, Q, h: float, k: int = 12):
     return sdf
 
 
+def _drop_redundant_planes(nrm: np.ndarray, off: np.ndarray):
+    """Remove planes ``n · (y, z) <= off`` that no longer bound the polygon.
+
+    ``nrm`` is sorted by angle. Plane k is redundant when the corner of its
+    neighbours satisfies it, which happens to a short chamfer edge once the
+    section is inset past its length.
+    """
+    nrm, off = np.asarray(nrm, float), np.asarray(off, float)
+    tol = 1e-12 * float(np.abs(off).max())
+    while len(nrm) > 3:
+        m = len(nrm)
+        slack = np.full(m, -np.inf)
+        for k in range(m):
+            a = nrm[[k - 1, (k + 1) % m]]
+            if abs(np.linalg.det(a)) < 1e-12:
+                continue
+            p = np.linalg.solve(a, off[[k - 1, (k + 1) % m]])
+            slack[k] = off[k] - nrm[k] @ p
+        k = int(np.argmax(slack))
+        if slack[k] < -tol:
+            break
+        nrm, off = np.delete(nrm, k, axis=0), np.delete(off, k)
+    return nrm, off
+
+
 def _beam_loops(
     sdf, joint: dict, length: float, delta: float, shrink: float, h: float,
     edge_clear: float = 0.0,
@@ -792,7 +850,7 @@ def _beam_loops(
         # makes consecutive planes neighbours, so vertex k is the corner
         # between plane k and plane k + 1.
         order = np.argsort(np.arctan2(normals[:, 1], normals[:, 0]))
-        nrm, off = normals[order], off[order]
+        nrm, off = _drop_redundant_planes(normals[order], off[order])
         m = len(nrm)
         verts = np.array([
             np.linalg.solve(nrm[[k, (k + 1) % m]], off[[k, (k + 1) % m]])
@@ -937,7 +995,10 @@ def _beam_solid(occ, rec: dict) -> list[tuple[int, int]]:
     L = float(rec["L"])
     if sec["kind"] == "rect":
         w1, w2 = sec["w1"], sec["w2"]
-        dimtags = [(3, occ.addBox(0.0, -0.5 * w2, -0.5 * w1, L, w2, w1))]
+        if sec.get("rounding") is not None:
+            dimtags = _polygon_prism(occ, _rounded_yz(sec), L)
+        else:
+            dimtags = [(3, occ.addBox(0.0, -0.5 * w2, -0.5 * w1, L, w2, w1))]
         t = sec["t"]
         if t is not None:
             t = min(float(t), min(w1, w2) / 2.0)
@@ -967,11 +1028,16 @@ def _beam_solid(occ, rec: dict) -> list[tuple[int, int]]:
 
 def _ngon_prism(occ, r: float, n: int, length: float, x0: float = 0.0) -> list[tuple[int, int]]:
     """Solid n-gon prism along +x. Vertex 0 lies on local +y, circumradius ``r``."""
-    tags = []
-    for k in range(int(n)):
-        theta = 2.0 * np.pi * k / int(n)
-        tags.append(occ.addPoint(float(x0), float(r * np.cos(theta)), float(r * np.sin(theta))))
-    lines = [occ.addLine(tags[k], tags[(k + 1) % int(n)]) for k in range(int(n))]
+    theta = 2.0 * np.pi * np.arange(int(n)) / int(n)
+    yz = float(r) * np.stack([np.cos(theta), np.sin(theta)], axis=1)
+    return _polygon_prism(occ, yz, length, x0)
+
+
+def _polygon_prism(occ, yz, length: float, x0: float = 0.0) -> list[tuple[int, int]]:
+    """Solid prism along +x over the polygon with ``(y, z)`` vertices ``yz``."""
+    tags = [occ.addPoint(float(x0), float(y), float(z)) for y, z in np.asarray(yz, float)]
+    m = len(tags)
+    lines = [occ.addLine(tags[k], tags[(k + 1) % m]) for k in range(m)]
     face = occ.addPlaneSurface([occ.addCurveLoop(lines)])
     return _vols(occ.extrude([(2, face)], float(length), 0.0, 0.0))
 
@@ -1145,7 +1211,7 @@ def _write_step(path, vols, names) -> None:
     print(f"_export_simsopt: wrote {path}")
 
 
-def _mesh_tet10(owner, size_max: float, size_min: float):
+def _mesh_tet10(owner, size_max: float, size_min: float, dump_prefix=None):
     """Mesh every volume of this model in one pass. Shared faces share nodes.
 
     The mesh is generated linear and optimized (Netgen), then raised to
@@ -1174,6 +1240,7 @@ def _mesh_tet10(owner, size_max: float, size_min: float):
         gmsh.model.mesh.generate(3)
         print(f"_export_simsopt: linear mesh ({time.time() - t0:.0f} s)", flush=True)
     except Exception as exc:
+        bad_vols = []
         for word in str(exc).replace("(", " ").replace(")", " ").split():
             if not word.isdigit():
                 continue
@@ -1191,6 +1258,15 @@ def _mesh_tet10(owner, size_max: float, size_min: float):
                 f"com {np.round(com, 4).tolist()}, "
                 f"volumes {[int(v) for v in upward]} labels {labels}",
                 flush=True,
+            )
+            bad_vols += [abs(int(v)) for v in upward if abs(int(v)) not in bad_vols]
+        if dump_prefix is not None and bad_vols:
+            gmsh.model.mesh.clear()
+            for v in bad_vols:
+                _write_step(Path(f"{dump_prefix}_overlap_v{v}.step"), [v], [f"v{v}_{owner.get(v)}"])
+            _write_step(
+                Path(f"{dump_prefix}_overlap_pair.step"), bad_vols,
+                [f"v{v}_{owner.get(v)}" for v in bad_vols],
             )
         raise RuntimeError(f"_export_simsopt: mesh failed ({exc})") from exc
 
@@ -1344,19 +1420,25 @@ def _clamp_centers(sdofs, curves, meshes, Q_list):
 # ============================================================================
 
 
-def _coil_bodies(occ, meshes, Q_list) -> dict[tuple[int, int], dict[str, list[int]]]:
+def _coil_bodies(
+    occ, meshes, Q_list, round_casing: bool = False,
+) -> dict[tuple[int, int], dict[str, list[int]]]:
     """Winding pack and full-coil solids of every ``(coil, image)``: ``{"wp": tags, "big": tags}``.
 
     ``coil_big`` is the full coil swept along the casing's outer outline, so it
     contains the winding pack (swept along its own outline, chamfered when the
-    mesh has a rounding). Image 0 is lofted; later images are rigid copies.
+    mesh has a rounding). With ``round_casing`` the casing outline gets the same
+    ``(r, n)`` chamfer as the winding pack. Image 0 is lofted; later images are
+    rigid copies.
     """
     bodies: dict[tuple[int, int], dict[str, list[int]]] = {}
     for i, mesh in enumerate(meshes):
-        wp = _coil_loft(
-            occ, mesh, float(mesh.w1), float(mesh.w2), getattr(mesh, "rounding", None),
+        rounding = getattr(mesh, "rounding", None)
+        wp = _coil_loft(occ, mesh, float(mesh.w1), float(mesh.w2), rounding)
+        big = _coil_loft(
+            occ, mesh, float(mesh.w1_outer), float(mesh.w2_outer),
+            rounding if round_casing else None,
         )
-        big = _coil_loft(occ, mesh, float(mesh.w1_outer), float(mesh.w2_outer))
         occ.synchronize()
         for s, Q in enumerate(Q_list):
             tags = wp + big
@@ -1555,9 +1637,11 @@ def _export_simsopt(
     mesh_scale=0.5,
     joint_options=None,
     save_step=False,
-    save_vtk=True,
+    save_vtu=True,
     n_sides_circle=12,
     n_workers=None,
+    round_casing=False,
+    round_beam=True,
 ) -> None:
     """Write the welded full device to STEP and/or a conforming TET10 VTU.
 
@@ -1578,7 +1662,7 @@ def _export_simsopt(
         ``<prefix>_premerge.step``. The parent directory must exist.
     mesh_scale : float
         Multiplier on ``MeshSizeMax``. The size is ``mesh_scale * 0.5 * w1``
-        of the first coil, capped at the smallest casing thickness.
+        of the first coil, capped at twice the smallest casing thickness.
         ``MeshSizeMin`` is ``min(MeshSizeMax, delta)``.
     joint_options : dict or None
         ``delta`` is the beam-to-coil gap of the inner weld ring. It defaults
@@ -1594,7 +1678,7 @@ def _export_simsopt(
         weld), all as separate, overlapping bodies. ``coil_big`` is the full
         coil swept along the casing outline and contains the winding pack.
         Default ``False``.
-    save_vtk : bool
+    save_vtu : bool
         Merge all bodies, mesh them, and write ``<prefix>.vtu``. Default
         ``True``. The linear mesh is optimized (Netgen) before it is raised to
         second order. A curved cell that folds has its edge midpoints put
@@ -1609,6 +1693,15 @@ def _export_simsopt(
         ``min(number of beams, CPU count)``; ``1`` runs in-process. Worker
         processes are spawned, so a script calling the export needs an
         ``if __name__ == "__main__":`` guard (notebooks do not).
+    round_casing : bool
+        Cut the corners of the casing's outer outline with the same
+        ``(r, n)`` chamfer as the winding pack. No effect on coils without a
+        rounding. The welds are still built from the sharp casing. Default
+        ``False``.
+    round_beam : bool
+        Cut the corners of rectangular beams with the coils' ``(r, n)``
+        chamfer. No effect on circular beams or on coils without a rounding.
+        The welds follow the chamfered beam faces. Default ``True``.
 
     Raises
     ------
@@ -1625,7 +1718,7 @@ def _export_simsopt(
     if int(n_sides_circle) < 3:
         raise ValueError(f"n_sides_circle must be at least 3, got {n_sides_circle}")
     n_sides_circle = int(n_sides_circle)
-    if not save_step and not save_vtk:
+    if not save_step and not save_vtu:
         warnings.warn("No file exported")
         return None
 
@@ -1658,7 +1751,15 @@ def _export_simsopt(
     curves = fem.base_curves_jax
     geom = support.beam_geometry(curves, sdofs)
     Q_list = _sym_maps(support.nfp, support.stellsym)
-    recs = _master_beams(support, sdofs, geom, Q_list, n_sides_circle)
+    beam_rounding = None
+    if round_beam:
+        roundings = {getattr(m, "rounding", None) for m in meshes}
+        if len(roundings) > 1:
+            raise ValueError(
+                f"round_beam needs one coil rounding, got {sorted(roundings, key=str)}"
+            )
+        beam_rounding = roundings.pop()
+    recs = _master_beams(support, sdofs, geom, Q_list, n_sides_circle, beam_rounding)
     for rec in recs:
         sec = rec["section"]
         if (sec["kind"] == "rect" and sec["t"] is not None) or (
@@ -1669,7 +1770,7 @@ def _export_simsopt(
     delta = opt["delta"]
     print(f"_export_simsopt: delta={delta:.4g}", flush=True)
     size_max = float(mesh_scale) * 0.5 * float(meshes[0].w1)
-    size_max = min(size_max, min(float(m.casing_thickness) for m in meshes))
+    size_max = min(size_max, 2.0 * min(float(m.casing_thickness) for m in meshes))
     size_min = min(size_max, delta)
     snap_tol = opt["edge_snap_fraction"] * min(size_min, opt["h_contour"])
 
@@ -1680,10 +1781,10 @@ def _export_simsopt(
     # fragments the beam prism with its welds (pass 1). The other symmetry
     # images are placed from these results in stage 2.
     t_all = t0 = time.time()
-    brep_dir = tempfile.TemporaryDirectory(prefix="coil_fem_export_") if save_vtk else None
+    brep_dir = tempfile.TemporaryDirectory(prefix="coil_fem_export_") if save_vtu else None
     n_workers = min(len(recs), os.cpu_count() or 1) if n_workers is None else int(n_workers)
     results = _run_beam_tasks(
-        [(rec, brep_dir.name if save_vtk else None) for rec in recs],
+        [(rec, brep_dir.name if save_vtu else None) for rec in recs],
         (meshes, Q_list, opt, delta, snap_tol), n_workers,
     )
     by_beam = {rec["index"]: res for rec, res in zip(recs, results)}
@@ -1754,7 +1855,7 @@ def _export_simsopt(
             t_step = time.time()
             gmsh.model.add("step")
             occ = gmsh.model.occ
-            coil_bodies = _coil_bodies(occ, meshes, Q_list)
+            coil_bodies = _coil_bodies(occ, meshes, Q_list, round_casing)
             vols, names = [], []
             for (i, s_), parts in coil_bodies.items():
                 for kind, tags in (("winding_pack", parts["wp"]), ("coil_big", parts["big"])):
@@ -1780,12 +1881,12 @@ def _export_simsopt(
             _write_step(Path(f"{prefix}_premerge.step"), vols, names)
             gmsh.model.remove()
             print(f"_export_simsopt: STEP files ({time.time() - t_step:.0f} s)", flush=True)
-        if not save_vtk:
+        if not save_vtu:
             return None
 
         gmsh.model.add("device")
         occ = gmsh.model.occ
-        coil_bodies = _coil_bodies(occ, meshes, Q_list)
+        coil_bodies = _coil_bodies(occ, meshes, Q_list, round_casing)
 
         # ====================================================================
         # Merge: local booleans only, never the whole device at once
@@ -1891,14 +1992,34 @@ def _export_simsopt(
         print(f"_export_simsopt: crossing beams ({time.time() - t_cross:.0f} s); "
               f"setup + pass 1 done ({time.time() - t_all:.0f} s)", flush=True)
 
+        def _boxes_overlap(a, b):
+            return not ((a[:3] > b[3:] + 1e-9).any() or (b[:3] > a[3:] + 1e-9).any())
+
+        def _touching(tags, others):
+            """Tags in ``tags`` at zero distance from any volume in ``others``."""
+            boxes = {t: np.array(occ.getBoundingBox(3, t)) for t in others}
+            hits = []
+            for t in tags:
+                bt = np.array(occ.getBoundingBox(3, t))
+                if any(
+                    _boxes_overlap(bt, boxes[o]) and occ.getDistance(3, t, 3, o)[0] < 1e-9
+                    for o in others
+                ):
+                    hits.append(t)
+            return hits
+
         # Pass 2, per coil image: the welds on it are fused into coil_big (welds
         # that overlap merge), then the winding pack is fragmented out. The fuse
         # swallows every part of a weld inside the coil, so no weld face is left
         # to cut the winding pack. Unify is off so that a weld face shared with
-        # a beam is never merged into a larger face.
+        # a beam is never merged into a larger face. The fuse can still rebuild
+        # a weld face a beam lay on without keeping it shared, so the beams that
+        # touch the casing go into the same fragment and are imprinted again.
+        # Beams touching those beams go in too, so that no beam-beam interface
+        # is split from outside the fragment.
         gmsh.option.setNumber("Geometry.OCCUnionUnify", 0)
         for key, parts in coil_bodies.items():
-            print(f"  coil {key} ({time.time() - t0:.0f} s)", flush=True)
+            t_coil = time.time()
             if welds_on[key]:
                 out, _map = occ.fuse(
                     [(3, t) for t in parts["big"]], [(3, t) for t in sorted(welds_on[key])],
@@ -1910,16 +2031,38 @@ def _export_simsopt(
                 fused = list(parts["big"])
             if not fused:
                 raise RuntimeError(f"coil {key}: fusing the welds into the coil gave no volume")
-            members = [(t, (key[0], key[1], 1)) for t in fused]
+            welded = {t for t, s_ in support_of.items() if s_ in supports_on[key]}
+            others = [t for t in support_of if t not in welded]
+            near = welded | set(_touching(others, fused))
+            others = [t for t in others if t not in near]
+            near |= set(_touching(others, sorted(near)))
+            near = sorted(near)
+            print(f"  coil {key} ({time.time() - t0:.0f} s), {len(near)} beam pieces", flush=True)
+
+            # Lowest priority first: the last owner of a piece wins.
+            members = [(t, (-1, -1, -1)) for t in near]
+            members += [(t, (key[0], key[1], 1)) for t in fused]
             members += [(t, (key[0], key[1], 0)) for t in parts["wp"]]
             _out, ovmap = occ.fragment([(3, t) for t, _l in members], [])
             if len(ovmap) != len(members):
                 raise RuntimeError(f"coil {key}: fragment returned an unexpected map")
+            # (Pop every old tag first: fragment may reuse them for new pieces.)
+            sups = [support_of.pop(t) for t in near]
+            for t in near:
+                owner.pop(t)
             for (_t, label), outs in zip(members, ovmap):
                 for d, t in outs:
                     if int(d) == 3:
                         owner[int(t)] = label
+            for sup, outs in zip(sups, ovmap):
+                for d, t in outs:
+                    if int(d) == 3 and owner[int(t)] == (-1, -1, -1):
+                        support_of.setdefault(int(t), sup)
+            print(f"    fuse + fragment ({time.time() - t_coil:.0f} s)", flush=True)
         occ.synchronize()
+        lost = {(sp["beam"], sp["image"]) for sp in supports} - set(support_of.values())
+        if lost:
+            raise RuntimeError(f"supports {sorted(lost)}: no beam piece left after pass 2")
         print(f"_export_simsopt: merged ({time.time() - t0:.0f} s)", flush=True)
 
         # Every beam must still share a face with the casing of each coil image
@@ -1939,7 +2082,7 @@ def _export_simsopt(
         # ====================================================================
         (
             quality, points, cells, owner_coil, owner_sym, material_id,
-        ) = _mesh_tet10(owner, size_max, size_min)
+        ) = _mesh_tet10(owner, size_max, size_min, dump_prefix=prefix)
     finally:
         gmsh.option.setNumber("Geometry.OCCParallel", occ_parallel)
         gmsh.option.setNumber("Geometry.OCCUnionUnify", unify)

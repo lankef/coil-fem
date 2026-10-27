@@ -510,7 +510,7 @@ class CoilFEMObjective(Optimizable):
         boundary lies between the weld and the beam. ``save_step=True`` writes
         ``<prefix>_raw.step`` (winding packs, full-coil ``coil_big`` solids and
         untrimmed beams) and ``<prefix>_premerge.step`` (the same plus the
-        welds), all as separate bodies. ``save_vtk=True`` fuses the welds into
+        welds), all as separate bodies. ``save_vtu=True`` fuses the welds into
         each coil, trims the beams, meshes everything in one pass so interfaces
         share nodes, optimizes the mesh and writes ``<prefix>.vtu``. Every
         coil needs a casing. Thin wrapper around
@@ -860,17 +860,36 @@ class BeamCurveDistance(Optimizable):
     capped at just under :math:`L/2` so the free span cannot invert; a
     collapsed beam still contributes a mid-chord sliver rather than zero.
 
+    With ``effective_endpoint=True`` the dead length is measured inward from
+    the coil-surface exits instead of the centreline endpoints:
+
+    .. math::
+        \xi_\mathrm{start}^\mathrm{eff}
+            = \xi_\mathrm{start} + \ell_\mathrm{dead}/L,
+        \qquad
+        \xi_\mathrm{end}^\mathrm{eff}
+            = \xi_\mathrm{end} - \ell_\mathrm{dead}/L,
+
+    with the per-end trim capped at just under
+    :math:`L_\mathrm{free}/2`, :math:`L_\mathrm{free} = L\,(\xi_\mathrm{end}
+    - \xi_\mathrm{start})`.
+
     Parameters
     ----------
     coil_support_beams : CoilSupportBeams
         Provides the base curves, the beam DOFs, and the underlying
         :class:`~coil_fem.coupling.SupportBeams` model.
     dead_length : float
-        Length ignored from each chord end before the free span [m].
-        Must be ``> 0``.  If larger than half a beam's length it is
+        Length ignored from each end before the free span [m].
+        Must be ``> 0``.  If larger than half the measured length it is
         capped per beam so a non-empty free span remains.
     minimum_distance : float
         Desired minimum beam-to-coil clearance [m].
+    effective_endpoint : bool
+        If True, measure ``dead_length`` from the surface-exit stations
+        ``xi_start`` / ``xi_end``; if False (default), from the centreline
+        chord endpoints.  The two agree when coil meshes are unbound, and
+        for the foundation end of CF beams (``xi_end = 1``).
 
     Notes
     -----
@@ -890,6 +909,8 @@ class BeamCurveDistance(Optimizable):
         coil_support_beams,
         dead_length: float,
         minimum_distance: float,
+        *,
+        effective_endpoint: bool = False,
     ):
         if not _HAS_SIMSOPT:
             raise ImportError("simsopt is required for BeamCurveDistance.")
@@ -910,6 +931,7 @@ class BeamCurveDistance(Optimizable):
         self._support = coil_support_beams.support
         self.dead_length = dead_length
         self.minimum_distance = minimum_distance
+        self.effective_endpoint = bool(effective_endpoint)
 
         self._base_curves_jax = [
             CurveXYZFourierJAX.from_simsopt(c)
@@ -956,19 +978,35 @@ class BeamCurveDistance(Optimizable):
         # jnp.minimum so this stays in the JAX trace (L depends on DOFs).
         # On beams shorter than 2*MIN_SPAN, keep 2% of L instead of 1 mm.
         min_span = jnp.minimum(MIN_SPAN, 0.01 * L)
-        dead_eff = jnp.minimum(
-            self.dead_length,
-            jnp.maximum(0.0, 0.5 * L - min_span),
-        )
-        xi_safe_start = dead_eff / (L + 1e-300)
-        xi_safe_end = 1.0 - dead_eff / (L + 1e-300)
-        xi_start_eff = jnp.maximum(geom['xi_start'], xi_safe_start)
-        xi_end_eff = jnp.minimum(geom['xi_end'], xi_safe_end)
+        if self.effective_endpoint:
+            # Dead length measured inward from the surface exits; the cap
+            # uses the free length between them instead of L.
+            L_free = L * jnp.maximum(geom['xi_end'] - geom['xi_start'], 0.0)
+            dead_eff = jnp.minimum(
+                self.dead_length,
+                jnp.maximum(0.0, 0.5 * L_free - min_span),
+            )
+            xi_start_eff = geom['xi_start'] + dead_eff / (L + 1e-300)
+            xi_end_eff = geom['xi_end'] - dead_eff / (L + 1e-300)
+        else:
+            dead_eff = jnp.minimum(
+                self.dead_length,
+                jnp.maximum(0.0, 0.5 * L - min_span),
+            )
+            xi_safe_start = dead_eff / (L + 1e-300)
+            xi_safe_end = 1.0 - dead_eff / (L + 1e-300)
+            xi_start_eff = jnp.maximum(geom['xi_start'], xi_safe_start)
+            xi_end_eff = jnp.minimum(geom['xi_end'], xi_safe_end)
 
         # Mesh trim (xi_start / xi_end) can still invert; push to a mid-sliver.
         mid = 0.5 * (xi_start_eff + xi_end_eff)
         half = 0.5 * (min_span / (L + 1e-300))
-        inverted = xi_start_eff > xi_end_eff
+        if self.effective_endpoint:
+            # Exits closer than min_span (or overlapping) leave a degenerate
+            # span; a zero-length segment has an undefined closest point.
+            inverted = (xi_end_eff - xi_start_eff) * L < min_span
+        else:
+            inverted = xi_start_eff > xi_end_eff
         xi_start_eff = jnp.where(inverted, mid - half, xi_start_eff)
         xi_end_eff = jnp.where(inverted, mid + half, xi_end_eff)
 
@@ -1190,7 +1228,8 @@ def _chord_quadrature(x_start, x_end, n_quad):
 
 
 def _beam_beam_pair_indices(support):
-    """Static ``(ia, ib)`` pool indices for CC intra-group and CS-vs-image pairs."""
+    """Static ``(ia, ib)`` pool indices for CC intra-group, CS-vs-image and
+    CS-vs-CC (same start coil) pairs."""
     ia: list[int] = []
     ib: list[int] = []
     n_base = support.n_base
@@ -1222,6 +1261,19 @@ def _beam_beam_pair_indices(support):
             for m in range(a + 1, n_images):
                 ia.append(cs_pool(a))
                 ib.append(cs_pool(m))
+
+        for a, (c, _) in enumerate(support.i_beam_cs):
+            for g in range(support.n_groups_cc):
+                g_coil = g if g < n_base else 0
+                if g_coil != c:
+                    continue
+                start = (
+                    support.beam_offsets[g] if g < n_base
+                    else support.wrap_beam_offset
+                )
+                for i in range(support.n_beam_cc[g]):
+                    ia.append(cs0 + a)
+                    ib.append(start + i)
 
     return (
         np.asarray(ia, dtype=np.int32),
@@ -1271,6 +1323,8 @@ class BeamBeamDistance(Optimizable):
       produced by :func:`~coil_fem.geo.apply_symmetries_to_gammas`, matching
       the ``num_basecurves`` scheme of
       :class:`~simsopt.geo.CurveCurveDistance`.
+    * **CS–CC** — each CS master against every CC master that starts on
+      the same base coil (the wrap group starts on coil 0).
 
     Coil–foundation (CF) beams are not implemented.
 
@@ -1290,6 +1344,8 @@ class BeamBeamDistance(Optimizable):
     Only the base (master) CC beams held in
     ``SupportBeams.beam_geometry`` are paired; stellarator-mirrored CC
     partners and field-period rotations of CC beams are not replicated.
+    CS images and CC beams that only end on a CS beam's start coil are
+    not paired with CC beams.
 
     The full centreline chord ``x_start -> x_end`` is used, not the free
     span between ``xi_start`` and ``xi_end``.
