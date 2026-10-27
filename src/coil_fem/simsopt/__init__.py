@@ -7,10 +7,10 @@ beam / CSR geometric constraints, and the LSE soft-min clearances.
 
 from .objectives import (
     BeamSurfaceDistance,
-    BeamSurfaceDistanceLSE,
+    BeamSurfaceDistanceMinLSE,
     BeamCurveDistance,
     BeamBeamDistance,
-    BeamBeamDistanceLSE,
+    BeamBeamDistanceMinLSE,
     BeamCurveAngle,
     ClampInboard,
     CoilFEMObjective,
@@ -19,7 +19,11 @@ from .objectives import (
     CSRCurveDistance,
     CSRSurfaceDistance,
 )
-from .objectives_geo import CurveCurveDistanceLSE, CurveSurfaceDistanceLSE
+from .objectives_geo import (
+    CurveCurveDistanceMinLSE,
+    CurveCurvatureMaxSqLSE,
+    CurveSurfaceDistanceMinLSE,
+)
 from .coil_support import CoilSupport
 from .coil_support_fixed import (
     CoilSupportFixed,
@@ -32,13 +36,14 @@ from .utils import constraint_from_optimizable
 
 __all__ = [
     "BeamSurfaceDistance",
-    "BeamSurfaceDistanceLSE",
+    "BeamSurfaceDistanceMinLSE",
     "BeamCurveDistance",
     "BeamBeamDistance",
-    "BeamBeamDistanceLSE",
+    "BeamBeamDistanceMinLSE",
     "BeamCurveAngle",
-    "CurveCurveDistanceLSE",
-    "CurveSurfaceDistanceLSE",
+    "CurveCurveDistanceMinLSE",
+    "CurveCurvatureMaxSqLSE",
+    "CurveSurfaceDistanceMinLSE",
     "ClampInboard",
     "CoilFEMObjective",
     "CRBeamInboard",
