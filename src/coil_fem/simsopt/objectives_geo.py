@@ -1,9 +1,11 @@
 """LSE curve objectives for simsopt.
 
 :class:`CurveCurveDistanceMinLSE` and :class:`CurveSurfaceDistanceMinLSE`
-estimate the smallest sampled distance, and :class:`CurveCurvatureMaxSqLSE`
-estimates the largest sampled curvature squared. Each error is at most a
-given ``epsilon``. They depend only on simsopt and JAX.
+estimate the smallest sampled distance, :class:`CurveCurvatureMaxSqLSE`
+estimates the largest sampled curvature squared, and
+:class:`FrameTorsionMaxSqLSE` estimates the largest sampled frame torsion
+squared. Each error is at most a given ``epsilon``. They depend only on
+simsopt and JAX.
 """
 
 from __future__ import annotations
@@ -286,6 +288,79 @@ class CurveCurvatureMaxSqLSE(Optimizable):
         return sum(
             curve.dkappa_by_dcoeff_vjp(np.asarray(g))
             for curve, g in zip(self.curves, grads)
+        )
+
+    return_fn_map = {'J': J, 'dJ': dJ}
+
+
+class FrameTorsionMaxSqLSE(Optimizable):
+    r"""Soft-maximum of frame torsion squared over a set of framed curves.
+
+    Samples are ``framedcurve.frame_torsion()`` at each curve's quadrature
+    points. There is no arclength weight and no threshold. With
+    :math:`\tau^2` those samples over every framed curve and
+    :math:`t = \max(1, \log n) / \epsilon`,
+
+    .. math::
+
+        J = \frac{1}{t}\operatorname{LSE}(t\, \tau^2),
+
+    so
+
+    .. math::
+
+        \max \tau^2 \le J \le \max \tau^2 + \epsilon.
+
+    ``J`` never underestimates the maximum, so a constraint ``J <= \tau_0^2``
+    keeps every sample at or below frame torsion :math:`|\tau| \le \tau_0`.
+
+    The Frenet frame torsion blows up where the curvature goes to zero.
+    :class:`~simsopt.geo.FramedCurveCentroid` avoids this.
+
+    Parameters
+    ----------
+    framedcurves : sequence of simsopt.geo.FramedCurve
+        Framed curves in the coil set. DOF parents of this objective, so both
+        the curve and the frame rotation contribute to the gradient.
+    epsilon : float
+        Error bound on :math:`\tau^2` [1/m²]. Must be positive.
+    """
+
+    def __init__(self, framedcurves, epsilon):
+        epsilon = float(epsilon)
+        if not math.isfinite(epsilon) or epsilon <= 0.0:
+            raise ValueError(f"epsilon must be > 0; got {epsilon}.")
+        self.framedcurves = framedcurves
+        self.epsilon = epsilon
+        self.J_jax = jit(self._J_pure)
+        self.dJ_dtaus = jit(grad(self._J_pure))
+        super().__init__(depends_on=framedcurves)
+
+    def _J_pure(self, taus):
+        """Soft-max of frame torsion squared at every quadrature point."""
+        sq = jnp.concatenate([tau ** 2 for tau in taus])
+        # max(τ^2) <= max_lse(τ^2) <= max(τ^2) + epsilon
+        return max_lse(sq, self.epsilon)
+
+    def J(self):
+        """Soft-maximum of frame torsion squared [1/m²]."""
+        return self.J_jax([fc.frame_torsion() for fc in self.framedcurves])
+
+    @derivative_dec
+    def dJ(self):
+        """Gradient of :meth:`J` with respect to the framed-curve DOFs.
+
+        :meth:`~simsopt.geo.FramedCurve.dframe_torsion_by_dcoeff_vjp` already
+        sums the curve and frame-rotation vector-Jacobian products.
+        ``@derivative_dec`` contracts the result to a flat array aligned
+        with ``self.x``.
+        """
+        grads = self.dJ_dtaus(
+            [fc.frame_torsion() for fc in self.framedcurves],
+        )
+        return sum(
+            fc.dframe_torsion_by_dcoeff_vjp(np.asarray(g))
+            for fc, g in zip(self.framedcurves, grads)
         )
 
     return_fn_map = {'J': J, 'dJ': dJ}

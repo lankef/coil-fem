@@ -12,7 +12,12 @@ from coil_fem.simsopt.objectives_geo import max_lse
 simsopt = pytest.importorskip("simsopt")
 
 from simsopt.field import Coil, Current                       # noqa: E402
-from simsopt.geo import SurfaceRZFourier, create_equally_spaced_curves  # noqa: E402
+from simsopt.geo import (                                  # noqa: E402
+    FrameRotation,
+    FramedCurveCentroid,
+    SurfaceRZFourier,
+    create_equally_spaced_curves,
+)
 
 from coil_fem.simsopt import (                                # noqa: E402
     BeamBeamDistanceMinLSE,
@@ -21,6 +26,7 @@ from coil_fem.simsopt import (                                # noqa: E402
     CurveCurveDistanceMinLSE,
     CurveCurvatureMaxSqLSE,
     CurveSurfaceDistanceMinLSE,
+    FrameTorsionMaxSqLSE,
 )
 
 EPS = 1e-2
@@ -33,6 +39,16 @@ def _curves(numquadpoints=16):
         N_BASE, NFP, stellsym=True, R0=1.0, R1=0.5, order=2,
         numquadpoints=numquadpoints,
     )
+
+
+def _framed():
+    """Centroid frames with a small nonzero rotation, so those DOFs are live."""
+    framed = []
+    for curve in _curves():
+        rotation = FrameRotation(curve.quadpoints, order=1)
+        rotation.x = np.array([0.2, 0.0, 0.1])
+        framed.append(FramedCurveCentroid(curve, rotation))
+    return framed
 
 
 def _surface():
@@ -111,6 +127,8 @@ def test_rejects_nonpositive_epsilon():
     with pytest.raises(ValueError, match="epsilon"):
         CurveCurvatureMaxSqLSE(curves, 0.0)
     with pytest.raises(ValueError, match="epsilon"):
+        FrameTorsionMaxSqLSE(_framed(), 0.0)
+    with pytest.raises(ValueError, match="epsilon"):
         CurveSurfaceDistanceMinLSE(curves, surf, -0.1)
     with pytest.raises(ValueError, match="epsilon"):
         BeamSurfaceDistanceMinLSE(cs, surf, 0.0)
@@ -174,6 +192,33 @@ def test_curvature_max_sq_bound_and_dJ():
     dJdx = float(np.asarray(obj.dJ()) @ dx)
     errs = []
     for step in (1e-5, 1e-6, 1e-7):
+        obj.x = x0 + step * dx
+        Jp = float(obj.J())
+        obj.x = x0 - step * dx
+        Jm = float(obj.J())
+        errs.append(abs((Jp - Jm) / (2 * step) - dJdx))
+    obj.x = x0
+    assert errs[0] > 0.0
+    for coarse, fine in zip(errs[:-1], errs[1:]):
+        assert fine < coarse * 0.05 or fine < 1e-9 * abs(dJdx)
+
+
+def test_frame_torsion_max_sq_bound_and_dJ():
+    framed = _framed()
+    obj = FrameTorsionMaxSqLSE(framed, EPS)
+    true_max = max(
+        float(np.max(np.asarray(fc.frame_torsion()) ** 2)) for fc in framed
+    )
+    J = float(obj.J())
+    assert true_max - 1e-8 <= J <= true_max + EPS + 1e-8
+
+    # 1e-7 is already in roundoff for this derivative, so stop at 1e-6.
+    # 1e-4 is still quadratic here, unlike the curvature objective.
+    x0 = np.array(obj.x)
+    dx = np.random.default_rng(0).standard_normal(x0.size)
+    dJdx = float(np.asarray(obj.dJ()) @ dx)
+    errs = []
+    for step in (1e-4, 1e-5, 1e-6):
         obj.x = x0 + step * dx
         Jp = float(obj.J())
         obj.x = x0 - step * dx

@@ -22,6 +22,7 @@ from .objectives import (
 from .objectives_geo import (
     CurveCurveDistanceMinLSE,
     CurveCurvatureMaxSqLSE,
+    FrameTorsionMaxSqLSE,
     CurveSurfaceDistanceMinLSE,
 )
 from .coil_support import CoilSupport
@@ -43,6 +44,7 @@ __all__ = [
     "BeamCurveAngle",
     "CurveCurveDistanceMinLSE",
     "CurveCurvatureMaxSqLSE",
+    "FrameTorsionMaxSqLSE",
     "CurveSurfaceDistanceMinLSE",
     "ClampInboard",
     "CoilFEMObjective",
